@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-from typing import Any, AsyncGenerator, Union
+from typing import Any
 
 from pyclaw.channels.base import BaseChannel
 from pyclaw.core.agent import Agent
@@ -49,20 +48,12 @@ class Gateway:
 
         try:
             # 交给 Agent 处理
-            result = await self.agent.process_message(message)
+            response = await self.agent.process_message(message)
 
-            # 判断是流式还是普通消息
-            if inspect.isasyncgen(result):
-                # 流式输出 - 调用通道的 send_stream
-                await self.channels[message.channel].send_stream(
-                    result,
-                    message.channel_user_id,
-                )
-                print("📤 Streamed response completed")
-            else:
-                # 普通消息 - 直接发送
-                await self.channels[message.channel].send_message(result)
-                print(f"📤 Replied: {result.content[:50]}...")
+            # 通过原通道发送回复
+            await self.channels[message.channel].send_message(response)
+
+            print(f"📤 Replied: {response.content[:50]}...")
 
         except Exception as e:
             print(f"❌ Error processing message: {e}")
