@@ -7,6 +7,7 @@ import sys
 
 import typer
 
+from pyclaw.channels.feishu import FeishuChannel
 from pyclaw.channels.telegram import TelegramChannel
 from pyclaw.core.agent import Agent
 from pyclaw.core.session import SessionManager
@@ -59,12 +60,24 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         # 创建网关
         gateway = Gateway(agent=agent)
 
-        # 注册Telegram通道
-        telegram_channel = TelegramChannel(
-            token=cfg.telegram.token,
-            allowed_user_ids=cfg.telegram.allowed_user_ids or None,
-        )
-        gateway.register_channel(telegram_channel)
+        # 注册 Telegram 通道
+        if cfg.telegram and cfg.telegram.token:
+            telegram_channel = TelegramChannel(
+                token=cfg.telegram.token,
+                allowed_user_ids=cfg.telegram.allowed_user_ids or None,
+            )
+            gateway.register_channel(telegram_channel)
+            print("✅ Telegram 通道已注册")
+
+        # 注册飞书通道
+        if cfg.feishu and cfg.feishu.app_id:
+            feishu_channel = FeishuChannel(
+                app_id=cfg.feishu.app_id,
+                app_secret=cfg.feishu.app_secret,
+                allowed_user_ids=cfg.feishu.allowed_user_ids or None,
+            )
+            gateway.register_channel(feishu_channel)
+            print("✅ 飞书通道已注册")
 
         # 启动
         try:
@@ -95,13 +108,23 @@ def init(config: str = typer.Option(None, help="Path to create config file")) ->
 
     template = """# PyClaw 配置文件示例
 
-telegram:
-  # 你的Telegram Bot Token (从 @BotFather 获取)
-  token: "YOUR_TELEGRAM_BOT_TOKEN"
-  # 允许使用的用户ID列表 (留空则允许所有人)
+# Telegram Bot 配置 (可选)
+# telegram:
+#   # 你的Telegram Bot Token (从 @BotFather 获取)
+#   token: "YOUR_TELEGRAM_BOT_TOKEN"
+#   # 允许使用的用户ID列表 (留空则允许所有人)
+#   allowed_user_ids:
+#     # - 123456789
+#     # - 987654321
+
+# 飞书 Bot 配置 (可选)
+feishu:
+  # 飞书机器人应用 App ID 和 App Secret
+  app_id: "YOUR_FEISHU_APP_ID"
+  app_secret: "YOUR_FEISHU_APP_SECRET"
+  # 允许使用的用户 open_id 列表 (留空则允许所有人)
   allowed_user_ids:
-    # - 123456789
-    # - 987654321
+    # - ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 model:
   # 模型提供商: openai, ark, etc.
@@ -109,9 +132,9 @@ model:
   # API Key
   api_key: "YOUR_API_KEY"
   # 可选：自定义API端点 (比如火山引擎、OpenRouter等)
-  # base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
   # 模型名称
-  model: "gpt-4o"
+  model: "ep-xxxxxxxxx"
 
 # 工作目录 (Agent执行命令的默认目录)
 work_dir: "~/pyclaw"
@@ -127,7 +150,7 @@ work_dir: "~/pyclaw"
 
     config_path.write_text(template, encoding="utf-8")
     typer.echo(f"✅ 配置文件已创建: {config}")
-    typer.echo(f"   请编辑配置文件填入你的Token和API Key")
+    typer.echo(f"   请编辑配置文件填入你的 App ID 和 API Key")
     typer.echo(f"   然后运行: pyclaw start")
 
 

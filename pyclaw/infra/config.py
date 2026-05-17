@@ -13,6 +13,12 @@ class TelegramConfig(BaseModel):
     allowed_user_ids: Optional[list[int]] = None
 
 
+class FeishuConfig(BaseModel):
+    app_id: str
+    app_secret: str
+    allowed_user_ids: Optional[list[str]] = None
+
+
 class ModelConfig(BaseModel):
     provider: str = "openai"
     api_key: str
@@ -21,7 +27,8 @@ class ModelConfig(BaseModel):
 
 
 class Config(BaseModel):
-    telegram: TelegramConfig
+    telegram: Optional[TelegramConfig] = None
+    feishu: Optional[FeishuConfig] = None
     model: ModelConfig
     work_dir: str = Field(default_factory=lambda: str(Path.home() / "pyclaw"))
 
@@ -48,5 +55,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
     # 处理空的 allowed_user_ids
     if data.get("telegram", {}).get("allowed_user_ids") is None:
         data["telegram"]["allowed_user_ids"] = []
+
+    if data.get("feishu", {}).get("allowed_user_ids") is None:
+        data["feishu"]["allowed_user_ids"] = []
 
     return Config(**data)

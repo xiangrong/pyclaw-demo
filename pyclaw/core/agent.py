@@ -81,13 +81,22 @@ class Agent:
 
             # 获取历史消息
             messages = session.get_history()
+            print(f"  📜 历史消息数: {len(messages)}")
 
-            # 调用 LLM
-            result = await self.model.chat(
-                messages=messages,
-                tools=self.tools.get_all_specs(),
-                stream=False,
-            )
+            try:
+                # 调用 LLM
+                print(f"  🤖 正在调用 LLM...")
+                result = await self.model.chat(
+                    messages=messages,
+                    tools=self.tools.get_all_specs(),
+                    stream=False,
+                )
+                print(f"  ✅ LLM 调用完成")
+            except Exception as e:
+                print(f"  ❌ LLM 调用出错: {e}")
+                import traceback
+                traceback.print_exc()
+                return f"⚠️ LLM 调用出错: {str(e)}"
 
             print(f"📨 LLM result type: {type(result)}")
 
@@ -110,9 +119,17 @@ class Agent:
                 session.add_message(assistant_msg)
 
                 # 2. 执行工具调用
-                tool_results = await self.tools.execute_tool_calls(
-                    json.dumps(result)
-                )
+                try:
+                    print(f"  🔨 正在执行工具...")
+                    tool_results = await self.tools.execute_tool_calls(
+                        json.dumps(result)
+                    )
+                    print(f"  ✅ 工具执行完成")
+                except Exception as e:
+                    print(f"  ❌ 工具执行出错: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return f"⚠️ 工具执行出错: {str(e)}"
 
                 print(f"🔧 Tool results: {len(tool_results)} results")
 
