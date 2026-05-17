@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
@@ -20,7 +22,7 @@ class TelegramChannel(BaseChannel):
 
     name = "telegram"
 
-    def __init__(self, token: str, allowed_user_ids: list[int] | None = None) -> None:
+    def __init__(self, token: str, allowed_user_ids: Optional[list[int]] = None) -> None:
         super().__init__()
         self.token = token
         self.allowed_user_ids = allowed_user_ids  # 如果为None，则允许所有用户
@@ -95,10 +97,10 @@ class TelegramChannel(BaseChannel):
             )
         elif text == "/help":
             await update.message.reply_text(
-            "📖 可用命令：\n"
-            "/start - 开始使用\n"
-            "/help - 显示帮助\n"
-            "/clear - 清空会话历史",
+                "📖 可用命令：\n"
+                "/start - 开始使用\n"
+                "/help - 显示帮助\n"
+                "/clear - 清空会话历史",
             )
 
     async def send_message(self, message: Message) -> None:
@@ -117,3 +119,62 @@ class TelegramChannel(BaseChannel):
                 text=chunk,
                 parse_mode=None,
             )
+
+    async def send_stream(
+        self,
+        stream,
+        channel_user_id: str,
+    ) -> str:
+        """流式发送消息"""
+        if not self._app:
+            return ""
+
+        chat_id = int(channel_user_id)
+        full_content = ""
+        last_update_time = 0
+        update_interval = 0.5  # 每0.5秒更新一次消息
+
+        # 发送第一条"思考中..."消息
+        message = await self._app.bot.send_message(
+            chat_id=chat_id,
+            text="🤔 思考中...",
+        )
+        message_id = message.message_id
+
+        try:
+            async for chunk in stream:
+                full_content += chunk
+
+                # 节流：避免太频繁的 API 调用
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_update_time > update_interval:
+                    if full_content.strip():  # 确保有内容才更新
+                        await self._app.bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=full_content,
+                            parse_mode=None,
+                        )
+                        last_update_time = current_time
+
+            # 流式结束，确保最后更新一次
+            if full_content.strip():
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=full_content,
+                    parse_mode=None,
+                )
+
+        except Exception as e:
+            print(f"⚠️ Stream error: {e}")
+            # 出错时发送完整内容
+            if full_content.strip():
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=full_content,
+                    parse_mode=None,
+                )
+
+        return full_content

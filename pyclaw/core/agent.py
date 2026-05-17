@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import AsyncGenerator, Optional, Union
 
 from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.core.session import Session, SessionManager
@@ -30,8 +30,16 @@ class Agent:
             "Always explain what you're doing to the user in Chinese."
         )
 
-    async def process_message(self, message: Message) -> Message:
-        """处理用户消息并生成回复"""
+    async def process_message(
+        self,
+        message: Message,
+    ) -> Union[Message, AsyncGenerator[str, None]]:
+        """处理用户消息并生成回复
+
+        返回:
+        - 如果有工具调用: 返回最终 Message
+        - 如果没有工具调用: 返回流式 AsyncGenerator
+        """
         # 获取或创建会话
         session = self.sessions.get_or_create(
             channel=message.channel,
@@ -55,35 +63,69 @@ class Agent:
         # 添加用户消息到会话
         session.add_message(message)
 
-        # 执行Agent循环
-        response_content = await self._agent_loop(session)
+        # 先执行 Agent 循环（检测工具调用）
+        has_tool_calls, final_content = await self._agent_loop_check_tools(session)
 
-        # 创建并添加回复消息
+        if has_tool_calls:
+            # 有工具调用 - 非流式返回
+            response = Message(
+                id=f"response-{message.id}",
+                channel=message.channel,
+                channel_user_id=message.channel_user_id,
+                session_id=session.session_id,
+                type=message.type,
+                role=MessageRole.ASSISTANT,
+                content=final_content,
+            )
+            session.add_message(response)
+            return response
+        else:
+            # 没有工具调用 - 流式返回
+            return self._stream_with_history(session, message)
+
+    async def _stream_with_history(
+        self,
+        session: Session,
+        original_message: Message,
+    ) -> AsyncGenerator[str, None]:
+        """流式输出并在结束时保存到历史"""
+        messages = session.get_history()
+        stream = await self.model.chat(
+            messages=messages,
+            tools=self.tools.get_all_specs(),
+            stream=True,
+        )
+
+        full_content = ""
+        async for chunk in stream:
+            full_content += chunk
+            yield chunk
+
+        # 流式结束，保存到会话历史
         response = Message(
-            id=f"response-{message.id}",
-            channel=message.channel,
-            channel_user_id=message.channel_user_id,
+            id=f"response-{original_message.id}",
+            channel=original_message.channel,
+            channel_user_id=original_message.channel_user_id,
             session_id=session.session_id,
-            type=message.type,
+            type=original_message.type,
             role=MessageRole.ASSISTANT,
-            content=response_content,
+            content=full_content,
         )
         session.add_message(response)
 
-        return response
-
-    async def _agent_loop(self, session: Session) -> str:
-        """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
+    async def _agent_loop_check_tools(self, session: Session) -> tuple[bool, str]:
+        """Agent主循环：检测工具调用，返回 (是否有工具调用, 最终内容)"""
         max_iterations = 5
 
         for i in range(max_iterations):
             # 获取历史消息
             messages = session.get_history()
 
-            # 调用LLM
+            # 调用 LLM（非流式，用来检测工具调用）
             result = await self.model.chat(
                 messages=messages,
                 tools=self.tools.get_all_specs(),
+                stream=False,
             )
 
             # 检查是否有工具调用
@@ -126,7 +168,7 @@ class Agent:
                     )
                 continue
 
-            # 没有工具调用，返回最终结果
-            return str(result)
+            # 没有工具调用 - 返回 False，表示可以开始流式
+            return False, str(result)
 
-        return "⚠️ 达到最大迭代次数，请简化你的请求。"
+        return True, "⚠️ 达到最大迭代次数，请简化你的请求。"

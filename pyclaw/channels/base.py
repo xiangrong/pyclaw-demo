@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Callable
+from typing import Any, AsyncGenerator, Callable, Optional
 
 from pyclaw.core.message import Message
 
@@ -12,7 +12,7 @@ class BaseChannel(ABC):
     name: str
 
     def __init__(self) -> None:
-        self._message_handler: Callable[[Message], Any] | None = None
+        self._message_handler: Optional[Callable[[Message], Any]] = None
 
     @abstractmethod
     async def start(self) -> None:
@@ -29,12 +29,19 @@ class BaseChannel(ABC):
         """发送消息"""
         pass
 
-    async def send_stream(self, stream: AsyncGenerator[str, None]) -> None:
-        """流式发送消息（默认合并后发送）"""
+    async def send_stream(
+        self,
+        stream: AsyncGenerator[str, None],
+        channel_user_id: str,
+    ) -> str:
+        """流式发送消息 - 默认实现合并后发送
+
+        子类可以重写此方法实现真正的流式输出
+        """
         content = ""
         async for chunk in stream:
             content += chunk
-        # 子类可以重写此方法实现真正的流式输出
+        return content
 
     def on_message(self, handler: Callable[[Message], Any]) -> None:
         """注册消息处理器"""
