@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+import sys
+
+import typer
+
+from pyclaw.channels.telegram import TelegramChannel
+from pyclaw.core.agent import Agent
+from pyclaw.core.session import SessionManager
+from pyclaw.gateway.gateway import Gateway
+from pyclaw.infra.config import Config, load_config
+from pyclaw.models.openai import OpenAIProvider
+from pyclaw.tools.files import ReadFileTool, WriteFileTool
+from pyclaw.tools.registry import ToolRegistry
+from pyclaw.tools.terminal import TerminalTool
+
+app = typer.Typer(help="PyClaw - Python AI Agent")
+
+
+@app.command()
+def start(config: str = typer.Option(None, help="Path to config file")) -> None:
+    """启动 PyClaw Agent"""
+
+    async def _start() -> None:
+        # 加载配置
+        try:
+            cfg = load_config(config)
+        except FileNotFoundError as e:
+            typer.echo(f"❌ {e}", err=True)
+            sys.exit(1)
+
+        # 创建工作目录
+        os.makedirs(cfg.work_dir, exist_ok=True)
+        os.chdir(cfg.work_dir)
+
+        # 初始化组件
+        tool_registry = ToolRegistry()
+        tool_registry.register(TerminalTool())
+        tool_registry.register(ReadFileTool())
+        tool_registry.register(WriteFileTool())
+
+        session_manager = SessionManager()
+
+        model_provider = OpenAIProvider(
+            api_key=cfg.model.api_key,
+            base_url=cfg.model.base_url,
+            model=cfg.model.model,
+        )
+
+        agent = Agent(
+            model_provider=model_provider,
+            tool_registry=tool_registry,
+            session_manager=session_manager,
+        )
+
+        # 创建网关
+        gateway = Gateway(agent=agent)
+
+        # 注册Telegram通道
+        telegram_channel = TelegramChannel(
+            token=cfg.telegram.token,
+            allowed_user_ids=cfg.telegram.allowed_user_ids or None,
+        )
+        gateway.register_channel(telegram_channel)
+
+        # 启动
+        try:
+            await gateway.start()
+
+            # 等待信号
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, stop_event.set)
+
+            await stop_event.wait()
+
+        finally:
+            await gateway.stop()
+
+    asyncio.run(_start())
+
+
+@app.command()
+def init(config: str = typer.Option(None, help="Path to create config file")) -> None:
+    """创建配置文件模板"""
+    if config is None:
+        from pathlib import Path
+
+        config = str(Path.home() / ".config" / "pyclaw" / "config.yaml")
+
+    template = """# PyClaw 配置文件示例
+
+telegram:
+  # 你的Telegram Bot Token (从 @BotFather 获取)
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+  # 允许使用的用户ID列表 (留空则允许所有人)
+  allowed_user_ids:
+    # - 123456789
+    # - 987654321
+
+model:
+  # 模型提供商: openai, ark, etc.
+  provider: "openai"
+  # API Key
+  api_key: "YOUR_API_KEY"
+  # 可选：自定义API端点 (比如火山引擎、OpenRouter等)
+  # base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  # 模型名称
+  model: "gpt-4o"
+
+# 工作目录 (Agent执行命令的默认目录)
+work_dir: "~/pyclaw"
+"""
+
+    from pathlib import Path
+
+    config_path = Path(config)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if config_path.exists():
+        typer.confirm(f"⚠️ 配置文件已存在: {config}，是否覆盖？", abort=True)
+
+    config_path.write_text(template, encoding="utf-8")
+    typer.echo(f"✅ 配置文件已创建: {config}")
+    typer.echo(f"   请编辑配置文件填入你的Token和API Key")
+    typer.echo(f"   然后运行: pyclaw start")
+
+
+if __name__ == "__main__":
+    app()

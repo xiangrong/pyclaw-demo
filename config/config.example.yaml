@@ -1,0 +1,23 @@
+# PyClaw 配置文件示例
+# 复制到 ~/.config/pyclaw/config.yaml 并填写配置
+
+telegram:
+  # 你的Telegram Bot Token (从 @BotFather 获取)
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+  # 允许使用的用户ID列表 (留空则允许所有人)
+  allowed_user_ids:
+    # - 123456789
+    # - 987654321
+
+model:
+  # 模型提供商: openai, ark, etc.
+  provider: "openai"
+  # API Key
+  api_key: "YOUR_API_KEY"
+  # 可选：自定义API端点 (比如火山引擎、OpenRouter等)
+  # base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  # 模型名称
+  model: "gpt-4o"
+
+# 工作目录 (Agent执行命令的默认目录)
+work_dir: "~/pyclaw"
