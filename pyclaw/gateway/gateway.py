@@ -82,7 +82,7 @@ class Gateway:
 
         try:
             # 设置 Cron 工具的会话上下文
-            cron_tool = self.agent.tool_registry.get_tool("cronjob")
+            cron_tool = self.agent.tools.get_tool("cronjob")
             if cron_tool and isinstance(cron_tool, CronJobTool):
                 cron_tool.session_context = {
                     "platform": message.channel,
