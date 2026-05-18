@@ -17,6 +17,8 @@ from pyclaw.models.openai import OpenAIProvider
 from pyclaw.tools.files import ReadFileTool, WriteFileTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
+from pyclaw.cron.tools import CronJobTool
+from pyclaw.cron.jobs import get_job
 
 app = typer.Typer(help="PyClaw - Python AI Agent")
 
@@ -42,6 +44,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
+        tool_registry.register(CronJobTool())
 
         session_manager = SessionManager()
 
@@ -90,12 +93,77 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, stop_event.set)
 
+            print("\n🚀 PyClaw Agent 已启动，按 Ctrl+C 停止")
             await stop_event.wait()
 
         finally:
             await gateway.stop()
 
     asyncio.run(_start())
+
+
+@app.command()
+def cron_exec(
+    job_id: str = typer.Option(..., "--job-id", help="Cron job ID"),
+    prompt: str = typer.Option(..., "--prompt", help="Prompt to execute"),
+    config: str = typer.Option(None, help="Path to config file"),
+) -> None:
+    """执行 Cron 任务（内部使用，子进程调用）"""
+
+    async def _exec() -> None:
+        # 加载配置
+        try:
+            cfg = load_config(config)
+        except FileNotFoundError as e:
+            typer.echo(f"❌ {e}", err=True)
+            sys.exit(1)
+
+        # 创建工作目录
+        os.makedirs(cfg.work_dir, exist_ok=True)
+        os.chdir(cfg.work_dir)
+
+        # 初始化组件
+        tool_registry = ToolRegistry()
+        tool_registry.register(TerminalTool())
+        tool_registry.register(ReadFileTool())
+        tool_registry.register(WriteFileTool())
+        # Cron任务不允许创建新的Cron任务（防止递归）
+
+        session_manager = SessionManager()
+
+        model_provider = OpenAIProvider(
+            api_key=cfg.model.api_key,
+            base_url=cfg.model.base_url,
+            model=cfg.model.model,
+        )
+
+        agent = Agent(
+            model_provider=model_provider,
+            tool_registry=tool_registry,
+            session_manager=session_manager,
+        )
+
+        # 创建临时会话并执行
+        session = session_manager.create_session(f"cron_{job_id}")
+        result = await agent.run(session, prompt)
+
+        # 打印结果到stdout
+        print(result)
+
+    asyncio.run(_exec())
+
+
+@app.command()
+def cron_tick(
+    config: str = typer.Option(None, help="Path to config file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+) -> None:
+    """手动执行一次 Cron 调度检查"""
+    from pyclaw.cron.scheduler import tick
+
+    count = tick(verbose=verbose)
+    if verbose:
+        typer.echo(f"执行了 {count} 个任务")
 
 
 @app.command()
