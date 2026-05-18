@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pyclaw.agent</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/REPLACE_WITH_YOUR_USER/.pyclaw/venv/bin/pyclaw</string>
+        <string>start</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_WITH_YOUR_USER/.pyclaw/pyclaw.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_WITH_YOUR_USER/.pyclaw/pyclaw.err.log</string>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/REPLACE_WITH_YOUR_USER/.pyclaw</string>
+    
+    <key>UserName</key>
+    <string>REPLACE_WITH_YOUR_USER</string>
+</dict>
+</plist>
