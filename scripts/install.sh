@@ -58,12 +58,28 @@ log_error() {
 # 系统检查
 # ============================================================================
 
+force_arm64() {
+    # 在 Apple Silicon 上强制使用 arm64 架构
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        export ARCHPREFERENCE="arm64"
+        export VERSIONER_PYTHON_PREFER_32_BIT="no"
+    fi
+}
+
 check_system() {
     log_info "检查系统环境..."
 
+    # 检查架构（Apple Silicon 兼容性）
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        log_success "Apple Silicon (arm64) 检测到"
+        force_arm64
+    elif [[ "$(uname -m)" == "x86_64" ]] && sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
+        log_warn "检测到 Rosetta 转译模式，建议在原生 arm64 终端下安装"
+    fi
+
     # 检查 Python
     if ! command -v python3 &> /dev/null; then
-        log_error "未找到 python3，请先安装 Python 3.11+"
+        log_error "未找到 python3，请先安装 Python 3.9+"
         exit 1
     fi
 
