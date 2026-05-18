@@ -58,23 +58,43 @@ log_error() {
 # 系统检查
 # ============================================================================
 
-force_arm64() {
-    # 在 Apple Silicon 上强制使用 arm64 架构
+# 根据 CPU 架构选择正确的执行方式
+arch_python() {
     if [[ "$(uname -m)" == "arm64" ]]; then
-        export ARCHPREFERENCE="arm64"
-        export VERSIONER_PYTHON_PREFER_32_BIT="no"
+        # Apple Silicon - 强制 arm64 架构执行
+        arch -arm64 python3 "$@"
+    else
+        # Intel 或其他架构
+        python3 "$@"
+    fi
+}
+
+arch_pip() {
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        # Apple Silicon - 强制 arm64 架构执行
+        arch -arm64 "$VENV_DIR/bin/pip" "$@"
+    else
+        # Intel 或其他架构
+        "$VENV_DIR/bin/pip" "$@"
     fi
 }
 
 check_system() {
     log_info "检查系统环境..."
 
-    # 检查架构（Apple Silicon 兼容性）
-    if [[ "$(uname -m)" == "arm64" ]]; then
-        log_success "Apple Silicon (arm64) 检测到"
-        force_arm64
-    elif [[ "$(uname -m)" == "x86_64" ]] && sysctl -n machdep.cpu.brand_string | grep -q "Apple"; then
-        log_warn "检测到 Rosetta 转译模式，建议在原生 arm64 终端下安装"
+    # 检查架构
+    CPU_ARCH=$(uname -m)
+    PYTHON_ARCH=$(python3 -c "import platform; print(platform.machine())")
+    
+    if [[ "$CPU_ARCH" == "arm64" ]]; then
+        log_success "CPU: Apple Silicon (arm64)"
+        if [[ "$PYTHON_ARCH" == "arm64" ]]; then
+            log_success "Python: 原生 arm64"
+        else
+            log_warn "Python 运行在 Rosetta 转译模式下，将强制 arm64 架构安装"
+        fi
+    else
+        log_success "CPU: Intel (x86_64)"
     fi
 
     # 检查 Python
@@ -83,7 +103,7 @@ check_system() {
         exit 1
     fi
 
-    PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    PYTHON_VERSION=$(arch_python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     log_success "Python $PYTHON_VERSION 已找到"
 
     # 检查 Git
@@ -120,25 +140,29 @@ install_pyclaw() {
         git clone "$REPO_URL" pyclaw-demo
     fi
 
-    # 创建虚拟环境
+    # 创建虚拟环境（注意：venv 创建不能用 arch -arm64 前缀，直接创建）
     if [ ! -d "$VENV_DIR" ]; then
         log_info "创建虚拟环境..."
         python3 -m venv "$VENV_DIR"
     fi
 
-    # 安装依赖
+    # 安装依赖（使用架构适配的 pip）
     log_info "安装依赖..."
-    "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install -e "$INSTALL_DIR/pyclaw-demo"
+    arch_pip install --upgrade pip
+    arch_pip install -e "$INSTALL_DIR/pyclaw-demo"
 
     # 创建可执行文件链接
     log_info "创建命令链接..."
     mkdir -p "$BIN_DIR"
     
-    # 包装脚本（直接调用 venv 里的 pyclaw）
+    # 包装脚本（Apple Silicon 下强制 arm64 执行）
     cat > "$BIN_DIR/pyclaw" << EOF
 #!/bin/bash
-exec "$VENV_DIR/bin/pyclaw" "\$@"
+if [[ "\$(uname -m)" == "arm64" ]]; then
+    exec arch -arm64 "$VENV_DIR/bin/pyclaw" "\$@"
+else
+    exec "$VENV_DIR/bin/pyclaw" "\$@"
+fi
 EOF
     chmod +x "$BIN_DIR/pyclaw"
 
