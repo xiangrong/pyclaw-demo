@@ -119,11 +119,10 @@ install_pyclaw() {
     log_info "创建命令链接..."
     mkdir -p "$BIN_DIR"
     
-    # 包装脚本（激活 venv 后执行）
-    cat > "$BIN_DIR/pyclaw" << 'EOF'
+    # 包装脚本（直接调用 venv 里的 pyclaw）
+    cat > "$BIN_DIR/pyclaw" << EOF
 #!/bin/bash
-source "$HOME/.pyclaw/venv/bin/activate"
-exec pyclaw "$@"
+exec "$VENV_DIR/bin/pyclaw" "\$@"
 EOF
     chmod +x "$BIN_DIR/pyclaw"
 
