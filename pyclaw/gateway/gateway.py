@@ -27,26 +27,7 @@ class Gateway:
         channel.on_message(self._on_message)
         self.channels[channel.name] = channel
 
-    def _start_cron_ticker(self) -> None:
-        """启动 Cron 调度器后台线程"""
-        adapters = dict(self.channels)
-        loop = asyncio.get_running_loop()
 
-        def tick_loop():
-            while self._running:
-                try:
-                    cron_tick(verbose=False, adapters=adapters, loop=loop, use_subprocess=False)
-                except Exception as e:
-                    print(f"⚠️ Cron tick error: {e}")
-                time.sleep(60)
-
-        self._cron_ticker_thread = threading.Thread(
-            target=tick_loop,
-            daemon=True,
-            name="pyclaw-cron-ticker"
-        )
-        self._cron_ticker_thread.start()
-        print("✅ Cron ticker started")
 
     async def start(self) -> None:
         """启动所有通道"""
@@ -60,7 +41,8 @@ class Gateway:
             task.add_done_callback(self._tasks.discard)
 
         # 启动 cron ticker
-        self._start_cron_ticker()
+        from pyclaw.cron.scheduler import start_background_ticker
+        start_background_ticker(self.agent, self.channels)
 
         print("✅ All channels started!")
         print("=" * 50)
@@ -96,7 +78,8 @@ class Gateway:
             # 通过原通道发送回复
             await self.channels[message.channel].send_message(response)
 
-            print(f"📤 Replied: {response.content[:50]}...")
+            resp_preview = response[:50] if isinstance(response, str) else getattr(response, 'content', str(response))[:50]
+            print(f"📤 Replied: {resp_preview}...")
 
         except Exception as e:
             print(f"❌ Error processing message: {e}")
