@@ -74,7 +74,8 @@ class Agent:
 
     async def _agent_loop(self, session: Session) -> str:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
-        max_iterations = 5
+        max_iterations = 12  # 从 5 提高到 12
+        last_tool_calls = []  # 循环检测
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
@@ -83,12 +84,20 @@ class Agent:
             messages = session.get_history()
             print(f"  📜 历史消息数: {len(messages)}")
 
+            # 判断是否是最后几次迭代，强制禁用工具
+            is_final_iteration = i >= max_iterations - 2
+            if is_final_iteration:
+                print(f"  ⚠️  最后 {max_iterations - i} 次迭代，强制禁用工具")
+                tools = None  # 禁用工具调用
+            else:
+                tools = self.tools.get_all_specs()
+
             try:
                 # 调用 LLM
                 print(f"  🤖 正在调用 LLM...")
                 result = await self.model.chat(
                     messages=messages,
-                    tools=self.tools.get_all_specs(),
+                    tools=tools,
                     stream=False,
                 )
                 print(f"  ✅ LLM 调用完成")
@@ -96,13 +105,22 @@ class Agent:
                 print(f"  ❌ LLM 调用出错: {e}")
                 import traceback
                 traceback.print_exc()
-                return f"⚠️ LLM 调用出错: {str(e)}"
-
-            print(f"📨 LLM result type: {type(result)}")
+                return f"⚠️  LLM 调用出错: {str(e)}"
 
             # 检查是否有工具调用
             if isinstance(result, dict) and result.get("__tool_calls__"):
-                print("🔧 Tool calls detected!")
+                tool_calls = result["tool_calls"]
+                print(f"🔧 检测到 {len(tool_calls)} 个工具调用")
+
+                # 循环检测：连续相同的工具调用
+                tool_call_signature = str(tool_calls)
+                if tool_call_signature in last_tool_calls:
+                    print(f"  ⚠️  检测到循环调用，强制停止")
+                    return "⚠️  检测到循环调用，停止执行。当前已获取的信息可能不完整。"
+                
+                last_tool_calls.append(tool_call_signature)
+                if len(last_tool_calls) > 3:
+                    last_tool_calls.pop(0)
 
                 # 1. 添加助手消息（工具调用）到历史
                 tool_calls_content = result.get("content", "") or "正在调用工具..."
@@ -114,7 +132,7 @@ class Agent:
                     type=MessageType.TEXT,
                     role=MessageRole.ASSISTANT,
                     content=tool_calls_content,
-                    metadata={"tool_calls": result["tool_calls"]},
+                    metadata={"tool_calls": tool_calls},
                 )
                 session.add_message(assistant_msg)
 
@@ -129,12 +147,11 @@ class Agent:
                     print(f"  ❌ 工具执行出错: {e}")
                     import traceback
                     traceback.print_exc()
-                    return f"⚠️ 工具执行出错: {str(e)}"
+                    return f"⚠️  工具执行出错: {str(e)}"
 
-                print(f"🔧 Tool results: {len(tool_results)} results")
-
-                # 3. 将工具结果添加到会话
+                # 3. 将工具结果添加到会话（自动截断长内容）
                 for tr in tool_results:
+                    truncated_content = self._truncate_content(tr["content"])
                     session.add_message(
                         Message(
                             id=f"tool-{tr['tool_call_id']}",
@@ -143,7 +160,7 @@ class Agent:
                             session_id=session.session_id,
                             type=MessageType.TEXT,
                             role=MessageRole.TOOL,
-                            content=tr["content"],
+                            content=truncated_content,
                             metadata={
                                 "tool_name": tr["name"],
                                 "tool_call_id": tr["tool_call_id"],
@@ -156,5 +173,63 @@ class Agent:
             print("✅ No tool calls, returning final result")
             return str(result)
 
-        print("⚠️ Max iterations reached")
-        return "⚠️ 达到最大迭代次数，请简化你的请求。"
+        # 达到最大迭代次数，友好提示
+        print("⚠️  Max iterations reached, summarizing current result")
+        return self._summarize_final(session)
+
+    def _truncate_content(self, content: str, max_len: int = 8000) -> str:
+        """截断过长的工具返回结果，避免上下文溢出
+        注意：这只截断工具返回的结果，不会影响 LLM 生成的回复长度
+        """
+        if len(content) <= max_len:
+            return content
+        
+        # 对于代码和日志，保留前后部分，中间省略
+        if self._looks_like_code(content) or "---" in content:
+            keep_front = 4000
+            keep_back = 2000
+            front = content[:keep_front]
+            back = content[-keep_back:]
+            omitted = len(content) - keep_front - keep_back
+            return (
+                front
+                + f"\n\n... ⚠️  ----- 内容过长，中间省略了约 {omitted} 字符 ----- \n\n"
+                + back
+            )
+        
+        # 普通文本只保留前面
+        truncated = content[:max_len]
+        omitted = len(content) - max_len
+        return truncated + f"\n\n... ⚠️  内容已截断，省略了约 {omitted} 字符"
+
+    def _looks_like_code(self, content: str) -> bool:
+        """判断内容是否像代码"""
+        code_markers = ["def ", "class ", "import ", "function ", "const ", "let "]
+        lines = content.split('\n')
+        for line in lines[:20]:  # 只检查前 20 行
+            for marker in code_markers:
+                if marker in line:
+                    return True
+        return False
+
+    def _summarize_final(self, session: Session) -> str:
+        """达到最大迭代次数时，强制总结已有的信息"""
+        messages = session.get_history()
+        
+        # 收集所有工具返回的结果
+        tool_results = []
+        for msg in messages:
+            if msg.role == MessageRole.TOOL:
+                tool_results.append(msg.content)
+        
+        if tool_results:
+            return (
+                "⚠️  达到最大思考深度，基于已获取的信息总结如下：\n\n"
+                + "\n\n---\n\n".join(tool_results[-2:])  # 只取最后两个结果
+                + "\n\n💡 提示：可以尝试更简单的问题，或者分步骤询问"
+            )
+        else:
+            return (
+                "⚠️  思考超时，未能完成任务。\n\n"
+                "💡 建议：简化问题描述，或者分步骤询问。"
+            )
