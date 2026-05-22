@@ -35,12 +35,14 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             typer.echo(f"❌ {e}", err=True)
             sys.exit(1)
 
-        # 创建工作目录
+        # 创建工作目录和 skills 目录
         os.makedirs(cfg.work_dir, exist_ok=True)
         os.chdir(cfg.work_dir)
+        skills_dir = os.path.join(cfg.work_dir, "skills")
+        os.makedirs(skills_dir, exist_ok=True)
 
         # 初始化组件
-        tool_registry = ToolRegistry()
+        tool_registry = ToolRegistry(skills_dir=skills_dir)
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
@@ -118,12 +120,14 @@ def cron_exec(
             typer.echo(f"❌ {e}", err=True)
             sys.exit(1)
 
-        # 创建工作目录
+        # 创建工作目录和 skills 目录
         os.makedirs(cfg.work_dir, exist_ok=True)
         os.chdir(cfg.work_dir)
+        skills_dir = os.path.join(cfg.work_dir, "skills")
+        os.makedirs(skills_dir, exist_ok=True)
 
         # 初始化组件
-        tool_registry = ToolRegistry()
+        tool_registry = ToolRegistry(skills_dir=skills_dir)
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
