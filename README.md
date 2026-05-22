@@ -7,13 +7,12 @@
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 📱 飞书 Bot | ✅ | 官方 SDK 长连接，无需 ngrok/公网 IP |
-| 📱 Telegram Bot | ✅ | 标准 Webhook 模式 |
+| 📱 Telegram Bot | ✅ | 标准 Webhook/Polling 模式，**支持直接发送文件处理** |
 | 🤖 LLM 集成 | ✅ | 支持 OpenAI / 火山引擎 API |
-| 🔧 终端命令 | ✅ | 执行 Shell 命令 |
-| 📄 文件操作 | ✅ | 读取、写入文件 |
+| 🧠 动态技能 | ✅ | 支持通过 Git URL 自动安装和热加载 `SKILL.md` 技能生态 |
+| 🧰 内置工具 | ✅ | 终端命令、文件读写、Cron 定时任务 |
 | 💬 会话管理 | ✅ | 多轮对话上下文保存 |
 | 🔒 权限控制 | ✅ | 用户白名单 |
-| ⚡ OK 状态标记 | ✅ | 消息反应标签，确认已收到 |
 
 ## 🚀 快速开始
 
@@ -115,116 +114,50 @@ pyclaw/
     └── telegram.py          # Telegram Bot
 ```
 
-## 🔧 扩展开发
+## 🔧 扩展开发与生态
 
-### 添加新工具
+PyClaw 完美兼容 OpenClaw/Hermes 的 `SKILL.md` 技能生态，支持**渐进式能力披露 (Progressive Disclosure)**，极大节省上下文 Token。
 
-在 `pyclaw/tools/` 目录下创建新文件：
-
-```python
-from pyclaw.tools.base import BaseTool
-
-class MyTool(BaseTool):
-    name = "my_tool"
-    description = "这是我的自定义工具"
-
-    def get_spec(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "param1": {"type": "string", "description": "参数1"},
-                    },
-                    "required": ["param1"],
-                },
-            },
-        }
-
-    async def execute(self, arguments: dict) -> str:
-        param1 = arguments.get("param1", "")
-        # 执行逻辑...
-        return f"处理结果: {param1}"
+### 1. 安装新技能 (Chat-Driven)
+无需重启或修改代码，直接在 Telegram 或飞书中发送指令给 Agent：
+```text
+给我安装这个技能：https://github.com/ma2ong/claude-skills-collection.git
 ```
+Agent 会自动将仓库 Clone 到工作目录的 `skills/` 文件夹下，并在下一轮对话中将其编入自己的“能力索引”中。
 
-然后在 `pyclaw/core/agent.py` 中注册：
+### 2. 动态发现与加载
+Agent 在每次对话前都会扫描 `skills/` 目录。当你的任务需要某个技能时（例如“帮我分析财报”），它会使用内置的 `activate_skill` 工具，自动提取对应文件夹下的 `SKILL.md` 提示词，并严格按照其 SOP 执行配套脚本。
 
-```python
-from pyclaw.tools.my_tool import MyTool
+### 3. 创建你自己的技能包
+只需在 `skills/` 目录下创建一个文件夹，并在其中提供：
+1. `SKILL.md`: 明确告诉 Agent 这个技能的用途、工作流和必须执行的脚本命令。
+2. 辅助脚本 (`.py`, `.sh`, 等): 供 Agent 通过终端调用的实际代码。
 
-self.tools.register(MyTool())
-```
-
-### 添加新的消息通道
-
-在 `pyclaw/channels/` 目录下创建新文件：
-
-```python
-from pyclaw.channels.base import BaseChannel
-
-class MyChannel(BaseChannel):
-    name = "my_channel"
-
-    async def start(self) -> None:
-        # 启动通道
-        pass
-
-    async def stop(self) -> None:
-        # 停止通道
-        pass
-
-    async def send_message(self, message) -> None:
-        # 发送消息
-        pass
-```
-
-然后在 `pyclaw/gateway.py` 中注册：
-
-```python
-from pyclaw.channels.my_channel import MyChannel
-
-self.register_channel(MyChannel(config))
-```
+---
 
 ## 🎯 使用示例
 
-### 1. 执行终端命令
+### 1. 发送并分析文件 (Telegram)
 
 **用户输入：**
+*(在 Telegram 中直接发送一个 `data.csv` 附件，并配文)*
+```text
+请用 pandas 帮我提取里面的前三行数据
 ```
+
+**Agent 自动调用：**
+Agent 会获知文件下载的本地绝对路径，并自动调用 `TerminalTool` 编写并执行 Python 脚本来分析数据。
+
+### 2. 执行终端命令
+
+**用户输入：**
+```text
 列出当前目录的文件
 ```
 
 **Agent 自动调用：**
 ```python
 await TerminalTool().execute({"command": "ls -la"})
-```
-
-### 2. 读取文件
-
-**用户输入：**
-```
-查看 README.md 的内容
-```
-
-**Agent 自动调用：**
-```python
-await FileTool().execute({"action": "read", "path": "README.md"})
-```
-
-### 3. 写入文件
-
-**用户输入：**
-```
-创建一个 hello.txt，内容是 "Hello PyClaw!"
-```
-
-**Agent 自动调用：**
-```python
-await FileTool().execute({"action": "write", "path": "hello.txt", "content": "Hello PyClaw!"})
 ```
 
 ## 🐛 常见问题
