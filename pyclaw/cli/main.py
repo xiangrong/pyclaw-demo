@@ -17,6 +17,7 @@ from pyclaw.models.openai import OpenAIProvider
 from pyclaw.tools.files import ReadFileTool, WriteFileTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
+from pyclaw.tools.skill_activation import ActivateSkillTool
 from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
 
@@ -47,6 +48,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
         tool_registry.register(CronJobTool())
+        tool_registry.register(ActivateSkillTool())
 
         session_manager = SessionManager()
 
@@ -131,6 +133,7 @@ def cron_exec(
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
+        tool_registry.register(ActivateSkillTool())
         # Cron任务不允许创建新的Cron任务（防止递归）
 
         session_manager = SessionManager()

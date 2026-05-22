@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
 
 from pyclaw.core.message import Message, MessageRole, MessageType
@@ -28,10 +29,26 @@ class Agent:
             "You have various 'skills' which are directly provided to you as tool functions (Function Calling).\n"
             "CRITICAL RULES FOR SKILLS:\n"
             "1. To LIST skills: Just look at the tools available in your context and describe them. NEVER use terminal commands like `openclaw`.\n"
-            "2. To INSTALL a skill: You MUST use the `install_skill` tool and provide the raw URL. NEVER use `openclaw install` or `git clone` to install skills unless specifically asked to clone a repo.\n"
+            "2. To INSTALL a skill: You MUST use the `install_skill` tool and provide the git repository URL. NEVER use `openclaw install` or `git clone` to install skills directly.\n"
+            "3. To USE A COMPLEX SKILL: First check if it exists in your <available_skills> index below. If it does, MUST call `activate_skill(name=...)` to load its full SKILL.md instructions before proceeding.\n"
             "Think carefully and use the available tools when needed.\n"
-            "Always explain what you're doing to the user in Chinese."
+            "Always explain what you're doing to the user in Chinese.\n\n"
         )
+        self.base_system_prompt = self.system_prompt # save base
+
+    def _get_dynamic_system_prompt(self) -> str:
+        """动态生成带技能索引的系统提示词"""
+        skills_index = []
+        skills_dir = os.path.abspath(os.path.join(os.getcwd(), "skills"))
+        if os.path.exists(skills_dir):
+            for entry in os.listdir(skills_dir):
+                skill_path = os.path.join(skills_dir, entry)
+                if os.path.isdir(skill_path) and os.path.exists(os.path.join(skill_path, "SKILL.md")):
+                    skills_index.append(f"- {entry}")
+        
+        index_str = "\n".join(skills_index) if skills_index else "No SKILL.md based skills installed."
+        
+        return self.base_system_prompt + f"<available_skills>\n{index_str}\n</available_skills>"
 
     async def process_message(self, message: Message) -> Message:
         """处理用户消息并生成回复"""
@@ -40,6 +57,9 @@ class Agent:
             channel=message.channel,
             user_id=message.channel_user_id,
         )
+
+        # 动态更新系统提示词（允许技能热插拔被感知）
+        current_system_prompt = self._get_dynamic_system_prompt()
 
         # 如果是新会话，添加系统提示
         if not session.messages:
@@ -51,9 +71,15 @@ class Agent:
                     session_id=session.session_id,
                     type=message.type,
                     role=MessageRole.SYSTEM,
-                    content=self.system_prompt,
+                    content=current_system_prompt,
                 )
             )
+        else:
+            # 找到并更新已有的 system prompt
+            for msg in session.messages:
+                if msg.role == MessageRole.SYSTEM:
+                    msg.content = current_system_prompt
+                    break
 
         # 添加用户消息到会话
         session.add_message(message)
