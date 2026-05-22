@@ -74,7 +74,7 @@ class Agent:
 
     async def _agent_loop(self, session: Session) -> str:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
-        max_iterations = 12  # 从 5 提高到 12
+        max_iterations = 25  # 增加到25，支持更复杂的长任务
         last_tool_calls = []  # 循环检测
 
         for i in range(max_iterations):
