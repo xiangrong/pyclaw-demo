@@ -4,6 +4,8 @@ import asyncio
 import os
 import signal
 import sys
+from importlib import metadata
+from typing import Optional
 
 import typer
 
@@ -22,6 +24,28 @@ from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
 
 app = typer.Typer(help="PyClaw - Python AI Agent")
+
+def version_callback(value: bool) -> None:
+    if value:
+        try:
+            version = metadata.version("pyclaw")
+        except metadata.PackageNotFoundError:
+            version = "unknown (not installed as package)"
+        typer.echo(f"PyClaw version: {version}")
+        raise typer.Exit()
+
+@app.callback()
+def main(
+    version: Optional[bool] = typer.Option(
+        None,
+        "--version",
+        "-v",
+        callback=version_callback,
+        is_eager=True,
+        help="Show the application's version and exit.",
+    )
+) -> None:
+    pass
 
 
 @app.command()
