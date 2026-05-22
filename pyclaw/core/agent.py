@@ -219,7 +219,7 @@ class Agent:
 
     def _summarize_final(self, session: Session) -> str:
         """达到最大迭代次数时，强制总结已有的信息"""
-        messages = session.get_history()
+        messages = session.messages
         
         # 收集所有工具返回的结果
         tool_results = []
