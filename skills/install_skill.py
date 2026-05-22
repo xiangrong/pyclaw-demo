@@ -32,7 +32,8 @@ class InstallSkillTool(BaseTool):
         if not filename.endswith('.py'):
             filename += '.py'
 
-        skills_dir = "skills"
+        # Use absolute path based on current working directory (set by pyclaw config)
+        skills_dir = os.path.abspath(os.path.join(os.getcwd(), "skills"))
         os.makedirs(skills_dir, exist_ok=True)
         file_path = os.path.join(skills_dir, filename)
 
