@@ -19,9 +19,23 @@ class Session(BaseModel):
         """添加消息到会话历史"""
         self.messages.append(message)
 
-    def get_history(self, limit: int = 20) -> list[dict[str, Any]]:
-        """获取LLM格式的历史消息"""
-        return [msg.to_llm_format() for msg in self.messages[-limit:]]
+    def get_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        """获取LLM格式的历史消息，确保系统提示词不会被截断"""
+        if len(self.messages) <= limit:
+            return [msg.to_llm_format() for msg in self.messages]
+        
+        # 提取系统消息（通常在最前面）
+        system_msgs = [msg for msg in self.messages if msg.role == MessageRole.SYSTEM]
+        
+        # 提取最近的 limit 个消息
+        recent_msgs = self.messages[-limit:]
+        
+        # 确保 recent_msgs 中不包含已经提取的 system_msgs
+        recent_msgs = [m for m in recent_msgs if m.id not in [sm.id for sm in system_msgs]]
+        
+        # 合并返回
+        final_msgs = system_msgs + recent_msgs
+        return [msg.to_llm_format() for msg in final_msgs]
 
     def clear(self) -> None:
         """清空会话历史（保留系统提示词）"""

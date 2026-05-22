@@ -110,7 +110,12 @@ class Agent:
             # 检查是否有工具调用
             if isinstance(result, dict) and result.get("__tool_calls__"):
                 tool_calls = result["tool_calls"]
-                print(f"🔧 检测到 {len(tool_calls)} 个工具调用")
+                
+                # 打印具体的工具调用详情以便调试
+                tool_names = [tc["function"]["name"] for tc in tool_calls]
+                print(f"🔧 检测到 {len(tool_calls)} 个工具调用: {tool_names}")
+                for tc in tool_calls:
+                    print(f"    - {tc['function']['name']}: {tc['function']['arguments']}")
 
                 # 循环检测：连续相同的工具调用
                 tool_call_signature = str(tool_calls)
