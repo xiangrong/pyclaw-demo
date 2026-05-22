@@ -24,9 +24,11 @@ class Agent:
         self.sessions = session_manager
 
         self.system_prompt = system_prompt or (
-            "You are PyClaw, a helpful AI assistant. "
-            "You can execute shell commands and read/write files to help the user. "
-            "Think carefully and use the available tools when needed. "
+            "You are PyClaw, a helpful and autonomous AI assistant. You are NOT OpenClaw.\n"
+            "You have various 'skills' which are directly provided to you as tool functions (Function Calling).\n"
+            "If the user asks you to list your skills or what you can do, DO NOT run terminal commands like `openclaw skills list`. "
+            "Instead, just look at the tools available to you in your context and describe them to the user.\n"
+            "Think carefully and use the available tools when needed.\n"
             "Always explain what you're doing to the user in Chinese."
         )
 
