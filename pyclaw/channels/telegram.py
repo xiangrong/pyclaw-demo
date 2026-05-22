@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import os
 import uuid
 from typing import Optional
 
@@ -32,8 +32,8 @@ class TelegramChannel(BaseChannel):
         """启动Telegram Bot"""
         self._app = ApplicationBuilder().token(self.token).build()
 
-        # 添加消息处理器
-        handler = MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text_message)
+        # 添加消息处理器 (支持文本和文件)
+        handler = MessageHandler((filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, self._on_message)
         self._app.add_handler(handler)
 
         # 添加命令处理器
@@ -51,12 +51,12 @@ class TelegramChannel(BaseChannel):
             await self._app.updater.stop()
             await self._app.stop()
 
-    async def _on_text_message(
+    async def _on_message(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """处理文本消息"""
+        """处理文本和文件消息"""
         if not update.message or not update.effective_user:
             return
 
@@ -66,15 +66,46 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text("❌ 你没有权限使用此Bot")
             return
 
+        content = ""
+        msg_type = MessageType.TEXT
+
+        # 处理文件上传
+        if update.message.document:
+            document = update.message.document
+            file_name = document.file_name or "unknown_file"
+            
+            # 创建下载目录
+            download_dir = os.path.abspath(os.path.join(os.getcwd(), "downloads"))
+            os.makedirs(download_dir, exist_ok=True)
+            
+            file_path = os.path.join(download_dir, file_name)
+            
+            # 下载文件
+            telegram_file = await context.bot.get_file(document.file_id)
+            await telegram_file.download_to_drive(file_path)
+            
+            # 构造提示词，告诉 LLM 文件存在哪里
+            caption = update.message.caption or ""
+            content = f"[User uploaded a file named '{file_name}'. It has been saved locally at: {file_path}]\n"
+            if caption:
+                content += f"User message: {caption}"
+            
+            msg_type = MessageType.FILE
+        elif update.message.text:
+            content = update.message.text
+        
+        if not content:
+            return
+
         msg = Message(
             id=str(uuid.uuid4()),
             channel="telegram",
             channel_user_id=str(user_id),
             user_id=str(user_id),
             session_id=f"telegram:{user_id}",
-            type=MessageType.TEXT,
+            type=msg_type,
             role=MessageRole.USER,
-            content=update.message.text or "",
+            content=content,
         )
 
         await self._handle_message(msg)
