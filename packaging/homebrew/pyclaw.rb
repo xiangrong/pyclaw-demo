@@ -3,9 +3,9 @@ class Pyclaw < Formula
 
   desc "Python AI Agent - OpenClaw inspired personal assistant with Feishu/Lark support"
   homepage "https://github.com/xiangrong/pyclaw-demo"
-  url "https://github.com/xiangrong/pyclaw-demo/releases/download/v0.1.1/pyclaw-0.1.1.tar.gz"
-  version "0.1.1"
-  sha256 "60f75f013d7c43eca12ac0883fc68dfa67b938f7c8f2d9ea620ba78d077ab7ab"
+  url "https://github.com/xiangrong/pyclaw-demo/releases/download/v0.2.0/pyclaw-0.2.0.tar.gz"
+  version "0.2.0"
+  sha256 "8b8060a686b060bdccbecd755db96241e81620a8a92d55ff09b49dbc902d710d"
 
   depends_on "python@3.11"
 
