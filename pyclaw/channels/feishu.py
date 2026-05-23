@@ -49,8 +49,43 @@ class FeishuChannel(BaseChannel):
                 sender = event_obj.sender
 
                 # 消息内容
-                content = json.loads(message.content)
-                text = content.get("text", "")
+                content_raw = message.content
+                content = json.loads(content_raw)
+                
+                msg_type = message.message_type # text, image, file, audio, media, sticker, interactive
+                text = ""
+                file_path = None
+                m_type = MessageType.TEXT
+
+                if msg_type == "text":
+                    text = content.get("text", "")
+                elif msg_type == "post":
+                    # 富文本，提取文本部分
+                    content_list = content.get("content", [])
+                    text_parts = []
+                    for row in content_list:
+                        for item in row:
+                            if item.get("tag") == "text":
+                                text_parts.append(item.get("text", ""))
+                    text = "".join(text_parts)
+                elif msg_type in ["image", "file", "audio", "media"]:
+                    key = content.get("image_key") or content.get("file_key")
+                    file_name = content.get("file_name", f"feishu_{msg_type}_{message.message_id}")
+                    if key:
+                        # 启动异步下载
+                        file_path = asyncio.run_coroutine_threadsafe(
+                            self._download_media(message.message_id, key, file_name, msg_type),
+                            self._loop
+                        ).result()
+                        
+                        text = f"[Received {msg_type}: {file_name}] Local path: {file_path}"
+                        if msg_type == "image": m_type = MessageType.IMAGE
+                        elif msg_type == "file": m_type = MessageType.FILE
+                        # 允许用户附带文字描述
+                        if "text" in content:
+                            text += f"\nDescription: {content['text']}"
+                else:
+                    text = f"[Unsupported message type: {msg_type}]"
 
                 # 发送者信息
                 open_id = sender.sender_id.open_id
@@ -76,9 +111,10 @@ class FeishuChannel(BaseChannel):
                     channel_user_id=open_id,
                     user_id=open_id,
                     session_id=f"feishu:{open_id}",
-                    type=MessageType.TEXT,
+                    type=m_type,
                     role=MessageRole.USER,
                     content=text,
+                    metadata={"file_path": file_path} if file_path else {},
                 )
 
                 # 处理消息
@@ -102,6 +138,8 @@ class FeishuChannel(BaseChannel):
             .register_p2_im_message_receive_v1(on_message_receive)
             .register_p2_im_message_message_read_v1(noop_handler)
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(noop_handler)
+            .register_p2_im_message_reaction_created_v1(noop_handler)
+            .register_p2_im_message_reaction_deleted_v1(noop_handler)
             .build()
         )
 
@@ -113,6 +151,7 @@ class FeishuChannel(BaseChannel):
                     self.app_id,
                     self.app_secret,
                     event_handler=handler,
+                    log_level=lark.LogLevel.WARNING, # 减少日志输出
                 )
                 ws_client.start()
             except Exception as e:
@@ -130,12 +169,11 @@ class FeishuChannel(BaseChannel):
             await self._session.close()
 
     async def send_message(self, message: Message) -> None:
-        """发送消息到飞书"""
+        """发送消息到飞书 (支持文本和消息卡片)"""
         try:
             print(f"📤 [飞书] 正在发送消息...")
 
             token = await self._get_tenant_token()
-
             url = "https://open.feishu.cn/open-apis/im/v1/messages"
             headers = {
                 "Authorization": f"Bearer {token}",
@@ -143,13 +181,31 @@ class FeishuChannel(BaseChannel):
             }
 
             receive_id = message.channel_user_id
-            content = json.dumps({"text": message.content}, ensure_ascii=False)
+            
+            # 检测是否包含 Markdown 格式，如果是则发送消息卡片以获得更好的显示效果
+            if self._is_markdown(message.content):
+                msg_type = "interactive"
+                # 构建简单的消息卡片
+                card_content = {
+                    "config": {"wide_screen_mode": True},
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": message.content
+                        }
+                    ]
+                }
+                # 如果内容非常长，飞书卡片有长度限制，可能需要截断或分段，这里先做简单处理
+                content = json.dumps(card_content, ensure_ascii=False)
+            else:
+                msg_type = "text"
+                content = json.dumps({"text": message.content}, ensure_ascii=False)
 
             params = {"receive_id_type": "open_id"}
             data = {
                 "receive_id": receive_id,
                 "content": content,
-                "msg_type": "text",
+                "msg_type": msg_type,
             }
 
             async with self._session.post(url, headers=headers, params=params, json=data) as resp:
@@ -157,13 +213,27 @@ class FeishuChannel(BaseChannel):
 
                 if result.get("code") != 0:
                     print(f"❌ [飞书] 发送失败: {result.get('msg')} (code: {result.get('code')})")
+                    # 如果卡片发送失败（可能因为内容过长或格式问题），尝试退回到普通文本
+                    if msg_type == "interactive":
+                        print("⚠️ 卡片发送失败，尝试退回到纯文本发送...")
+                        data["msg_type"] = "text"
+                        data["content"] = json.dumps({"text": message.content}, ensure_ascii=False)
+                        async with self._session.post(url, headers=headers, params=params, json=data) as retry_resp:
+                            retry_result = await retry_resp.json()
+                            if retry_result.get("code") == 0:
+                                print("✅ [飞书] 纯文本重试发送成功")
                 else:
-                    print(f"✅ [飞书] 消息发送成功")
+                    print(f"✅ [飞书] 消息发送成功 ({msg_type})")
 
         except Exception as e:
             print(f"❌ [飞书] 发送异常: {e}")
             import traceback
             traceback.print_exc()
+
+    def _is_markdown(self, text: str) -> bool:
+        """简单检测文本是否包含 Markdown 格式"""
+        markers = ["**", "###", "##", "- ", "1. ", "[", "`"]
+        return any(marker in text for marker in markers)
 
     def _add_ok_reaction_sync(self, message_id: str) -> None:
         """给用户消息添加 OK 反应标签 - 表示已收到"""
@@ -223,3 +293,46 @@ class FeishuChannel(BaseChannel):
                 return result["tenant_access_token"]
             else:
                 raise Exception(f"获取 Token 失败: {result}")
+
+    async def _download_media(self, message_id: str, file_key: str, file_name: str, msg_type: str) -> str:
+        """从飞书下载媒体文件并保存到本地"""
+        import os
+        from pathlib import Path
+
+        # 确保下载目录存在
+        download_dir = Path.home() / ".pyclaw" / "downloads" / "feishu"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        
+        local_path = download_dir / f"{message_id}_{file_name}"
+        
+        try:
+            print(f"📥 [飞书] 正在下载媒体文件: {file_name} ({msg_type})...")
+            
+            token = await self._get_tenant_token()
+            
+            # 使用官方接口下载媒体文件
+            # 对于 image 使用 get_image，对于其他使用 get_file
+            if msg_type == "image":
+                url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image"
+            else:
+                url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=file"
+
+            headers = {
+                "Authorization": f"Bearer {token}",
+            }
+
+            async with self._session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    with open(local_path, "wb") as f:
+                        f.write(await resp.read())
+                    print(f"✅ [飞书] 文件已下载到: {local_path}")
+                    return str(local_path)
+                else:
+                    error_text = await resp.text()
+                    print(f"❌ [飞书] 下载失败 (HTTP {resp.status}): {error_text}")
+        except Exception as e:
+            print(f"❌ [飞书] 下载异常: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        return ""
