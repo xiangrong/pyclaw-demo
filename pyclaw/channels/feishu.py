@@ -147,6 +147,7 @@ class FeishuChannel(BaseChannel):
         def start_ws():
             try:
                 print("🔗 正在建立飞书长连接...")
+                # 关键：在子线程中实例化 Client，确保其内部的 asyncio.Lock 等对象绑定到子线程的 loop
                 ws_client = lark.ws.Client(
                     self.app_id,
                     self.app_secret,

@@ -81,7 +81,7 @@ class Agent:
     async def process_message(self, message: Message) -> Message:
         """处理用户消息并生成回复"""
         # 获取或创建会话
-        session = self.sessions.get_or_create(
+        session = await self.sessions.get_or_create(
             channel=message.channel,
             user_id=message.channel_user_id,
         )
@@ -90,27 +90,31 @@ class Agent:
         current_system_prompt = self._get_dynamic_system_prompt()
 
         # 如果是新会话，添加系统提示
-        if not session.messages:
-            session.add_message(
-                Message(
-                    id="system",
-                    channel=message.channel,
-                    channel_user_id=message.channel_user_id,
-                    session_id=session.session_id,
-                    type=message.type,
-                    role=MessageRole.SYSTEM,
-                    content=current_system_prompt,
-                )
+        system_msg = None
+        for msg in session.messages:
+            if msg.role == MessageRole.SYSTEM:
+                system_msg = msg
+                break
+        
+        if not system_msg:
+            system_msg = Message(
+                id=f"system-{session.session_id}",
+                channel=message.channel,
+                channel_user_id=message.channel_user_id,
+                session_id=session.session_id,
+                type=message.type,
+                role=MessageRole.SYSTEM,
+                content=current_system_prompt,
             )
+            await self.sessions.save_message(session, system_msg)
         else:
-            # 找到并更新已有的 system prompt
-            for msg in session.messages:
-                if msg.role == MessageRole.SYSTEM:
-                    msg.content = current_system_prompt
-                    break
+            # 动态更新系统提示词内容
+            if system_msg.content != current_system_prompt:
+                system_msg.content = current_system_prompt
+                await self.sessions.save_message(session, system_msg)
 
         # 添加用户消息到会话
-        session.add_message(message)
+        await self.sessions.save_message(session, message)
 
         # 执行 Agent 循环
         response_content = await self._agent_loop(session)
@@ -125,9 +129,26 @@ class Agent:
             role=MessageRole.ASSISTANT,
             content=response_content,
         )
-        session.add_message(response)
+        await self.sessions.save_message(session, response)
 
         return response
+
+    async def run(self, session: Session, prompt: str) -> str:
+        """运行一次性任务（如 Cron 任务）"""
+        # 创建并保存用户消息
+        message = Message(
+            id=f"run-{session.session_id}-{int(datetime.now().timestamp())}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=prompt,
+        )
+        await self.sessions.save_message(session, message)
+        
+        # 执行循环
+        return await self._agent_loop(session)
 
     async def _agent_loop(self, session: Session) -> str:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
@@ -187,7 +208,7 @@ class Agent:
                 # 1. 添加助手消息（工具调用）到历史
                 tool_calls_content = result.get("content", "") or "正在调用工具..."
                 assistant_msg = Message(
-                    id=f"assistant-toolcall-{i}",
+                    id=f"assistant-toolcall-{i}-{session.session_id}",
                     channel=session.channel,
                     channel_user_id=session.user_id,
                     session_id=session.session_id,
@@ -196,7 +217,7 @@ class Agent:
                     content=tool_calls_content,
                     metadata={"tool_calls": tool_calls},
                 )
-                session.add_message(assistant_msg)
+                await self.sessions.save_message(session, assistant_msg)
 
                 # 2. 执行工具调用
                 try:
@@ -214,21 +235,20 @@ class Agent:
                 # 3. 将工具结果添加到会话（自动截断长内容）
                 for tr in tool_results:
                     truncated_content = self._truncate_content(tr["content"])
-                    session.add_message(
-                        Message(
-                            id=f"tool-{tr['tool_call_id']}",
-                            channel=session.channel,
-                            channel_user_id=session.user_id,
-                            session_id=session.session_id,
-                            type=MessageType.TEXT,
-                            role=MessageRole.TOOL,
-                            content=truncated_content,
-                            metadata={
-                                "tool_name": tr["name"],
-                                "tool_call_id": tr["tool_call_id"],
-                            },
-                        )
+                    tool_msg = Message(
+                        id=f"tool-{tr['tool_call_id']}-{session.session_id}",
+                        channel=session.channel,
+                        channel_user_id=session.user_id,
+                        session_id=session.session_id,
+                        type=MessageType.TEXT,
+                        role=MessageRole.TOOL,
+                        content=truncated_content,
+                        metadata={
+                            "tool_name": tr["name"],
+                            "tool_call_id": tr["tool_call_id"],
+                        },
                     )
+                    await self.sessions.save_message(session, tool_msg)
                 continue
 
             # 没有工具调用，返回最终结果

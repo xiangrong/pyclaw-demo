@@ -85,7 +85,9 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(InstallSkillTool())
         tool_registry.register(UninstallSkillTool())
 
-        session_manager = SessionManager()
+        db_path = os.path.join(cfg.work_dir, "pyclaw.db")
+        session_manager = SessionManager(db_path=db_path)
+        await session_manager.init_db()
 
         model_provider = OpenAIProvider(
             api_key=cfg.model.api_key,
@@ -181,7 +183,9 @@ def cron_exec(
         tool_registry.register(UninstallSkillTool())
         # Cron任务不允许创建新的Cron任务（防止递归）
 
-        session_manager = SessionManager()
+        db_path = os.path.join(cfg.work_dir, "pyclaw.db")
+        session_manager = SessionManager(db_path=db_path)
+        await session_manager.init_db()
 
         model_provider = OpenAIProvider(
             api_key=cfg.model.api_key,
@@ -196,7 +200,7 @@ def cron_exec(
         )
 
         # 创建临时会话并执行
-        session = session_manager.create_session(f"cron_{job_id}")
+        session = await session_manager.create_session(f"cron_{job_id}")
         result = await agent.run(session, prompt)
 
         # 打印结果到stdout
