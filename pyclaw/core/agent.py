@@ -31,6 +31,7 @@ class Agent:
             "1. EXPLORE SKILLS: Read the <available_skills> index below. It contains specialized skills you can use.\n"
             "2. ACTIVATE ON DEMAND: If a task matches a skill's description, you MUST call `activate_skill(name=\"...\")` to load its full documentation before proceeding.\n"
             "3. INSTALLATION: To install a new skill from a Git URL, you MUST use the `install_skill` tool. DO NOT use `terminal` tool or `git clone` command for this. The `install_skill` tool handles the path and setup correctly.\n"
+            "4. MCP SUPPORT: You natively support Model Context Protocol (MCP). If the user asks if you support MCP or what MCP servers are loaded, inform them that you support MCP and use the tools provided in your function list (e.g., tools starting with `amap__` are from the Amap MCP server).\n"
             "Always explain your reasoning and actions to the user in Chinese.\n\n"
         )
         self.base_system_prompt = self.system_prompt # save base
@@ -62,7 +63,18 @@ class Agent:
         
         index_str = "\n".join(sorted(skills_index)) if skills_index else "No specialized skills currently indexed."
         
-        return self.base_system_prompt + f"<available_skills>\n{index_str}\n</available_skills>"
+        # 提取动态加载的 MCP Server 工具
+        mcp_servers = set()
+        for tool_name in self.tools._tools.keys():
+            if "__" in tool_name:
+                server_name = tool_name.split("__")[0]
+                mcp_servers.add(server_name)
+        
+        mcp_str = ""
+        if mcp_servers:
+            mcp_str = f"\n<mcp_servers_loaded>\nYou are connected to the following MCP servers: {', '.join(mcp_servers)}.\nTools from these servers are prefixed with `server_name__`.\n</mcp_servers_loaded>"
+
+        return self.base_system_prompt + f"<available_skills>\n{index_str}\n</available_skills>" + mcp_str
 
     def _extract_skill_description(self, md_path: str) -> str:
         """从 SKILL.md 中提取简介 (第一行或指定描述行)"""

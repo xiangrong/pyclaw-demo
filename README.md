@@ -10,6 +10,7 @@
 | 📱 Telegram Bot | ✅ | 标准 Webhook/Polling 模式，**支持直接发送文件处理** |
 | 🤖 LLM 集成 | ✅ | 支持 OpenAI / 火山引擎 API |
 | 🧠 动态技能 | ✅ | 支持通过 Git URL 自动安装和热加载 `SKILL.md` 技能生态 |
+| 🔌 MCP 支持 | ✅ | 原生支持 Model Context Protocol (MCP)，内置高德地图适配 |
 | 🧰 内置工具 | ✅ | 终端命令、文件读写、Cron 定时任务 |
 | 💬 会话管理 | ✅ | 多轮对话上下文保存 |
 | 🔒 权限控制 | ✅ | 用户白名单 |
@@ -194,3 +195,9 @@ MIT License
 ---
 
 **Made with ❤️ by PyClaw Team**
+ Pull Request！
+
+---
+
+**Made with ❤️ by PyClaw Team**
+

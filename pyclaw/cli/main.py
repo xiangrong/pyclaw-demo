@@ -23,6 +23,7 @@ from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
 from skills.install_skill import InstallSkillTool, UninstallSkillTool
 from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
+from pyclaw.tools.mcp_client import MCPClientManager
 
 app = typer.Typer(help="PyClaw - Python AI Agent")
 
@@ -85,6 +86,13 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(InstallSkillTool())
         tool_registry.register(UninstallSkillTool())
 
+        # 初始化并启动 MCP 客户端
+        mcp_manager = MCPClientManager(cfg.mcp_servers)
+        await mcp_manager.start()
+        mcp_tools = await mcp_manager.load_tools()
+        for tool in mcp_tools:
+            tool_registry.register(tool, is_static=True)
+
         db_path = os.path.join(cfg.work_dir, "pyclaw.db")
         session_manager = SessionManager(db_path=db_path)
         await session_manager.init_db()
@@ -139,6 +147,8 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
 
         finally:
             await gateway.stop()
+            if 'mcp_manager' in locals():
+                await mcp_manager.stop()
 
     asyncio.run(_start())
 
@@ -249,6 +259,18 @@ feishu:
   # 允许使用的用户 open_id 列表 (留空则允许所有人)
   allowed_user_ids:
     # - ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 高德地图配置 (可选，配置后会自动挂载高德地图 MCP Server)
+# amap:
+#   # 你的高德开放平台 Web 服务 API Key (从 https://lbs.amap.com/ 获取)
+#   api_key: "YOUR_AMAP_API_KEY"
+
+# MCP Servers 配置 (可选)
+# mcp_servers:
+#   sqlite:
+#     command: "uvx"
+#     args: ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
+#     env: {}
 
 model:
   # 模型提供商: openai, ark, etc.

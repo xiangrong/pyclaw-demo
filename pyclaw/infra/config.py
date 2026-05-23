@@ -19,6 +19,12 @@ class FeishuConfig(BaseModel):
     allowed_user_ids: Optional[list[str]] = None
 
 
+class MCPServerConfig(BaseModel):
+    command: str
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+
+
 class ModelConfig(BaseModel):
     provider: str = "openai"
     api_key: str
@@ -29,6 +35,7 @@ class ModelConfig(BaseModel):
 class Config(BaseModel):
     telegram: Optional[TelegramConfig] = None
     feishu: Optional[FeishuConfig] = None
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     model: ModelConfig
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
 
@@ -54,9 +61,22 @@ def load_config(config_path: Optional[str] = None) -> Config:
 
     # 处理空的 allowed_user_ids
     if data.get("telegram", {}).get("allowed_user_ids") is None:
-        data["telegram"]["allowed_user_ids"] = []
+        if "telegram" in data:
+            data["telegram"]["allowed_user_ids"] = []
 
     if data.get("feishu", {}).get("allowed_user_ids") is None:
-        data["feishu"]["allowed_user_ids"] = []
+        if "feishu" in data:
+            data["feishu"]["allowed_user_ids"] = []
+
+    # 默认注入高德地图 MCP
+    if data.get("amap", {}).get("api_key"):
+        if "mcp_servers" not in data:
+            data["mcp_servers"] = {}
+        if "amap" not in data["mcp_servers"]:
+            data["mcp_servers"]["amap"] = {
+                "command": "npx",
+                "args": ["-y", "@amap/amap-maps-mcp-server"],
+                "env": {"AMAP_MAPS_API_KEY": data["amap"]["api_key"]}
+            }
 
     return Config(**data)

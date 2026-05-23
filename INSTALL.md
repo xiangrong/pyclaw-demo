@@ -31,11 +31,13 @@ git clone https://github.com/xiangrong/pyclaw-demo.git
 cd pyclaw-demo
 ```
 
-**2. 创建虚拟环境 (可选但强烈推荐)**
+**2. 创建虚拟环境 (强烈推荐，确保使用 Python 3.10+)**
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 ```
+
+*注意：如果你的系统默认 python3 版本低于 3.10，请先升级 Python 或使用 Conda。*
 
 **3. 安装依赖与包**
 ```bash
@@ -92,4 +94,5 @@ pip install -e .
   运行命令检查您安装的 PyClaw 版本：
   ```bash
   pyclaw --version
+  ```on
   ```
