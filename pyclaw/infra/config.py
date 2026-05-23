@@ -30,7 +30,7 @@ class Config(BaseModel):
     telegram: Optional[TelegramConfig] = None
     feishu: Optional[FeishuConfig] = None
     model: ModelConfig
-    work_dir: str = Field(default_factory=lambda: str(Path.home() / "pyclaw"))
+    work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
 
 
 def load_config(config_path: Optional[str] = None) -> Config:

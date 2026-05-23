@@ -28,26 +28,55 @@ class Agent:
             "You are PyClaw, an autonomous AI assistant.\n"
             "You manage your capabilities exclusively using the provided function calling tools.\n"
             "CRITICAL RULES:\n"
-            "1. To list your skills: Read the <available_skills> index at the bottom of this prompt. Do not use the terminal to list skills.\n"
-            "2. To install a new skill from a Git URL: You MUST call the `install_skill` tool function. Do NOT use the `terminal` tool for cloning, downloading, or installation.\n"
-            "3. To use a skill: If a relevant skill is in <available_skills>, you MUST call the `activate_skill` tool function first to load its instructions.\n"
-            "Always explain what you're doing to the user in Chinese.\n\n"
+            "1. EXPLORE SKILLS: Read the <available_skills> index below. It contains specialized skills you can use.\n"
+            "2. ACTIVATE ON DEMAND: If a task matches a skill's description, you MUST call `activate_skill(name=\"...\")` to load its full documentation before proceeding.\n"
+            "3. INSTALLATION: To install a new skill from a Git URL, you MUST use the `install_skill` tool. DO NOT use `terminal` tool or `git clone` command for this. The `install_skill` tool handles the path and setup correctly.\n"
+            "Always explain your reasoning and actions to the user in Chinese.\n\n"
         )
         self.base_system_prompt = self.system_prompt # save base
 
     def _get_dynamic_system_prompt(self) -> str:
         """动态生成带技能索引的系统提示词"""
         skills_index = []
-        skills_dir = os.path.abspath(os.path.join(os.getcwd(), "skills"))
-        if os.path.exists(skills_dir):
-            for entry in os.listdir(skills_dir):
-                skill_path = os.path.join(skills_dir, entry)
-                if os.path.isdir(skill_path) and os.path.exists(os.path.join(skill_path, "SKILL.md")):
-                    skills_index.append(f"- {entry}")
         
-        index_str = "\n".join(skills_index) if skills_index else "No SKILL.md based skills installed."
+        for skills_dir in self.tools.skills_dirs:
+            if skills_dir and skills_dir.exists():
+                # 1. 递归搜索所有带 SKILL.md 的目录 (支持嵌套)
+                for root, dirs, files in os.walk(skills_dir):
+                    if "SKILL.md" in files:
+                        skill_md_path = os.path.join(root, "SKILL.md")
+                        # 技能名称使用相对于 skills 目录的路径
+                        rel_path = os.path.relpath(root, skills_dir)
+                        description = self._extract_skill_description(skill_md_path)
+                        # 避免重复
+                        if not any(item.startswith(f"- {rel_path}:") for item in skills_index):
+                            skills_index.append(f"- {rel_path}: {description}")
+                
+                # 2. 搜索根目录下的独立 .py 技能 (ToolRegistry 自动加载的)
+                for file in os.listdir(skills_dir):
+                    if file.endswith(".py") and not file.startswith("__"):
+                        skill_name = file[:-3]
+                        # 避免重复索引
+                        if not any(item.startswith(f"- {skill_name}:") for item in skills_index):
+                            skills_index.append(f"- {skill_name}: Python tool script.")
+        
+        index_str = "\n".join(sorted(skills_index)) if skills_index else "No specialized skills currently indexed."
         
         return self.base_system_prompt + f"<available_skills>\n{index_str}\n</available_skills>"
+
+    def _extract_skill_description(self, md_path: str) -> str:
+        """从 SKILL.md 中提取简介 (第一行或指定描述行)"""
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # 返回第一个非空非标题行作为简介
+                    return line[:100] + "..." if len(line) > 100 else line
+        except Exception:
+            pass
+        return "No description available."
 
     async def process_message(self, message: Message) -> Message:
         """处理用户消息并生成回复"""

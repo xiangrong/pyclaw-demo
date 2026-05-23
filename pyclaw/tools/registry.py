@@ -14,10 +14,10 @@ from .base import BaseTool, ToolResult
 class ToolRegistry:
     """工具注册和执行中心"""
 
-    def __init__(self, skills_dir: Optional[str | Path] = None) -> None:
+    def __init__(self, skills_dirs: Optional[list[str | Path]] = None) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._static_tools: set[str] = set()
-        self.skills_dir = Path(skills_dir) if skills_dir else None
+        self.skills_dirs = [Path(d) for d in skills_dirs] if skills_dirs else []
         self._file_mtimes: dict[str, float] = {}
 
     def register(self, tool: BaseTool, is_static: bool = True) -> None:
@@ -28,46 +28,53 @@ class ToolRegistry:
 
     def _refresh_skills(self) -> None:
         """热加载 skills 目录下的所有 Python 技能"""
-        if not self.skills_dir or not self.skills_dir.exists():
+        if not self.skills_dirs:
             return
 
-        # 扫描 skills 目录下的 .py 文件
-        for filepath in self.skills_dir.glob("**/*.py"):
-            if filepath.name.startswith("__"):
+        for skills_dir in self.skills_dirs:
+            if not skills_dir.exists():
                 continue
 
-            try:
-                mtime = os.path.getmtime(filepath)
-            except OSError:
-                continue
+            # 扫描 skills 目录下的 .py 文件
+            for filepath in skills_dir.glob("**/*.py"):
+                if filepath.name.startswith("__"):
+                    continue
 
-            str_path = str(filepath)
-            if str_path in self._file_mtimes and self._file_mtimes[str_path] == mtime:
-                continue  # 文件没有改变
+                try:
+                    mtime = os.path.getmtime(filepath)
+                except OSError:
+                    continue
 
-            # 加载或重新加载模块
-            module_name = f"pyclaw_dynamic_skills_{filepath.stem}"
-            try:
-                spec = importlib.util.spec_from_file_location(module_name, str_path)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = module
-                    spec.loader.exec_module(module)
+                str_path = str(filepath)
+                if str_path in self._file_mtimes and self._file_mtimes[str_path] == mtime:
+                    continue  # 文件没有改变
 
-                    # 查找 BaseTool 的子类
-                    for name, obj in inspect.getmembers(module, inspect.isclass):
-                        if issubclass(obj, BaseTool) and obj is not BaseTool:
-                            # 忽略可能是通过 import 引入的基类或其它模块的类
-                            if obj.__module__ != module_name:
-                                continue
-                            tool_instance = obj()
-                            self._tools[tool_instance.name] = tool_instance
-                            self._static_tools.discard(tool_instance.name)
-                            print(f"📦 [ToolRegistry] 热加载技能: {tool_instance.name} (from {filepath.name})")
+                # 加载或重新加载模块
+                module_name = f"pyclaw_dynamic_skills_{filepath.stem}"
+                try:
+                    spec = importlib.util.spec_from_file_location(module_name, str_path)
+                    if spec and spec.loader:
+                        module = importlib.util.module_from_spec(spec)
+                        sys.modules[module_name] = module
+                        spec.loader.exec_module(module)
 
-                self._file_mtimes[str_path] = mtime
-            except Exception as e:
-                print(f"⚠️  [ToolRegistry] 加载技能失败 {filepath}: {e}")
+                        # 查找 BaseTool 的子类
+                        for name, obj in inspect.getmembers(module, inspect.isclass):
+                            if issubclass(obj, BaseTool) and obj is not BaseTool:
+                                if obj.__module__ != module_name:
+                                    continue
+                                tool_instance = obj()
+                                self._tools[tool_instance.name] = tool_instance
+                                self._static_tools.discard(tool_instance.name)
+                                print(f"📦 [ToolRegistry] 加载技能成功: {tool_instance.name}")
+
+                    self._file_mtimes[str_path] = mtime
+                except (ImportError, Exception) as e:
+                    # 记录失败但继续处理其他文件
+                    # 避免重复打印相同的错误
+                    if self._file_mtimes.get(str_path) != -1.0:
+                        print(f"⚠️  [ToolRegistry] 技能脚本加载跳过 {filepath.name}: {e} (可能缺少依赖)")
+                        self._file_mtimes[str_path] = -1.0 # 标记为加载失败，下次 refresh 不再重复尝试直到文件变动
 
     def get_tool(self, name: str) -> Optional[BaseTool]:
         """获取工具"""

@@ -19,7 +19,8 @@ from pyclaw.models.openai import OpenAIProvider
 from pyclaw.tools.files import ReadFileTool, WriteFileTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
-from pyclaw.tools.skill_activation import ActivateSkillTool
+from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
+from skills.install_skill import InstallSkillTool, UninstallSkillTool
 from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
 
@@ -67,12 +68,22 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         os.makedirs(skills_dir, exist_ok=True)
 
         # 初始化组件
-        tool_registry = ToolRegistry(skills_dir=skills_dir)
+        skills_dirs = [os.path.join(cfg.work_dir, "skills")]
+        fallback_skills = os.path.expanduser("~/.pyclaw/skills")
+        if os.path.exists(fallback_skills):
+            abs_fallback = os.path.abspath(fallback_skills)
+            if abs_fallback not in [os.path.abspath(d) for d in skills_dirs]:
+                skills_dirs.append(abs_fallback)
+                
+        tool_registry = ToolRegistry(skills_dirs=skills_dirs)
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
         tool_registry.register(CronJobTool())
         tool_registry.register(ActivateSkillTool())
+        tool_registry.register(ListSkillsTool())
+        tool_registry.register(InstallSkillTool())
+        tool_registry.register(UninstallSkillTool())
 
         session_manager = SessionManager()
 
@@ -153,11 +164,21 @@ def cron_exec(
         os.makedirs(skills_dir, exist_ok=True)
 
         # 初始化组件
-        tool_registry = ToolRegistry(skills_dir=skills_dir)
+        skills_dirs = [os.path.join(cfg.work_dir, "skills")]
+        fallback_skills = os.path.expanduser("~/.pyclaw/skills")
+        if os.path.exists(fallback_skills):
+            abs_fallback = os.path.abspath(fallback_skills)
+            if abs_fallback not in [os.path.abspath(d) for d in skills_dirs]:
+                skills_dirs.append(abs_fallback)
+                
+        tool_registry = ToolRegistry(skills_dirs=skills_dirs)
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
         tool_registry.register(ActivateSkillTool())
+        tool_registry.register(ListSkillsTool())
+        tool_registry.register(InstallSkillTool())
+        tool_registry.register(UninstallSkillTool())
         # Cron任务不允许创建新的Cron任务（防止递归）
 
         session_manager = SessionManager()
