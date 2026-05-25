@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from typing import Optional
 
@@ -169,8 +170,41 @@ class FeishuChannel(BaseChannel):
         if self._session:
             await self._session.close()
 
+    async def _upload_image(self, image_url: str) -> Optional[str]:
+        """下载远程图片并上传到飞书获取 image_key"""
+        try:
+            token = await self._get_tenant_token()
+            upload_url = "https://open.feishu.cn/open-apis/im/v1/images"
+            
+            # 1. 下载图片内容
+            async with self._session.get(image_url) as resp:
+                if resp.status != 200:
+                    print(f"⚠️ 下载图片失败: {resp.status} - {image_url}")
+                    return None
+                image_data = await resp.read()
+            
+            # 2. 上传到飞书
+            from aiohttp import FormData
+            form_data = FormData()
+            form_data.add_field('image_type', 'message')
+            form_data.add_field('image', image_data, filename='chart.png')
+            
+            headers = {
+                "Authorization": f"Bearer {token}",
+            }
+            
+            async with self._session.post(upload_url, headers=headers, data=form_data) as resp:
+                result = await resp.json()
+                if result.get("code") == 0:
+                    return result["data"]["image_key"]
+                else:
+                    print(f"⚠️ 上传图片到飞书失败: {result}")
+        except Exception as e:
+            print(f"⚠️ 上传图片过程出现异常: {e}")
+        return None
+
     async def send_message(self, message: Message) -> None:
-        """发送消息到飞书 (支持文本和消息卡片)"""
+        """发送消息到飞书 (支持文本和消息卡片，自动处理图片)"""
         try:
             print(f"📤 [飞书] 正在发送消息...")
 
@@ -182,25 +216,69 @@ class FeishuChannel(BaseChannel):
             }
 
             receive_id = message.channel_user_id
+            content_str = message.content
             
             # 检测是否包含 Markdown 格式，如果是则发送消息卡片以获得更好的显示效果
-            if self._is_markdown(message.content):
+            if self._is_markdown(content_str):
                 msg_type = "interactive"
-                # 构建简单的消息卡片
+                
+                # 匹配 ![alt](url)
+                img_pattern = r"!\[(.*?)\]\((https?://.*?)\)"
+                
+                elements = []
+                last_idx = 0
+                
+                # 查找所有图片并交替构建文本和图片元素
+                matches = list(re.finditer(img_pattern, content_str))
+                
+                if not matches:
+                    elements.append({"tag": "markdown", "content": content_str})
+                else:
+                    for match in matches:
+                        # 1. 添加图片之前的文本
+                        text_before = content_str[last_idx:match.start()].strip()
+                        if text_before:
+                            elements.append({"tag": "markdown", "content": text_before})
+                        
+                        alt_text = match.group(1)
+                        img_url = match.group(2)
+                        
+                        # 2. 尝试上传图片到飞书
+                        image_key = await self._upload_image(img_url)
+                        if image_key:
+                            # 使用独立的 img 标签，这是飞书最可靠的显示方式
+                            elements.append({
+                                "tag": "img",
+                                "img_key": image_key,
+                                "alt": {"tag": "plain_text", "content": alt_text or "image"},
+                                "mode": "fit_horizontal",
+                                "preview": True
+                            })
+                            # 同时保留原始链接作为备注，防止渲染失败
+                            elements.append({
+                                "tag": "note",
+                                "elements": [{"tag": "plain_text", "content": f"🔗 原始链接: {img_url}"}]
+                            })
+                        else:
+                            # 上传失败，保留原始 Markdown 链接
+                            elements.append({"tag": "markdown", "content": f"![{alt_text}]({img_url})"})
+                        
+                        last_idx = match.end()
+                    
+                    # 3. 添加剩余的文本
+                    text_remaining = content_str[last_idx:].strip()
+                    if text_remaining:
+                        elements.append({"tag": "markdown", "content": text_remaining})
+
+                # 构建交互式卡片
                 card_content = {
                     "config": {"wide_screen_mode": True},
-                    "elements": [
-                        {
-                            "tag": "markdown",
-                            "content": message.content
-                        }
-                    ]
+                    "elements": elements
                 }
-                # 如果内容非常长，飞书卡片有长度限制，可能需要截断或分段，这里先做简单处理
                 content = json.dumps(card_content, ensure_ascii=False)
             else:
                 msg_type = "text"
-                content = json.dumps({"text": message.content}, ensure_ascii=False)
+                content = json.dumps({"text": content_str}, ensure_ascii=False)
 
             params = {"receive_id_type": "open_id"}
             data = {
