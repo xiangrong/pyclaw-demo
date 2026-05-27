@@ -19,6 +19,8 @@ from pyclaw.models.openai import OpenAIProvider
 from pyclaw.tools.files import ReadFileTool, WriteFileTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
+from pyclaw.tools.web_search import WebSearchTool
+from pyclaw.tools.web_read import WebReadTool
 from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
 from skills.install_skill import InstallSkillTool, UninstallSkillTool
 from pyclaw.cron.tools import CronJobTool
@@ -80,6 +82,8 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
+        tool_registry.register(WebSearchTool())
+        tool_registry.register(WebReadTool())
         tool_registry.register(CronJobTool())
         tool_registry.register(ActivateSkillTool())
         tool_registry.register(ListSkillsTool())
@@ -187,6 +191,8 @@ def cron_exec(
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
+        tool_registry.register(WebSearchTool())
+        tool_registry.register(WebReadTool())
         tool_registry.register(ActivateSkillTool())
         tool_registry.register(ListSkillsTool())
         tool_registry.register(InstallSkillTool())

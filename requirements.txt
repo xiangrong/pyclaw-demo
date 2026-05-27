@@ -8,3 +8,5 @@ aiohttp>=3.9.0
 mcp>=1.0.0
 lark-oapi
 aiosqlite
+ddgs
+trafilatura

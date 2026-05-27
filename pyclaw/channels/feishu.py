@@ -222,6 +222,14 @@ class FeishuChannel(BaseChannel):
             if self._is_markdown(content_str):
                 msg_type = "interactive"
                 
+                # 尝试提取标题
+                header = None
+                header_match = re.search(r"^#\s+(.*)$", content_str, re.MULTILINE)
+                if header_match:
+                    header = header_match.group(1)
+                    # 从正文中移除该标题，避免重复显示
+                    content_str = content_str.replace(header_match.group(0), "").strip()
+
                 # 匹配 ![alt](url)
                 img_pattern = r"!\[(.*?)\]\((https?://.*?)\)"
                 
@@ -246,7 +254,6 @@ class FeishuChannel(BaseChannel):
                         # 2. 尝试上传图片到飞书
                         image_key = await self._upload_image(img_url)
                         if image_key:
-                            # 使用独立的 img 标签，这是飞书最可靠的显示方式
                             elements.append({
                                 "tag": "img",
                                 "img_key": image_key,
@@ -254,18 +261,11 @@ class FeishuChannel(BaseChannel):
                                 "mode": "fit_horizontal",
                                 "preview": True
                             })
-                            # 同时保留原始链接作为备注，防止渲染失败
-                            elements.append({
-                                "tag": "note",
-                                "elements": [{"tag": "plain_text", "content": f"🔗 原始链接: {img_url}"}]
-                            })
                         else:
-                            # 上传失败，保留原始 Markdown 链接
                             elements.append({"tag": "markdown", "content": f"![{alt_text}]({img_url})"})
                         
                         last_idx = match.end()
                     
-                    # 3. 添加剩余的文本
                     text_remaining = content_str[last_idx:].strip()
                     if text_remaining:
                         elements.append({"tag": "markdown", "content": text_remaining})
@@ -275,6 +275,19 @@ class FeishuChannel(BaseChannel):
                     "config": {"wide_screen_mode": True},
                     "elements": elements
                 }
+                
+                if header:
+                    card_content["header"] = {
+                        "template": "blue",
+                        "title": {"tag": "plain_text", "content": header}
+                    }
+                
+                # 添加页脚
+                card_content["elements"].append({
+                    "tag": "note",
+                    "elements": [{"tag": "plain_text", "content": "🤖 Powered by PyClaw"}]
+                })
+
                 content = json.dumps(card_content, ensure_ascii=False)
             else:
                 msg_type = "text"
