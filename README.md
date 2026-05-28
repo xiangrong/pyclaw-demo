@@ -83,7 +83,16 @@ work_dir: "."
 
 3. **版本发布** - 创建版本并发布，确保应用可用
 
-### 4. 启动 Bot
+### 5. 微信个人号配置 (iLink Bot)
+
+微信个人号接入基于腾讯官方的 iLink Bot API (ClawBot)，无需公网 IP：
+
+1. **首次登录**：运行 `python -m pyclaw start`，终端会显示登录二维码。
+2. **扫码确认**：使用微信扫码并点击确认。
+3. **捕获 ID**：登录成功后，**在微信上给机器人发一条消息**。终端会自动捕获并显示该用户的 `bot_token` 和 `bot_id`。
+4. **持久化**：将这两个值填入 `config.yaml` 的 `wechat` 部分，下次启动即可免扫码登录。
+
+### 6. 启动 Bot
 
 ```bash
 python -m pyclaw start
@@ -95,30 +104,31 @@ python -m pyclaw start
 
 ```
 pyclaw/
-├── __init__.py
 ├── __main__.py              # CLI 入口
-├── cli.py                   # 命令行处理
-├── gateway.py               # 网关 - 统一管理多通道
-├── core/
-│   ├── __init__.py
-│   ├── agent.py             # Agent 主逻辑
-│   ├── message.py           # 消息模型
-│   ├── session.py           # 会话管理
-│   └── config.py            # 配置加载
-├── models/
-│   ├── __init__.py
-│   ├── base.py              # 模型基类
-│   └── openai.py            # OpenAI / 火山引擎兼容
-├── tools/
-│   ├── __init__.py
-│   ├── base.py              # 工具基类
-│   ├── terminal.py          # 终端命令工具
-│   └── files.py             # 文件操作工具
-└── channels/
-    ├── __init__.py
-    ├── base.py              # 通道基类
-    ├── feishu.py            # 飞书 Bot
-    └── telegram.py          # Telegram Bot
+├── channels/                # 消息通道适配器
+│   ├── base.py              # 通道基类
+│   ├── feishu.py            # 飞书 Bot (长连接)
+│   ├── telegram.py          # Telegram Bot (Webhook/Polling)
+│   └── wechat.py            # 微信个人号 (iLink Bot API)
+├── cli/                     # CLI 命令行处理 (Typer)
+│   └── main.py
+├── core/                    # 核心 Agent 逻辑
+│   ├── agent.py             # Agent 决策循环 (ReAct)
+│   ├── message.py           # 统一消息模型
+│   ├── session.py           # 会话与状态持久化 (SQLite)
+├── gateway/                 # 网关 - 路由多通道消息
+│   └── gateway.py
+├── infra/                   # 基础设施
+│   └── config.py            # Pydantic 配置加载与校验
+├── models/                  # LLM 模型适配器
+│   ├── base.py              # 模型提供商基类
+│   └── openai.py            # OpenAI / 火山引擎 API 实现
+└── tools/                   # 内置工具集
+    ├── base.py              # 工具基类
+    ├── terminal.py          # 终端执行工具
+    ├── files.py             # 文件读写工具
+    ├── mcp_client.py        # MCP 客户端管理器
+    └── web_search.py        # 网页搜索与内容提取
 ```
 
 ## 🔧 扩展开发与生态
