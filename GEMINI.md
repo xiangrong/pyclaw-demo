@@ -5,7 +5,7 @@
 PyClaw is a lightweight Python AI Agent framework designed to connect Large Language Models (LLMs) with messaging platforms like Feishu (Lark) and Telegram. It acts as an interactive assistant capable of autonomous tool execution.
 
 **Key Features:**
-- **Messaging Integrations:** Supports Feishu (via long connection) and Telegram (via Webhooks/Polling).
+- **Messaging Integrations:** Supports Feishu (via long connection), Telegram (via Webhooks/Polling), and **WeChat Personal Accounts** (via official iLink Bot API).
 - **LLM Support:** Compatible with OpenAI and Volcengine API models.
 - **Built-in Tools:** Includes file operations (read/write), terminal command execution, and scheduled cron jobs.
 - **Session Management:** Persists multi-turn conversation context.
@@ -23,7 +23,8 @@ PyClaw is a lightweight Python AI Agent framework designed to connect Large Lang
 
 **Configuration:**
 - Run `python -m pyclaw init` to generate a configuration template at `~/.config/pyclaw/config.yaml`.
-- Edit the generated YAML file to add your API keys, Bot tokens (Feishu App ID/Secret, Telegram Token), and allowed users.
+- Edit the generated YAML file to add your API keys, Bot tokens (Feishu, Telegram, or WeChat), and allowed users.
+- For WeChat, a QR code will be displayed on the first run. After scanning and confirming, the console will output a `bot_token` and `bot_id`; save these to your config to avoid re-scanning.
 - Alternatively, you can copy the example from `config/config.example.yaml`.
 
 **Starting the Agent:**

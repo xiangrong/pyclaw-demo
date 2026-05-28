@@ -19,6 +19,12 @@ class FeishuConfig(BaseModel):
     allowed_user_ids: Optional[list[str]] = None
 
 
+class WechatConfig(BaseModel):
+    bot_token: Optional[str] = None
+    bot_id: Optional[str] = None
+    allowed_user_ids: Optional[list[str]] = None
+
+
 class MCPServerConfig(BaseModel):
     command: str
     args: list[str] = Field(default_factory=list)
@@ -35,6 +41,7 @@ class ModelConfig(BaseModel):
 class Config(BaseModel):
     telegram: Optional[TelegramConfig] = None
     feishu: Optional[FeishuConfig] = None
+    wechat: Optional[WechatConfig] = None
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     model: ModelConfig
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
@@ -67,6 +74,10 @@ def load_config(config_path: Optional[str] = None) -> Config:
     if data.get("feishu", {}).get("allowed_user_ids") is None:
         if "feishu" in data:
             data["feishu"]["allowed_user_ids"] = []
+
+    if data.get("wechat", {}).get("allowed_user_ids") is None:
+        if "wechat" in data:
+            data["wechat"]["allowed_user_ids"] = []
 
     # 默认注入高德地图 MCP
     if data.get("amap", {}).get("api_key"):

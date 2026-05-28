@@ -10,3 +10,5 @@ lark-oapi
 aiosqlite
 ddgs
 trafilatura
+cryptography
+qrcode

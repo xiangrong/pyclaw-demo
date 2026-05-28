@@ -8,6 +8,7 @@
 |------|------|------|
 | 📱 飞书 Bot | ✅ | 官方 SDK 长连接，无需 ngrok/公网 IP |
 | 📱 Telegram Bot | ✅ | 标准 Webhook/Polling 模式，**支持直接发送文件处理** |
+| 📱 微信个人号 | ✅ | **官方 iLink Bot API**，扫码接入，无需公网 IP |
 | 🤖 LLM 集成 | ✅ | 支持 OpenAI / 火山引擎 API |
 | 🧠 动态技能 | ✅ | 支持通过 Git URL 自动安装和热加载 `SKILL.md` 技能生态 |
 | 🔌 MCP 支持 | ✅ | 原生支持 Model Context Protocol (MCP)，内置高德地图适配 |
@@ -53,6 +54,11 @@ feishu:
 telegram:
   enabled: true
   token: "your-telegram-bot-token"
+
+# 微信个人号配置 (ClawBot)
+wechat:
+  bot_token: ""  # 扫码后填入
+  bot_id: ""     # 扫码后填入
 
 # 用户白名单 - 为空则允许所有用户
 allowed_user_ids:

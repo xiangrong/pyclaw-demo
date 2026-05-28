@@ -135,6 +135,17 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             gateway.register_channel(feishu_channel)
             print("✅ 飞书通道已注册")
 
+        # 注册微信通道
+        if cfg.wechat:
+            from pyclaw.channels.wechat import WechatChannel
+            wechat_channel = WechatChannel(
+                bot_token=cfg.wechat.bot_token,
+                bot_id=cfg.wechat.bot_id,
+                allowed_user_ids=cfg.wechat.allowed_user_ids or None,
+            )
+            gateway.register_channel(wechat_channel)
+            print("✅ 微信通道已注册")
+
         # 启动
         try:
             await gateway.start()
@@ -265,6 +276,15 @@ feishu:
   # 允许使用的用户 open_id 列表 (留空则允许所有人)
   allowed_user_ids:
     # - ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 微信个人号配置 (可选，iLink Bot API / ClawBot)
+wechat:
+  # 首次启动会自动进入扫码流程，成功后建议将控制台输出的 token 和 id 填入此处，避免重复扫码
+  bot_token: ""
+  bot_id: ""
+  # 允许使用的微信用户 ID 列表
+  allowed_user_ids:
+    # - xxx@im.wechat
 
 # 高德地图配置 (可选，配置后会自动挂载高德地图 MCP Server)
 # amap:
