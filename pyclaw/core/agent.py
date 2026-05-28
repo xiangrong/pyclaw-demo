@@ -11,7 +11,7 @@ from pyclaw.tools.registry import ToolRegistry
 
 
 class Agent:
-    """Agent核心类 - 简化版：先不流式，确保能工作"""
+    """Agent核心类 - 支持规划、推理和指令驱动架构"""
 
     def __init__(
         self,
@@ -19,62 +19,118 @@ class Agent:
         tool_registry: ToolRegistry,
         session_manager: SessionManager,
         system_prompt: Optional[str] = None,
+        work_dir: Optional[str] = None,
     ) -> None:
         self.model = model_provider
         self.tools = tool_registry
         self.sessions = session_manager
+        self.work_dir = work_dir or os.getcwd()
 
         self.system_prompt = system_prompt or (
             "You are PyClaw, an autonomous AI assistant.\n"
             "You manage your capabilities exclusively using the provided function calling tools.\n"
-            "CRITICAL RULES:\n"
-            "1. EXPLORE SKILLS: Read the <available_skills> index below. It contains specialized skills you can use.\n"
-            "2. ACTIVATE ON DEMAND: If a task matches a skill's description, you MUST call `activate_skill(name=\"...\")` to load its full documentation before proceeding.\n"
-            "3. INSTALLATION: To install a new skill from a Git URL, you MUST use the `install_skill` tool. DO NOT use `terminal` tool or `git clone` command for this. The `install_skill` tool handles the path and setup correctly.\n"
-            "4. MCP SUPPORT: You natively support Model Context Protocol (MCP). If the user asks if you support MCP or what MCP servers are loaded, inform them that you support MCP and use the tools provided in your function list (e.g., tools starting with `amap__` are from the Amap MCP server).\n"
             "Always explain your reasoning and actions to the user in Chinese.\n\n"
         )
         self.base_system_prompt = self.system_prompt # save base
 
     def _get_dynamic_system_prompt(self) -> str:
-        """动态生成带技能索引的系统提示词"""
-        skills_index = []
+        """动态生成增强版系统提示词 (Soul + Agents + Skills + MCP)"""
+        # 1. 加载 SOUL.md (全局人格)
+        soul_content = self._load_soul_md()
         
+        # 2. 加载 AGENTS.md (项目规范)
+        agents_content = self._load_agents_md()
+        
+        # 3. 加载技能索引
+        skills_index = self._get_skills_index()
+        
+        # 4. 加载 MCP 信息
+        mcp_str = self._get_mcp_info()
+
+        full_prompt = self.base_system_prompt
+        
+        if soul_content:
+            full_prompt += f"\n<soul>\n{soul_content}\n</soul>\n"
+            
+        if agents_content:
+            full_prompt += f"\n<agents_context>\n{agents_content}\n</agents_context>\n"
+            
+        full_prompt += f"\n<available_skills>\n{skills_index}\n</available_skills>"
+        full_prompt += mcp_str
+        
+        # 注入 Reasoning 引导
+        full_prompt += (
+            "\n\n<reasoning_guidelines>\n"
+            "1. THINK FIRST: Before taking any action, output your reasoning process inside <thought> tags.\n"
+            "2. PLAN: For complex tasks, create a step-by-step plan before execution.\n"
+            "3. REFLECT: After receiving tool results, evaluate if you are closer to the goal.\n"
+            "</reasoning_guidelines>"
+        )
+        
+        return full_prompt
+
+    def _load_soul_md(self) -> str:
+        """加载全局灵魂配置"""
+        config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
+        soul_path = os.path.join(config_dir, "SOUL.md")
+        if os.path.exists(soul_path):
+            try:
+                with open(soul_path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return ""
+
+    def _load_agents_md(self) -> str:
+        """从当前工作目录向上递归查找 AGENTS.md"""
+        current = os.path.abspath(self.work_dir)
+        while True:
+            agents_path = os.path.join(current, "AGENTS.md")
+            if os.path.exists(agents_path):
+                try:
+                    with open(agents_path, "r", encoding="utf-8") as f:
+                        return f.read().strip()
+                except Exception:
+                    pass
+            
+            parent = os.path.dirname(current)
+            if parent == current: # 根目录
+                break
+            current = parent
+        return ""
+
+    def _get_skills_index(self) -> str:
+        """获取技能索引"""
+        skills_index = []
         for skills_dir in self.tools.skills_dirs:
             if skills_dir and skills_dir.exists():
-                # 1. 递归搜索所有带 SKILL.md 的目录 (支持嵌套)
                 for root, dirs, files in os.walk(skills_dir):
                     if "SKILL.md" in files:
                         skill_md_path = os.path.join(root, "SKILL.md")
-                        # 技能名称使用相对于 skills 目录的路径
                         rel_path = os.path.relpath(root, skills_dir)
                         description = self._extract_skill_description(skill_md_path)
-                        # 避免重复
                         if not any(item.startswith(f"- {rel_path}:") for item in skills_index):
                             skills_index.append(f"- {rel_path}: {description}")
                 
-                # 2. 搜索根目录下的独立 .py 技能 (ToolRegistry 自动加载的)
                 for file in os.listdir(skills_dir):
                     if file.endswith(".py") and not file.startswith("__"):
                         skill_name = file[:-3]
-                        # 避免重复索引
                         if not any(item.startswith(f"- {skill_name}:") for item in skills_index):
                             skills_index.append(f"- {skill_name}: Python tool script.")
         
-        index_str = "\n".join(sorted(skills_index)) if skills_index else "No specialized skills currently indexed."
-        
-        # 提取动态加载的 MCP Server 工具
+        return "\n".join(sorted(skills_index)) if skills_index else "No specialized skills currently indexed."
+
+    def _get_mcp_info(self) -> str:
+        """获取已加载的 MCP Server 信息"""
         mcp_servers = set()
         for tool_name in self.tools._tools.keys():
             if "__" in tool_name:
                 server_name = tool_name.split("__")[0]
                 mcp_servers.add(server_name)
         
-        mcp_str = ""
         if mcp_servers:
-            mcp_str = f"\n<mcp_servers_loaded>\nYou are connected to the following MCP servers: {', '.join(mcp_servers)}.\nTools from these servers are prefixed with `server_name__`.\n</mcp_servers_loaded>"
-
-        return self.base_system_prompt + f"<available_skills>\n{index_str}\n</available_skills>" + mcp_str
+            return f"\n<mcp_servers_loaded>\nYou are connected to the following MCP servers: {', '.join(mcp_servers)}.\nTools from these servers are prefixed with `server_name__`.\n</mcp_servers_loaded>"
+        return ""
 
     def _extract_skill_description(self, md_path: str) -> str:
         """从 SKILL.md 中提取简介 (第一行或指定描述行)"""
@@ -196,6 +252,19 @@ class Agent:
                 import traceback
                 traceback.print_exc()
                 return f"⚠️  LLM 调用出错: {str(e)}"
+
+            content = ""
+            if isinstance(result, dict):
+                content = result.get("content", "") or ""
+            else:
+                content = str(result)
+
+            # 提取并打印思维链 (Thought)
+            if "<thought>" in content:
+                import re
+                thoughts = re.findall(r"<thought>(.*?)</thought>", content, re.DOTALL)
+                for t in thoughts:
+                    print(f"  🧠 [Thinking] {t.strip()}")
 
             # 检查是否有工具调用
             if isinstance(result, dict) and result.get("__tool_calls__"):

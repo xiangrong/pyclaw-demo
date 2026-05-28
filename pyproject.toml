@@ -1,7 +1,7 @@
 [project]
 name = "pyclaw"
-version = "0.6.0"
-description = "Python AI Agent - OpenClaw inspired personal assistant with Feishu/Lark support"
+version = "0.7.0"
+description = "Python AI Agent - Intelligent assistant with Multi-Agent collaboration and ReAct reasoning"
 authors = [
   { name="Xiang Rong", email="xiang.rong@example.com" }
 ]

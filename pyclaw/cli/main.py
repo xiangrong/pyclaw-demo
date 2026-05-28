@@ -111,7 +111,12 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             model_provider=model_provider,
             tool_registry=tool_registry,
             session_manager=session_manager,
+            work_dir=cfg.work_dir,
         )
+
+        # 注册子 Agent 工具 (需要传入 agent 实例)
+        from pyclaw.tools.sub_agent import SubAgentTool
+        tool_registry.register(SubAgentTool(agent))
 
         # 创建网关
         gateway = Gateway(agent=agent)
@@ -224,7 +229,12 @@ def cron_exec(
             model_provider=model_provider,
             tool_registry=tool_registry,
             session_manager=session_manager,
+            work_dir=cfg.work_dir,
         )
+
+        # 注册子 Agent 工具
+        from pyclaw.tools.sub_agent import SubAgentTool
+        tool_registry.register(SubAgentTool(agent))
 
         # 创建临时会话并执行
         session = await session_manager.create_session(f"cron_{job_id}")
