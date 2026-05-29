@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from typing import Any
@@ -75,10 +76,24 @@ class Gateway:
             # 交给 Agent 处理
             response = await self.agent.process_message(message)
 
-            # 通过原通道发送回复
+            # 1. 首先通过原通道发送回复文本
             await self.channels[message.channel].send_message(response)
+            
+            # 2. 检查是否有待发送的文件
+            pending_files = response.metadata.get("pending_files", [])
+            for file_info in pending_files:
+                file_path = file_info.get("file_path")
+                description = file_info.get("description")
+                if file_path and os.path.exists(file_path):
+                    print(f"📤 [Gateway] Sending file: {file_path}")
+                    await self.channels[message.channel].send_file(
+                        channel_user_id=message.channel_user_id,
+                        file_path=file_path,
+                        description=description,
+                        metadata=response.metadata # 传递 metadata 以便微信获取 context_token
+                    )
 
-            resp_preview = response[:50] if isinstance(response, str) else getattr(response, 'content', str(response))[:50]
+            resp_preview = response.content[:50]
             print(f"📤 Replied: {resp_preview}...")
 
         except Exception as e:

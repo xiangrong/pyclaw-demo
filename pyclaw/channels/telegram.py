@@ -151,6 +151,31 @@ class TelegramChannel(BaseChannel):
                 parse_mode=None,
             )
 
+    async def send_file(
+        self,
+        channel_user_id: str,
+        file_path: str,
+        description: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """发送本地文件到 Telegram"""
+        if not self._app:
+            return
+
+        try:
+            chat_id = int(channel_user_id)
+            print(f"📤 [Telegram] 正在发送文件: {os.path.basename(file_path)}...")
+            
+            with open(file_path, "rb") as f:
+                await self._app.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    caption=description,
+                )
+            print(f"✅ [Telegram] 文件发送成功")
+        except Exception as e:
+            print(f"❌ [Telegram] 发送文件失败: {e}")
+
     async def send_stream(
         self,
         stream,

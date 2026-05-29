@@ -371,6 +371,76 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             print(f"⚠️ 添加反应异常: {e}")
 
+    async def send_file(
+        self,
+        channel_user_id: str,
+        file_path: str,
+        description: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """发送本地文件到飞书"""
+        try:
+            print(f"📤 [飞书] 正在发送文件: {os.path.basename(file_path)}...")
+            
+            # 1. 上传文件到飞书获取 file_key
+            file_key = await self._upload_file(file_path)
+            if not file_key:
+                print(f"❌ [飞书] 文件上传失败，无法发送")
+                return
+
+            # 2. 发送文件消息
+            token = await self._get_tenant_token()
+            url = "https://open.feishu.cn/open-apis/im/v1/messages"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            }
+
+            params = {"receive_id_type": "open_id"}
+            data = {
+                "receive_id": channel_user_id,
+                "content": json.dumps({"file_key": file_key}),
+                "msg_type": "file",
+            }
+
+            async with self._session.post(url, headers=headers, params=params, json=data) as resp:
+                result = await resp.json()
+                if result.get("code") == 0:
+                    print(f"✅ [飞书] 文件发送成功")
+                else:
+                    print(f"❌ [飞书] 文件发送失败: {result}")
+
+        except Exception as e:
+            print(f"❌ [飞书] 发送文件异常: {e}")
+
+    async def _upload_file(self, file_path: str) -> Optional[str]:
+        """上传本地文件到飞书获取 file_key"""
+        try:
+            token = await self._get_tenant_token()
+            url = "https://open.feishu.cn/open-apis/im/v1/files"
+            
+            from aiohttp import FormData
+            form_data = FormData()
+            form_data.add_field('file_type', 'stream')
+            form_data.add_field('file_name', os.path.basename(file_path))
+            
+            with open(file_path, 'rb') as f:
+                form_data.add_field('file', f.read(), filename=os.path.basename(file_path))
+            
+            headers = {
+                "Authorization": f"Bearer {token}",
+            }
+            
+            async with self._session.post(url, headers=headers, data=form_data) as resp:
+                result = await resp.json()
+                if result.get("code") == 0:
+                    return result["data"]["file_key"]
+                else:
+                    print(f"⚠️ 上传文件到飞书失败: {result}")
+        except Exception as e:
+            print(f"⚠️ 上传文件过程出现异常: {e}")
+        return None
+
     async def _get_tenant_token(self) -> str:
         """获取 tenant_access_token"""
         url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"

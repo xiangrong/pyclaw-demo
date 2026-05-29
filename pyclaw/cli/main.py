@@ -16,7 +16,7 @@ from pyclaw.core.session import SessionManager
 from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
 from pyclaw.models.openai import OpenAIProvider
-from pyclaw.tools.files import ReadFileTool, WriteFileTool
+from pyclaw.tools.files import ReadFileTool, WriteFileTool, SendFileTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
 from pyclaw.tools.web_search import WebSearchTool
@@ -114,7 +114,8 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             work_dir=cfg.work_dir,
         )
 
-        # 注册子 Agent 工具 (需要传入 agent 实例)
+        # 注册需要 Agent 实例的工具
+        tool_registry.register(SendFileTool(agent))
         from pyclaw.tools.sub_agent import SubAgentTool
         tool_registry.register(SubAgentTool(agent))
 
@@ -232,7 +233,8 @@ def cron_exec(
             work_dir=cfg.work_dir,
         )
 
-        # 注册子 Agent 工具
+        # 注册需要 Agent 实例的工具
+        tool_registry.register(SendFileTool(agent))
         from pyclaw.tools.sub_agent import SubAgentTool
         tool_registry.register(SubAgentTool(agent))
 

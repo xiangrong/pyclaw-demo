@@ -10,7 +10,10 @@ from pyclaw.tools.base import BaseTool, ToolResult
 class SubAgentArgs(BaseModel):
     prompt: str = Field(..., description="要发送给子 Agent 的详细指令")
     specialization: Optional[str] = Field(
-        None, description="子 Agent 的专业领域，例如 'Python Expert', 'Researcher' 等"
+        None, description="子 Agent 的专业领域，例如 'Researcher', 'Coder', 'Reviewer', 'Planner' 等"
+    )
+    context: Optional[str] = Field(
+        None, description="提供给子 Agent 的额外背景信息、参考资料或前置任务结果"
     )
 
 
@@ -28,20 +31,38 @@ class SubAgentTool(BaseTool):
         # 传入主 Agent 实例以复用模型提供商、工具注册表和会话管理器
         self.main_agent = agent_instance
 
-    async def execute(self, prompt: str, specialization: Optional[str] = None) -> ToolResult:
+    async def execute(
+        self, 
+        prompt: str, 
+        specialization: Optional[str] = None,
+        context: Optional[str] = None
+    ) -> ToolResult:
         try:
             from pyclaw.core.agent import Agent
-            from pyclaw.core.session import SessionManager
             
             # 构造子 Agent 的系统提示词
             sub_system_prompt = self.main_agent.base_system_prompt
+            
+            # 角色模板
+            role_prompts = {
+                "researcher": "You are a specialized RESEARCHER. Your goal is to gather accurate information, summarize findings, and provide citations where possible.",
+                "coder": "You are a specialized SOFTWARE ENGINEER. Your goal is to write clean, efficient, and well-documented code. Always prioritize safety and follow best practices.",
+                "reviewer": "You are a specialized CODE REVIEWER. Your goal is to find bugs, security vulnerabilities, and architectural flaws. Be critical and thorough.",
+                "planner": "You are a specialized STRATEGIST. Your goal is to break down complex tasks into manageable steps and identify potential risks.",
+            }
+
             if specialization:
-                sub_system_prompt += f"\nYour specialization is: {specialization}. Focus on this expertise.\n"
+                role_key = specialization.lower().strip()
+                role_prompt = role_prompts.get(role_key, f"Your specialization is: {specialization}. Focus on this expertise.")
+                sub_system_prompt += f"\n<role>\n{role_prompt}\n</role>\n"
             
             sub_system_prompt += (
                 "\nYou are a SUB-AGENT. Your goal is to complete the specific task assigned by the MAIN AGENT.\n"
-                "Once the task is complete, provide a concise summary of your work.\n"
+                "Once the task is complete, provide a detailed summary of your work and findings.\n"
             )
+
+            if context:
+                sub_system_prompt += f"\n<task_context>\n{context}\n</task_context>\n"
 
             # 创建子 Agent 实例
             sub_agent = Agent(
@@ -57,7 +78,7 @@ class SubAgentTool(BaseTool):
             sub_session_id = f"subagent-{uuid.uuid4().hex[:8]}"
             session = await self.main_agent.sessions.create_session(sub_session_id)
             
-            print(f"  🤝 [SubAgent] Spawning sub-agent for task: {prompt[:50]}...")
+            print(f"  🤝 [SubAgent] Spawning sub-agent ({specialization or 'Generalist'}) for task...")
             
             # 运行子 Agent 循环
             result = await sub_agent.run(session, prompt)

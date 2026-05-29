@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +60,12 @@ class SessionManager:
         self.db_path = db_path
         # 缓存活跃会话，减少数据库查询
         self._sessions: dict[str, Session] = {}
+
+    @asynccontextmanager
+    async def db_connect(self):
+        """提供数据库连接的上下文管理器"""
+        async with aiosqlite.connect(self.db_path) as db:
+            yield db
 
     async def init_db(self) -> None:
         """初始化数据库表"""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -9,7 +10,7 @@ class ToolResult(BaseModel):
     """工具执行结果"""
     success: bool
     content: str
-    metadata: dict[str, str] = {}
+    metadata: dict[str, Any] = {}
 
 
 class BaseTool(ABC):

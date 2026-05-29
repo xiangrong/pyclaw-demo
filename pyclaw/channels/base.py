@@ -29,6 +29,17 @@ class BaseChannel(ABC):
         """发送消息"""
         pass
 
+    @abstractmethod
+    async def send_file(
+        self,
+        channel_user_id: str,
+        file_path: str,
+        description: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """发送文件"""
+        pass
+
     async def send_stream(
         self,
         stream: AsyncGenerator[str, None],

@@ -124,6 +124,7 @@ class ToolRegistry:
                     "tool_call_id": call_id,
                     "name": tool_name,
                     "content": result.content,
+                    "metadata": result.metadata,
                 }
             )
 

@@ -293,6 +293,90 @@ class WechatChannel(BaseChannel):
             if ret != 0:
                 print(f"❌ 微信消息发送失败: {data}")
 
+    async def send_file(
+        self,
+        channel_user_id: str,
+        file_path: str,
+        description: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """发送本地文件到微信 (iLink Bot)"""
+        if not self.session or not self.bot_token:
+            return
+
+        try:
+            # 1. 获取 context_token
+            context_token = (metadata or {}).get("context_token") or self.context_tokens.get(channel_user_id)
+            if not context_token:
+                print(f"⚠️ [WeChat] 缺少 context_token，无法发送文件")
+                return
+
+            # 2. 上传文件获取 file_id
+            print(f"📤 [WeChat] 正在上传文件: {os.path.basename(file_path)}...")
+            file_id = await self._upload_file(file_path)
+            if not file_id:
+                print(f"❌ [WeChat] 文件上传失败")
+                return
+
+            # 3. 发送文件消息
+            payload = {
+                "msg": {
+                    "from_user_id": self.bot_id or "",
+                    "to_user_id": channel_user_id,
+                    "client_id": str(uuid.uuid4()),
+                    "message_type": 2,
+                    "message_state": 2,
+                    "context_token": context_token,
+                    "item_list": [
+                        {
+                            "type": 3, # 3 表示文件
+                            "file_item": {
+                                "file_id": file_id,
+                                "name": os.path.basename(file_path)
+                            }
+                        }
+                    ]
+                },
+                "base_info": {
+                    "channel_version": "2.4.1"
+                }
+            }
+
+            async with self.session.post(
+                f"{self.BASE_URL}/ilink/bot/sendmessage",
+                headers=self._get_headers(),
+                json=payload
+            ) as resp:
+                data = await resp.json(content_type=None)
+                ret = data.get("ret", data.get("errcode", 0))
+                if ret == 0:
+                    print(f"✅ [WeChat] 文件发送成功")
+                else:
+                    print(f"❌ [WeChat] 微信文件发送失败: {data}")
+
+        except Exception as e:
+            print(f"❌ [WeChat] 发送文件异常: {e}")
+
+    async def _upload_file(self, file_path: str) -> Optional[str]:
+        """上传本地文件到 iLink 获取 file_id"""
+        try:
+            url = f"{self.BASE_URL}/ilink/bot/upload_file"
+            
+            from aiohttp import FormData
+            form_data = FormData()
+            form_data.add_field('file', open(file_path, 'rb'), filename=os.path.basename(file_path))
+            
+            async with self.session.post(url, headers=self._get_headers(), data=form_data) as resp:
+                data = await resp.json(content_type=None)
+                ret = data.get("ret", data.get("errcode", 0))
+                if ret == 0:
+                    return data.get("file_id")
+                else:
+                    print(f"⚠️ [WeChat] 上传文件失败: {data}")
+        except Exception as e:
+            print(f"⚠️ [WeChat] 上传异常: {e}")
+        return None
+
     async def send_stream(
         self,
         stream: AsyncGenerator[str, None],
