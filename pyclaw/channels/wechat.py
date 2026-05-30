@@ -300,7 +300,7 @@ class WechatChannel(BaseChannel):
         description: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
-        """发送本地文件到微信 (iLink Bot)"""
+        """发送本地文件到微信 (由于 iLink Bot API 暂无公开的标准文件上传接口，此处采取文本降级策略)"""
         if not self.session or not self.bot_token:
             return
 
@@ -311,36 +311,143 @@ class WechatChannel(BaseChannel):
                 print(f"⚠️ [WeChat] 缺少 context_token，无法发送文件")
                 return
 
-            # 2. 上传文件获取 file_id
-            print(f"📤 [WeChat] 正在上传文件: {os.path.basename(file_path)}...")
-            file_id = await self._upload_file(file_path)
-            if not file_id:
-                print(f"❌ [WeChat] 文件上传失败")
-                return
-
-            # 3. 发送文件消息
-            payload = {
-                "msg": {
-                    "from_user_id": self.bot_id or "",
-                    "to_user_id": channel_user_id,
-                    "client_id": str(uuid.uuid4()),
-                    "message_type": 2,
-                    "message_state": 2,
-                    "context_token": context_token,
-                    "item_list": [
-                        {
-                            "type": 3, # 3 表示文件
-                            "file_item": {
-                                "file_id": file_id,
-                                "name": os.path.basename(file_path)
+            
+            print(f"📤 [WeChat] 正在处理文件: {os.path.basename(file_path)}...")
+            
+            cdn_info = await self._upload_file_to_cdn(channel_user_id, file_path)
+            
+            if cdn_info:
+                # Send file message
+                import time
+                import random
+                client_id = f"wechat-ilink:{int(time.time()*1000)}-{os.urandom(4).hex()}"
+                
+                payload = {
+                    "msg": {
+                        "from_user_id": "",
+                        "to_user_id": channel_user_id,
+                        "client_id": client_id,
+                        "message_type": 2,
+                        "message_state": 2,
+                        "context_token": context_token,
+                        "item_list": [
+                            {
+                                "type": 4,
+                                "file_item": {
+                                    "media": {
+                                        "encrypt_query_param": cdn_info["encrypt_query_param"],
+                                        "aes_key": cdn_info["aes_key"],
+                                        "encrypt_type": 1
+                                    },
+                                    "file_name": os.path.basename(file_path),
+                                    "len": str(cdn_info["fileSize"])
+                                }
                             }
-                        }
-                    ]
-                },
-                "base_info": {
-                    "channel_version": "2.4.1"
+                        ]
+                    },
+                    "base_info": {
+                        "channel_version": "2.4.1"
+                    }
                 }
-            }
+                
+                # if there is a description, maybe we should send it as a text message first?
+                # WeChat file item cannot have caption. We can send text first, then file.
+                if description:
+                    text_payload = {
+                        "msg": {
+                            "from_user_id": self.bot_id or "",
+                            "to_user_id": channel_user_id,
+                            "client_id": str(uuid.uuid4()),
+                            "message_type": 2,
+                            "message_state": 2,
+                            "context_token": context_token,
+                            "item_list": [{"type": 1, "text_item": {"text": description}}]
+                        },
+                        "base_info": {"channel_version": "2.4.1"}
+                    }
+                    await self.session.post(f"{self.BASE_URL}/ilink/bot/sendmessage", headers=self._get_headers(), json=text_payload)
+                    
+                async with self.session.post(
+                    f"{self.BASE_URL}/ilink/bot/sendmessage",
+                    headers=self._get_headers(),
+                    json=payload
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                    if data.get("ret", data.get("errcode", 0)) == 0:
+                        print(f"✅ [WeChat] 文件发送成功")
+                        return
+                    else:
+                        print(f"❌ [WeChat] 微信文件发送失败: {data}")
+                        
+            print(f"⚠️ [WeChat] CDN 上传失败或出错，尝试使用降级策略...")
+
+
+            # iLink Bot API 暂无可靠的文件上传接口 (/ilink/bot/upload_file 实际上报 404)
+            # 这里采取优雅降级策略：如果是文本类型，直接发送内容；如果是二进制类型，提示不支持。
+            text_extensions = {".md", ".txt", ".csv", ".json", ".py", ".js", ".html", ".css", ".yaml", ".yml", ".sh", ".log"}
+            ext = os.path.splitext(file_path)[1].lower()
+
+            if ext in text_extensions:
+                print(f"ℹ️ [WeChat] 采用降级策略：以文本形式发送文件内容 ({os.path.basename(file_path)})")
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+
+                # 微信单条消息通常有限制，简单截断
+                if len(content) > 2000:
+                    content = content[:2000] + "\n\n...(内容过长已截断)..."
+
+                msg_text = f"📄 【文件内容: {os.path.basename(file_path)}】\n\n{content}"
+                if description:
+                    msg_text = f"{description}\n\n{msg_text}"
+
+                payload = {
+                    "msg": {
+                        "from_user_id": self.bot_id or "",
+                        "to_user_id": channel_user_id,
+                        "client_id": str(uuid.uuid4()),
+                        "message_type": 2,
+                        "message_state": 2,
+                        "context_token": context_token,
+                        "item_list": [
+                            {
+                                "type": 1,
+                                "text_item": {
+                                    "text": msg_text
+                                }
+                            }
+                        ]
+                    },
+                    "base_info": {
+                        "channel_version": "2.4.1"
+                    }
+                }
+            else:
+                print(f"ℹ️ [WeChat] 采用降级策略：提示用户不支持该文件类型 ({os.path.basename(file_path)})")
+                msg_text = f"⚠️ 微信通道暂不支持直接接收 [{os.path.basename(file_path)}] 这种格式的文件，请通过其他通道(如飞书/Telegram)获取。"
+                if description:
+                    msg_text = f"{description}\n\n{msg_text}"
+
+                payload = {
+                    "msg": {
+                        "from_user_id": self.bot_id or "",
+                        "to_user_id": channel_user_id,
+                        "client_id": str(uuid.uuid4()),
+                        "message_type": 2,
+                        "message_state": 2,
+                        "context_token": context_token,
+                        "item_list": [
+                            {
+                                "type": 1,
+                                "text_item": {
+                                    "text": msg_text
+                                }
+                            }
+                        ]
+                    },
+                    "base_info": {
+                        "channel_version": "2.4.1"
+                    }
+                }
 
             async with self.session.post(
                 f"{self.BASE_URL}/ilink/bot/sendmessage",
@@ -350,32 +457,12 @@ class WechatChannel(BaseChannel):
                 data = await resp.json(content_type=None)
                 ret = data.get("ret", data.get("errcode", 0))
                 if ret == 0:
-                    print(f"✅ [WeChat] 文件发送成功")
+                    print(f"✅ [WeChat] 文件(降级文本)发送成功")
                 else:
                     print(f"❌ [WeChat] 微信文件发送失败: {data}")
 
         except Exception as e:
             print(f"❌ [WeChat] 发送文件异常: {e}")
-
-    async def _upload_file(self, file_path: str) -> Optional[str]:
-        """上传本地文件到 iLink 获取 file_id"""
-        try:
-            url = f"{self.BASE_URL}/ilink/bot/upload_file"
-            
-            from aiohttp import FormData
-            form_data = FormData()
-            form_data.add_field('file', open(file_path, 'rb'), filename=os.path.basename(file_path))
-            
-            async with self.session.post(url, headers=self._get_headers(), data=form_data) as resp:
-                data = await resp.json(content_type=None)
-                ret = data.get("ret", data.get("errcode", 0))
-                if ret == 0:
-                    return data.get("file_id")
-                else:
-                    print(f"⚠️ [WeChat] 上传文件失败: {data}")
-        except Exception as e:
-            print(f"⚠️ [WeChat] 上传异常: {e}")
-        return None
 
     async def send_stream(
         self,
@@ -399,3 +486,88 @@ class WechatChannel(BaseChannel):
         )
         await self.send_message(msg)
         return full_content
+
+
+    async def _upload_file_to_cdn(self, channel_user_id: str, file_path: str) -> Optional[dict[str, str]]:
+        """AES 加密并上传到微信 CDN"""
+        try:
+            import os
+            import hashlib
+            import base64
+            import uuid
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.hazmat.primitives import padding
+
+            with open(file_path, "rb") as f:
+                plaintext = f.read()
+            
+            rawsize = len(plaintext)
+            rawfilemd5 = hashlib.md5(plaintext).hexdigest()
+            
+            # AES encryption
+            raw_key = os.urandom(16)
+            padder = padding.PKCS7(128).padder()
+            padded_data = padder.update(plaintext) + padder.finalize()
+            cipher = Cipher(algorithms.AES(raw_key), modes.ECB(), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+            
+            filesize = len(ciphertext)
+            hex_key = raw_key.hex()
+            filekey = rawfilemd5 + str(uuid.uuid4())[:8]
+            
+            # getuploadurl
+            url = f"{self.BASE_URL}/ilink/bot/getuploadurl"
+            payload = {
+                "filekey": filekey,
+                "media_type": 3,
+                "to_user_id": channel_user_id,
+                "rawsize": rawsize,
+                "rawfilemd5": rawfilemd5,
+                "filesize": filesize,
+                "aeskey": hex_key,
+                "no_need_thumb": True,
+                "base_info": {
+                    "channel_version": "2.4.1"
+                }
+            }
+            
+            async with self.session.post(url, headers=self._get_headers(), json=payload) as resp:
+                data = await resp.json(content_type=None)
+                if not data:
+                    print(f"⚠️ [WeChat] getuploadurl 返回为空")
+                    return None
+                
+                # Some versions return `upload_full_url`, others return `ret: 0` and `upload_param`
+                if "upload_full_url" in data:
+                    cdn_url = data["upload_full_url"]
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(cdn_url)
+                    qs = parse_qs(parsed.query)
+                    upload_param = qs.get("encrypted_query_param", [""])[0].replace(" ", "+")
+                elif data.get("ret") == 0 and "upload_param" in data:
+                    upload_param_b64 = data["upload_param"]
+                    upload_param = base64.b64decode(upload_param_b64).decode('utf-8')
+                    cdn_url = upload_param if upload_param.startswith("http") else f"https://novac2c.cdn.weixin.qq.com/c2c/{upload_param}"
+                else:
+                    print(f"⚠️ [WeChat] getuploadurl 失败: {data}")
+                    return None
+                
+            # CDN upload
+            cdn_headers = {"Content-Type": "application/octet-stream"}
+            async with self.session.post(cdn_url, headers=cdn_headers, data=ciphertext) as cdn_resp:
+                if cdn_resp.status != 200:
+                    print(f"⚠️ [WeChat] CDN 上传失败: HTTP {cdn_resp.status}")
+                    return None
+                    
+                encrypt_query_param = cdn_resp.headers.get("x-encrypted-param") or upload_param
+                
+            return {
+                "encrypt_query_param": encrypt_query_param,
+                "aes_key": base64.b64encode(hex_key.encode('utf-8')).decode('utf-8'),
+                "fileSize": str(rawsize)
+            }
+        except Exception as e:
+            print(f"⚠️ [WeChat] CDN 上传异常: {e}")
+            return None

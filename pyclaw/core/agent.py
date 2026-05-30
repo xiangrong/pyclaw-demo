@@ -319,6 +319,10 @@ class Agent:
                 if len(last_tool_calls) > 3:
                     last_tool_calls.pop(0)
 
+                # 打印工具调用信息
+                for tc in tool_calls:
+                    print(f"  🛠️  [Tool Call] {tc['function']['name']}({tc['function']['arguments']})")
+
                 # 1. 添加助手消息
                 assistant_msg = Message(
                     id=f"assistant-toolcall-{i}-{session.session_id}",
