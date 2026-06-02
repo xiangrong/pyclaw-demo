@@ -36,17 +36,21 @@ class Agent:
         self.base_system_prompt = self.system_prompt # save base
 
     def _get_dynamic_system_prompt(self, session: Optional[Session] = None) -> str:
-        """动态生成增强版系统提示词 (Soul + Agents + Skills + MCP + Session State)"""
+        """动态生成增强版系统提示词 (Soul + Agents + Skills + MCP + Session State + Memory)"""
         # 1. 加载 SOUL.md (全局人格)
         soul_content = self._load_soul_md()
         
         # 2. 加载 AGENTS.md (项目规范)
         agents_content = self._load_agents_md()
         
-        # 3. 加载技能索引
+        # 3. 加载 MEMORY.md 和 USER.md (持久化知识)
+        memory_content = self._load_memory_md()
+        user_content = self._load_user_md()
+        
+        # 4. 加载技能索引
         skills_index = self._get_skills_index()
         
-        # 4. 加载 MCP 信息
+        # 5. 加载 MCP 信息
         mcp_str = self._get_mcp_info()
 
         full_prompt = self.base_system_prompt
@@ -57,10 +61,16 @@ class Agent:
         if agents_content:
             full_prompt += f"\n<agents_context>\n{agents_content}\n</agents_context>\n"
             
+        if memory_content:
+            full_prompt += f"\n<long_term_memory>\n{memory_content}\n</long_term_memory>\n"
+
+        if user_content:
+            full_prompt += f"\n<user_context>\n{user_content}\n</user_context>\n"
+
         full_prompt += f"\n<available_skills>\n{skills_index}\n</available_skills>"
         full_prompt += mcp_str
         
-        # 5. 注入当前会话状态 (Plan & Objective)
+        # 6. 注入当前会话状态 (Plan & Objective)
         if session and session.metadata:
             objective = session.metadata.get("current_objective")
             plan = session.metadata.get("current_plan")
@@ -80,7 +90,20 @@ class Agent:
             "2. PLAN: Update your step-by-step plan if necessary. If the task is new, CREATE a plan.\n"
             "3. ACTION: Call the appropriate tools to execute the next step of your plan.\n"
             "4. OBSERVATION: Carefully evaluate the tool results (Observations) in the next turn.\n"
-            "\nOutput your reasoning process inside <thought> tags. Keep your plan updated.\n"
+            "\n Output your reasoning process inside <thought> tags. Keep your plan updated.\n"
+            "\n<memory_policy>\n"
+            "You have access to a durable long-term memory (`MEMORY.md`) and user context (`USER.md`).\n"
+            "- Read them at the start of a session to understand your standing orders and user preferences.\n"
+            "- When you learn a new important fact about the user or complete a major project, proactively use the `write_file` tool to update `~/.config/pyclaw/MEMORY.md` or `~/.config/pyclaw/USER.md`.\n"
+            "- Keep these files concise and structured.\n"
+            "</memory_policy>\n"
+            "\n<human_in_the_loop_policy>\n"
+            "For HIGH-RISK actions, you MUST ask for user approval BEFORE execution. High-risk actions include:\n"
+            "- Deleting files or directories (`rm`, `rf`).\n"
+            "- Overwriting important system or project files.\n"
+            "- Executing complex shell scripts that modify the system state.\n"
+            "To ask for approval, state clearly what you intend to do and wait for the user to say 'Yes' or 'Go ahead'.\n"
+            "</human_in_the_loop_policy>\n"
             "\n<file_handling_policy>\n"
             "When a user asks you to 'send' a file, DO NOT just print its content. "
             "Instead, find the file path and use the `send_file_to_user` tool to deliver it. "
@@ -98,6 +121,30 @@ class Agent:
         if os.path.exists(soul_path):
             try:
                 with open(soul_path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return ""
+
+    def _load_memory_md(self) -> str:
+        """加载长期记忆"""
+        config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
+        memory_path = os.path.join(config_dir, "MEMORY.md")
+        if os.path.exists(memory_path):
+            try:
+                with open(memory_path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return ""
+
+    def _load_user_md(self) -> str:
+        """加载用户信息"""
+        config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
+        user_path = os.path.join(config_dir, "USER.md")
+        if os.path.exists(user_path):
+            try:
+                with open(user_path, "r", encoding="utf-8") as f:
                     return f.read().strip()
             except Exception:
                 pass
@@ -247,6 +294,7 @@ class Agent:
         max_iterations = 25
         last_tool_calls = []  # 循环检测
         pending_files = [] # 存储待发送的文件信息
+        all_responses = [] # 存储所有周期的文本回复
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
@@ -276,7 +324,8 @@ class Agent:
                 )
             except Exception as e:
                 print(f"  ❌ LLM 调用出错: {e}")
-                return f"⚠️  LLM 调用出错: {str(e)}", []
+                error_msg = f"⚠️  LLM 调用出错: {str(e)}"
+                return "\n\n".join(all_responses + [error_msg]), []
 
             content = result.get("content", "") if isinstance(result, dict) else str(result)
             
@@ -288,6 +337,11 @@ class Agent:
                 thoughts = re.findall(r"<thought>(.*?)</thought>", content, re.DOTALL)
                 for t in thoughts:
                     print(f"  🧠 [Thinking] {t.strip()}")
+
+            # 记录有效的文本内容
+            if content.strip():
+                if content not in all_responses:
+                    all_responses.append(content)
 
             # 检查是否有工具调用
             if isinstance(result, dict) and result.get("__tool_calls__"):
@@ -342,7 +396,8 @@ class Agent:
                         json.dumps(result)
                     )
                 except Exception as e:
-                    return f"⚠️  工具执行出错: {str(e)}", []
+                    error_msg = f"⚠️  工具执行出错: {str(e)}"
+                    return "\n\n".join(all_responses + [error_msg]), []
 
                 # 3. 将结果作为 Observation 添加到会话
                 for tr in tool_results:
@@ -372,10 +427,17 @@ class Agent:
                     await self.sessions.save_message(session, tool_msg)
                 continue
 
-            # 没有工具调用，返回最终结果
-            return str(result), pending_files
+            # 没有工具调用，返回最终汇总结果
+            final_content = "\n\n".join(all_responses)
+            if not final_content.strip():
+                # 如果所有周期都没有内容，且没有工具调用，说明模型可能返回了空响应
+                # 这种情况下尝试返回原始结果或给予提示
+                final_content = str(result) or "⚠️  大模型返回了空响应，且未调用任何工具。"
+                
+            return final_content, pending_files
 
-        return self._summarize_final(session), pending_files
+        return "\n\n".join(all_responses + [self._summarize_final(session)]), pending_files
+
 
     async def _update_session_state(self, session: Session, content: str) -> None:
         """从 LLM 输出中解析 Plan 和 Objective 并更新 Session"""
