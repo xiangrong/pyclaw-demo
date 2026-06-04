@@ -76,6 +76,22 @@ class ActivateSkillTool(BaseTool):
         if os.path.exists(fallback_skills):
             skills_dirs.append(os.path.abspath(fallback_skills))
 
+        # Check for Python tool script first
+        py_tool_path = None
+        for skills_dir in skills_dirs:
+            target_path = os.path.abspath(os.path.join(skills_dir, f"{name}.py"))
+            if target_path.startswith(skills_dir) and os.path.exists(target_path):
+                py_tool_path = target_path
+                break
+                
+        if py_tool_path:
+            return ToolResult(
+                success=True, 
+                content=f"✅ Python tool skill '{name}' activated successfully. The tool specification is now available for you to use in this session. You can see its signature in your next turn.",
+                metadata={"activated_skill": name}
+            )
+
+        # Then check for SKILL.md
         skill_md_path = None
         for skills_dir in skills_dirs:
             target_path = os.path.abspath(os.path.join(skills_dir, name))

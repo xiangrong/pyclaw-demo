@@ -175,6 +175,16 @@ class Agent:
     def _get_skills_index(self) -> str:
         """获取技能索引"""
         skills_index = []
+        
+        # 1. 动态加载的 Python 工具
+        self.tools._refresh_skills()
+        for name, tool in self.tools._tools.items():
+            if name not in self.tools._static_tools:
+                desc = tool.description[:100] + "..." if len(tool.description) > 100 else tool.description
+                desc = desc.replace("\n", " ")
+                skills_index.append(f"- {name}: [Python Tool] {desc}")
+
+        # 2. 遍历目录查找 SKILL.md
         for skills_dir in self.tools.skills_dirs:
             if skills_dir and skills_dir.exists():
                 for root, dirs, files in os.walk(skills_dir):
@@ -183,13 +193,7 @@ class Agent:
                         rel_path = os.path.relpath(root, skills_dir)
                         description = self._extract_skill_description(skill_md_path)
                         if not any(item.startswith(f"- {rel_path}:") for item in skills_index):
-                            skills_index.append(f"- {rel_path}: {description}")
-                
-                for file in os.listdir(skills_dir):
-                    if file.endswith(".py") and not file.startswith("__"):
-                        skill_name = file[:-3]
-                        if not any(item.startswith(f"- {skill_name}:") for item in skills_index):
-                            skills_index.append(f"- {skill_name}: Python tool script.")
+                            skills_index.append(f"- {rel_path}: [Markdown Skill] {description}")
         
         return "\n".join(sorted(skills_index)) if skills_index else "No specialized skills currently indexed."
 
@@ -317,7 +321,8 @@ class Agent:
 
             # 判断是否是最后几次迭代，强制禁用工具
             is_final_iteration = i >= max_iterations - 2
-            tools = None if is_final_iteration else self.tools.get_all_specs()
+            active_skills = session.metadata.get("active_skills", [])
+            tools = None if is_final_iteration else self.tools.get_all_specs(active_skills=active_skills)
 
             try:
                 # 调用 LLM
@@ -411,6 +416,21 @@ class Agent:
                             "file_path": tr["metadata"]["file_path"],
                             "description": tr["metadata"]["description"]
                         })
+                        
+                    # 检查是否激活了技能
+                    if tr.get("metadata", {}).get("activated_skill"):
+                        skill_name = tr["metadata"]["activated_skill"]
+                        active_skills = session.metadata.get("active_skills", [])
+                        if skill_name not in active_skills:
+                            active_skills.append(skill_name)
+                            session.metadata["active_skills"] = active_skills
+                            # 立即保存 session 的 metadata
+                            async with self.sessions.db_connect() as db:
+                                await db.execute(
+                                    "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+                                    (json.dumps(session.metadata), session.session_id)
+                                )
+                                await db.commit()
 
                     truncated_content = self._truncate_content(tr["content"])
                     observation_content = f"OBSERVATION from {tr['name']}:\n{truncated_content}"

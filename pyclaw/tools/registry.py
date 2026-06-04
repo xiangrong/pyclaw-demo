@@ -81,10 +81,20 @@ class ToolRegistry:
         self._refresh_skills()
         return self._tools.get(name)
 
-    def get_all_specs(self) -> list[dict[str, Any]]:
-        """获取所有工具的OpenAI规格"""
+    def get_all_specs(self, active_skills: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        """获取所有工具的OpenAI规格，支持渐进式暴露动态技能"""
         self._refresh_skills()
-        return [tool.get_openai_spec() for tool in self._tools.values()]
+        
+        specs = []
+        for name, tool in self._tools.items():
+            if name in self._static_tools:
+                specs.append(tool.get_openai_spec())
+            else:
+                # 动态加载的技能（渐进式披露）
+                if active_skills and name in active_skills:
+                    specs.append(tool.get_openai_spec())
+                    
+        return specs
 
     async def execute(self, tool_name: str, **kwargs: Any) -> ToolResult:
         """执行工具"""

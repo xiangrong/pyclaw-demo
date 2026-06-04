@@ -19,7 +19,7 @@ Based on benchmarking against **OpenClaw** and **Hermes Agent (Nous Research)**,
     - Add a `save_as_skill` tool that persists successful complex procedures for future use.
 - [ ] **Semantic Memory**:
     - Integrate a lightweight Vector DB (e.g., LanceDB or ChromaDB) to enable full-text and semantic search across *all* past sessions and uploaded documents.
-- [ ] **Dynamic Skill Indexing**: Optimize the prompt by only injecting the full documentation of a skill *after* the agent decides to use it (Progressive Disclosure).
+- [x] **Dynamic Skill Indexing**: Optimize the prompt by only injecting the full documentation of a skill *after* the agent decides to use it (Progressive Disclosure).
 
 ## Phase 3: Proactive Intelligence & Ecosystem (Long-term)
 *Goal: Transition from a reactive assistant to a proactive partner.*
