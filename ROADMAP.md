@@ -6,10 +6,10 @@ Based on benchmarking against **OpenClaw** and **Hermes Agent (Nous Research)**,
 *Goal: Move from session-based tasks to a long-lived identity with secure execution.*
 
 - [ ] **Sandboxed Execution**: Refactor `TerminalTool` to support optional Docker containers or SSH remotes to prevent local system compromise.
-- [ ] **Durable Knowledge Files**:
+- [x] **Durable Knowledge Files**:
     - Implement `MEMORY.md`: A curated file where the agent stores long-term facts, standing decisions, and completed project summaries.
     - Implement `USER.md`: Stores static context about the user (preferences, bio, recurring needs).
-- [ ] **Human-in-the-loop (HITL)**: Add an approval mechanism for "High Risk" tools (e.g., `rm -rf`, `terminal` commands, large file deletions). The agent must wait for a user confirmation via the messaging app before proceeding.
+- [x] **Human-in-the-loop (HITL)**: Add an approval mechanism for "High Risk" tools (e.g., `rm -rf`, `terminal` commands, large file deletions). The agent must wait for a user confirmation via the messaging app before proceeding.
 
 ## Phase 2: Self-Improvement & Learning (Medium-term)
 *Goal: Enable the agent to expand its own capabilities through experience.*
