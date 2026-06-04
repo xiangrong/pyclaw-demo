@@ -85,9 +85,12 @@ def load_config(config_path: Optional[str] = None) -> Config:
             data["mcp_servers"] = {}
         if "amap" not in data["mcp_servers"]:
             data["mcp_servers"]["amap"] = {
-                "command": "npx",
+                "command": "/usr/local/bin/npx",
                 "args": ["-y", "@amap/amap-maps-mcp-server"],
-                "env": {"AMAP_MAPS_API_KEY": data["amap"]["api_key"]}
+                "env": {
+                    "AMAP_MAPS_API_KEY": data["amap"]["api_key"],
+                    "PATH": "/usr/local/bin:/usr/bin:/bin"
+                }
             }
 
     return Config(**data)
