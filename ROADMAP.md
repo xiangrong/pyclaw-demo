@@ -24,7 +24,7 @@ Based on benchmarking against **OpenClaw** and **Hermes Agent (Nous Research)**,
 ## Phase 3: Proactive Intelligence & Ecosystem (Long-term)
 *Goal: Transition from a reactive assistant to a proactive partner.*
 
-- [ ] **Natural Language Heartbeat**: Expand the Cron system to allow "Natural Language Automations" (e.g., "Check my email every morning and summarize the ones from my boss").
+- [x] **Natural Language Heartbeat**: Expand the Cron system to allow "Natural Language Automations" (e.g., "Check my email every morning and summarize the ones from my boss").
 - [ ] **Multi-Agent Swarms**:
     - Implement a more robust `SubAgentTool` where sub-agents can have their own isolated workspaces, specialized `SOUL.md` files, and parallel execution paths.
 - [ ] **Extended Gateway Connectivity**:
