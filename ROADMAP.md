@@ -14,7 +14,7 @@ Based on benchmarking against **OpenClaw** and **Hermes Agent (Nous Research)**,
 ## Phase 2: Self-Improvement & Learning (Medium-term)
 *Goal: Enable the agent to expand its own capabilities through experience.*
 
-- [ ] **Closed Learning Loop (Autonomous Skills)**: 
+- [x] **Closed Learning Loop (Autonomous Skills)**: 
     - Enable the agent to identify a "missing capability" and write its own `SKILL.md` (Markdown instructions) or `.py` tool script.
     - Add a `save_as_skill` tool that persists successful complex procedures for future use.
 - [ ] **Semantic Memory**:

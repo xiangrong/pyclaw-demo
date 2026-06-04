@@ -22,6 +22,7 @@ from pyclaw.tools.terminal import TerminalTool
 from pyclaw.tools.web_search import WebSearchTool
 from pyclaw.tools.web_read import WebReadTool
 from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
+from pyclaw.tools.save_skill import SaveSkillTool
 from skills.install_skill import InstallSkillTool, UninstallSkillTool
 from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
@@ -89,6 +90,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(ListSkillsTool())
         tool_registry.register(InstallSkillTool())
         tool_registry.register(UninstallSkillTool())
+        tool_registry.register(SaveSkillTool())
 
         # 初始化并启动 MCP 客户端
         mcp_manager = MCPClientManager(cfg.mcp_servers)
@@ -214,6 +216,7 @@ def cron_exec(
         tool_registry.register(ListSkillsTool())
         tool_registry.register(InstallSkillTool())
         tool_registry.register(UninstallSkillTool())
+        tool_registry.register(SaveSkillTool())
         # Cron任务不允许创建新的Cron任务（防止递归）
 
         db_path = os.path.join(cfg.work_dir, "pyclaw.db")

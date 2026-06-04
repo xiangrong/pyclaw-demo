@@ -5,6 +5,7 @@ from .skill_activation import ActivateSkillTool
 from .terminal import TerminalTool
 from .web_search import WebSearchTool
 from .web_read import WebReadTool
+from .save_skill import SaveSkillTool
 
 __all__ = [
     "BaseTool",
@@ -16,4 +17,5 @@ __all__ = [
     "TerminalTool",
     "WebSearchTool",
     "WebReadTool",
+    "SaveSkillTool",
 ]
