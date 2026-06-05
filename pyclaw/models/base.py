@@ -24,3 +24,13 @@ class BaseModelProvider(ABC):
     def format_tool_def(self, tool_def: dict[str, Any]) -> dict[str, Any]:
         """转换工具定义为模型格式"""
         pass
+
+    @abstractmethod
+    async def embed(self, text: str) -> list[float]:
+        """生成文本嵌入向量"""
+        pass
+
+    @abstractmethod
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """批量生成文本嵌入向量"""
+        pass

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from typing import Optional
 
 from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.core.session import Session, SessionManager
+from pyclaw.core.memory import SemanticMemory
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
 
@@ -22,11 +24,13 @@ class Agent:
         session_manager: SessionManager,
         system_prompt: Optional[str] = None,
         work_dir: Optional[str] = None,
+        memory: Optional[SemanticMemory] = None,
     ) -> None:
         self.model = model_provider
         self.tools = tool_registry
         self.sessions = session_manager
         self.work_dir = work_dir or os.getcwd()
+        self.memory = memory or SemanticMemory(model_provider)
 
         self.system_prompt = system_prompt or (
             "You are PyClaw, an autonomous AI assistant.\n"
@@ -35,8 +39,8 @@ class Agent:
         )
         self.base_system_prompt = self.system_prompt # save base
 
-    def _get_dynamic_system_prompt(self, session: Optional[Session] = None) -> str:
-        """动态生成增强版系统提示词 (Soul + Agents + Skills + MCP + Session State + Memory)"""
+    async def _get_dynamic_system_prompt(self, session: Optional[Session] = None) -> str:
+        """动态生成增强版系统提示词 (Soul + Agents + Skills + MCP + Session State + Memory + Semantic Memory)"""
         # 1. 加载 SOUL.md (全局人格)
         soul_content = self._load_soul_md()
         
@@ -53,6 +57,32 @@ class Agent:
         # 5. 加载 MCP 信息
         mcp_str = self._get_mcp_info()
 
+        # 6. 获取语义记忆 (Semantic Memory / RAG)
+        semantic_memory_content = ""
+        if session and self.memory:
+            # 优先使用当前目标进行检索，如果没有则尝试获取最后一条用户消息
+            query = session.metadata.get("current_objective")
+            if not query:
+                for msg in reversed(session.messages):
+                    if msg.role == MessageRole.USER:
+                        query = msg.content
+                        break
+            
+            if query:
+                try:
+                    results = await self.memory.search(query, limit=3)
+                    if results:
+                        mem_entries = []
+                        for r in results:
+                            # 过滤掉分数太低（距离太远）的结果
+                            if r["score"] < 1.0: # LanceDB 默认是 L2 距离，越小越近
+                                mem_entries.append(f"--- Memory ({r['timestamp']}) ---\n{r['text']}")
+                        
+                        if mem_entries:
+                            semantic_memory_content = "\n".join(mem_entries)
+                except Exception as e:
+                    print(f"  ⚠️  语义记忆检索失败: {e}")
+
         full_prompt = self.base_system_prompt
         
         if soul_content:
@@ -67,10 +97,13 @@ class Agent:
         if user_content:
             full_prompt += f"\n<user_context>\n{user_content}\n</user_context>\n"
 
+        if semantic_memory_content:
+            full_prompt += f"\n<relevant_past_interactions>\n{semantic_memory_content}\n</relevant_past_interactions>\n"
+
         full_prompt += f"\n<available_skills>\n{skills_index}\n</available_skills>"
         full_prompt += mcp_str
         
-        # 6. 注入当前会话状态 (Plan & Objective)
+        # 7. 注入当前会话状态 (Plan & Objective)
         if session and session.metadata:
             objective = session.metadata.get("current_objective")
             plan = session.metadata.get("current_plan")
@@ -232,7 +265,7 @@ class Agent:
         )
 
         # 动态更新系统提示词（允许技能热插拔被感知）
-        current_system_prompt = self._get_dynamic_system_prompt(session)
+        current_system_prompt = await self._get_dynamic_system_prompt(session)
 
         # 如果是新会话，添加系统提示
         system_msg = None
@@ -277,6 +310,14 @@ class Agent:
         )
         await self.sessions.save_message(session, response)
 
+        # 异步保存到语义记忆（不阻塞主流程回复）
+        if self.memory:
+            asyncio.create_task(self.memory.add_session_interaction(
+                user_msg=message.content,
+                assistant_msg=response_content,
+                session_id=session.session_id
+            ))
+
         return response
 
     async def run(self, session: Session, prompt: str) -> str:
@@ -308,7 +349,7 @@ class Agent:
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
 
             # 动态更新系统提示词内容 (包含最新的 Plan & Objective)
-            current_system_prompt = self._get_dynamic_system_prompt(session)
+            current_system_prompt = await self._get_dynamic_system_prompt(session)
             for msg in session.messages:
                 if msg.role == MessageRole.SYSTEM:
                     if msg.content != current_system_prompt:

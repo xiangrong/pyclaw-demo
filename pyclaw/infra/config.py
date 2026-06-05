@@ -36,6 +36,9 @@ class ModelConfig(BaseModel):
     api_key: str
     base_url: Optional[str] = None
     model: str = "gpt-4o"
+    embedding_model: Optional[str] = None # 默认 text-embedding-3-small
+    embedding_base_url: Optional[str] = None
+    embedding_api_key: Optional[str] = None
 
 
 class Config(BaseModel):

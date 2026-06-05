@@ -13,6 +13,7 @@ from pyclaw.channels.feishu import FeishuChannel
 from pyclaw.channels.telegram import TelegramChannel
 from pyclaw.core.agent import Agent
 from pyclaw.core.session import SessionManager
+from pyclaw.core.memory import SemanticMemory
 from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
 from pyclaw.models.openai import OpenAIProvider
@@ -23,6 +24,7 @@ from pyclaw.tools.web_search import WebSearchTool
 from pyclaw.tools.web_read import WebReadTool
 from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
 from pyclaw.tools.save_skill import SaveSkillTool
+from pyclaw.tools.memory_search import MemorySearchTool
 from skills.install_skill import InstallSkillTool, UninstallSkillTool
 from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
@@ -107,13 +109,22 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             api_key=cfg.model.api_key,
             base_url=cfg.model.base_url,
             model=cfg.model.model,
+            embedding_model=cfg.model.embedding_model,
+            embedding_base_url=cfg.model.embedding_base_url,
+            embedding_api_key=cfg.model.embedding_api_key,
         )
+
+        # 初始化语义记忆
+        memory_db_path = os.path.join(cfg.work_dir, "lancedb")
+        semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
+        tool_registry.register(MemorySearchTool(semantic_memory))
 
         agent = Agent(
             model_provider=model_provider,
             tool_registry=tool_registry,
             session_manager=session_manager,
             work_dir=cfg.work_dir,
+            memory=semantic_memory,
         )
 
         # 注册需要 Agent 实例的工具
@@ -227,13 +238,22 @@ def cron_exec(
             api_key=cfg.model.api_key,
             base_url=cfg.model.base_url,
             model=cfg.model.model,
+            embedding_model=cfg.model.embedding_model,
+            embedding_base_url=cfg.model.embedding_base_url,
+            embedding_api_key=cfg.model.embedding_api_key,
         )
+
+        # 初始化语义记忆
+        memory_db_path = os.path.join(cfg.work_dir, "lancedb")
+        semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
+        tool_registry.register(MemorySearchTool(semantic_memory))
 
         agent = Agent(
             model_provider=model_provider,
             tool_registry=tool_registry,
             session_manager=session_manager,
             work_dir=cfg.work_dir,
+            memory=semantic_memory,
         )
 
         # 注册需要 Agent 实例的工具

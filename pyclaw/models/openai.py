@@ -6,6 +6,7 @@ from typing import Any, AsyncGenerator, Optional, Union
 from openai import AsyncOpenAI
 
 from .base import BaseModelProvider
+from .local import LocalEmbeddingProvider
 
 
 class OpenAIProvider(BaseModelProvider):
@@ -18,9 +19,24 @@ class OpenAIProvider(BaseModelProvider):
         api_key: str,
         base_url: Optional[str] = None,
         model: str = "gpt-4o",
+        embedding_model: Optional[str] = None,
+        embedding_base_url: Optional[str] = None,
+        embedding_api_key: Optional[str] = None,
     ) -> None:
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self.embedding_model = embedding_model or "text-embedding-3-small"
+        
+        # 如果提供了独立的 embedding 配置，则创建一个独立的 client
+        if embedding_base_url == "local":
+            self.embed_client = LocalEmbeddingProvider(model_name=self.embedding_model)
+        elif embedding_base_url or embedding_api_key:
+            self.embed_client = AsyncOpenAI(
+                api_key=embedding_api_key or api_key,
+                base_url=embedding_base_url or base_url
+            )
+        else:
+            self.embed_client = self.client
 
     async def chat(
         self,
@@ -95,3 +111,21 @@ class OpenAIProvider(BaseModelProvider):
                 "parameters": tool_def["parameters"],
             },
         }
+
+    async def embed(self, text: str) -> list[float]:
+        """生成文本嵌入向量"""
+        response = await self.embed_client.embeddings.create(
+            input=text,
+            model=self.embedding_model,
+        )
+        return response.data[0].embedding
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """批量生成文本嵌入向量"""
+        if not texts:
+            return []
+        response = await self.embed_client.embeddings.create(
+            input=texts,
+            model=self.embedding_model,
+        )
+        return [item.embedding for item in response.data]
