@@ -1,6 +1,6 @@
 [project]
 name = "pyclaw"
-version = "0.9.0"
+version = "0.10.0"
 description = "Python AI Agent - Intelligent assistant with Multi-Agent collaboration, ReAct reasoning, and Cross-Channel File Support"
 authors = [
   { name="Xiang Rong", email="xiang.rong@example.com" }
