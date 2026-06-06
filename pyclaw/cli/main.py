@@ -116,8 +116,12 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
 
         # 初始化语义记忆
         memory_db_path = os.path.join(cfg.work_dir, "lancedb")
-        semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
-        tool_registry.register(MemorySearchTool(semantic_memory))
+        semantic_memory = None
+        if SemanticMemory.is_available():
+            semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
+            tool_registry.register(MemorySearchTool(semantic_memory))
+        else:
+            print("  ℹ️  LanceDB not found, Memory Search tool is disabled.")
 
         agent = Agent(
             model_provider=model_provider,
@@ -245,8 +249,12 @@ def cron_exec(
 
         # 初始化语义记忆
         memory_db_path = os.path.join(cfg.work_dir, "lancedb")
-        semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
-        tool_registry.register(MemorySearchTool(semantic_memory))
+        semantic_memory = None
+        if SemanticMemory.is_available():
+            semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
+            tool_registry.register(MemorySearchTool(semantic_memory))
+        else:
+            print("  ℹ️  LanceDB not found, Memory Search tool is disabled.")
 
         agent = Agent(
             model_provider=model_provider,

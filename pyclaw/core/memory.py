@@ -6,8 +6,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 
-import lancedb
-import pyarrow as pa
+try:
+    import lancedb
+    import pyarrow as pa
+    LANCE_DB_AVAILABLE = True
+except ImportError:
+    LANCE_DB_AVAILABLE = False
 from pydantic import BaseModel
 
 from pyclaw.models.base import BaseModelProvider
@@ -22,6 +26,11 @@ class MemoryRecord(BaseModel):
 
 class SemanticMemory:
     """基于 LanceDB 的语义记忆管理类"""
+
+    @classmethod
+    def is_available(cls) -> bool:
+        """检查 LanceDB 是否可用"""
+        return LANCE_DB_AVAILABLE
 
     def __init__(
         self,
@@ -40,6 +49,9 @@ class SemanticMemory:
 
     async def _ensure_connected(self) -> None:
         """确保已连接到数据库且表已创建"""
+        if not LANCE_DB_AVAILABLE:
+            raise ImportError("LanceDB is not installed. Please install it via 'pip install lancedb pyarrow'.")
+
         if self.db is not None and self.table is not None:
             return
 

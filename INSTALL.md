@@ -45,6 +45,11 @@ pip install --upgrade pip
 pip install -e .
 ```
 
+*注意：核心依赖不包含向量数据库。如果您需要启用「语义记忆 (RAG)」功能，请额外安装：*
+```bash
+pip install -r requirements-extra.txt
+```
+
 ---
 
 ## ⚙️ 安装后的配置步骤

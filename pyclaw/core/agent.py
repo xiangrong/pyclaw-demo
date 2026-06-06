@@ -30,7 +30,15 @@ class Agent:
         self.tools = tool_registry
         self.sessions = session_manager
         self.work_dir = work_dir or os.getcwd()
-        self.memory = memory or SemanticMemory(model_provider)
+        
+        # 仅在 LanceDB 可用时初始化语义记忆
+        if memory:
+            self.memory = memory
+        elif SemanticMemory.is_available():
+            self.memory = SemanticMemory(model_provider)
+        else:
+            print("  ℹ️  LanceDB not found, Semantic Memory (RAG) is disabled.")
+            self.memory = None
 
         self.system_prompt = system_prompt or (
             "You are PyClaw, an autonomous AI assistant.\n"

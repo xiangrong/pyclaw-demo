@@ -114,6 +114,9 @@ class OpenAIProvider(BaseModelProvider):
 
     async def embed(self, text: str) -> list[float]:
         """生成文本嵌入向量"""
+        if isinstance(self.embed_client, LocalEmbeddingProvider):
+            return await self.embed_client.embed(text)
+
         response = await self.embed_client.embeddings.create(
             input=text,
             model=self.embedding_model,
@@ -124,6 +127,10 @@ class OpenAIProvider(BaseModelProvider):
         """批量生成文本嵌入向量"""
         if not texts:
             return []
+            
+        if isinstance(self.embed_client, LocalEmbeddingProvider):
+            return await self.embed_client.embed_batch(texts)
+
         response = await self.embed_client.embeddings.create(
             input=texts,
             model=self.embedding_model,

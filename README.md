@@ -23,7 +23,11 @@
 ### 1. 安装依赖
 
 ```bash
+# 安装核心依赖
 pip install -r requirements.txt
+
+# (可选) 启用语义记忆 (RAG) 功能，需要额外安装向量数据库：
+pip install -r requirements-extra.txt
 ```
 
 ### 2. 配置
