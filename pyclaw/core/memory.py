@@ -60,6 +60,26 @@ class SemanticMemory:
         
         if self.table_name in self.db.table_names():
             self.table = self.db.open_table(self.table_name)
+            
+            # 校验维度是否匹配
+            try:
+                schema = self.table.schema
+                vector_field = schema.field("vector")
+                # pyarrow 的 FixedSizeListType 包含维度信息
+                existing_dim = vector_field.type.list_size
+                
+                # 获取当前模型的维度
+                dummy_vector = await self.model.embed("health check")
+                current_dim = len(dummy_vector)
+                
+                if existing_dim != current_dim:
+                    print(f"\n  🚨 [Memory] 维度不匹配! 数据库维度: {existing_dim}, 当前模型维度: {current_dim}")
+                    print(f"  🚨 请运行以下命令重置记忆库:\n     rm -rf {self.db_path}\n")
+                    # 设置为 None，让后续操作感知到不可用，但不直接崩溃
+                    self.table = None
+                    return
+            except Exception as e:
+                print(f"  ⚠️  校验维度时出错: {e}")
         else:
             # 创建初始表结构
             # 动态获取 embedding 维度
