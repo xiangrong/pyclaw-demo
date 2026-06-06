@@ -1,0 +1,294 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - link "Skip to content" [ref=e4] [cursor=pointer]:
+      - /url: "#start-of-content"
+    - banner [ref=e6]:
+      - heading "Navigation Menu" [level=2] [ref=e7]
+      - generic [ref=e8]:
+        - link "Homepage" [ref=e10] [cursor=pointer]:
+          - /url: /
+          - img [ref=e11]
+        - generic [ref=e13]:
+          - navigation "Global" [ref=e16]:
+            - list [ref=e17]:
+              - listitem [ref=e18]:
+                - button "Platform" [ref=e20] [cursor=pointer]:
+                  - text: Platform
+                  - img [ref=e21]
+              - listitem [ref=e23]:
+                - button "Solutions" [ref=e25] [cursor=pointer]:
+                  - text: Solutions
+                  - img [ref=e26]
+              - listitem [ref=e28]:
+                - button "Resources" [ref=e30] [cursor=pointer]:
+                  - text: Resources
+                  - img [ref=e31]
+              - listitem [ref=e33]:
+                - button "Open Source" [ref=e35] [cursor=pointer]:
+                  - text: Open Source
+                  - img [ref=e36]
+              - listitem [ref=e38]:
+                - button "Enterprise" [ref=e40] [cursor=pointer]:
+                  - text: Enterprise
+                  - img [ref=e41]
+              - listitem [ref=e43]:
+                - link "Pricing" [ref=e44] [cursor=pointer]:
+                  - /url: https://github.com/pricing
+                  - generic [ref=e45]: Pricing
+          - generic [ref=e46]:
+            - button "Search or jump to…" [ref=e49] [cursor=pointer]:
+              - img [ref=e51]
+            - link "Sign in" [ref=e54] [cursor=pointer]:
+              - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Fsearch%3Fq%3Dpyclaw-demo
+            - link "Sign up" [ref=e55] [cursor=pointer]:
+              - /url: /signup?ref_cta=Sign+up&ref_loc=header+logged+out&ref_page=%2Fsearch&source=header
+            - button "Appearance settings" [ref=e58] [cursor=pointer]:
+              - img
+  - main [ref=e61]:
+    - generic [ref=e64]:
+      - heading "repositories Search Results · pyclaw-demo" [level=1] [ref=e65]
+      - generic [ref=e68]:
+        - generic [ref=e69]:
+          - generic [ref=e70]:
+            - heading "Filter by" [level=2] [ref=e71]
+            - list "Filter by" [ref=e76]:
+              - listitem [ref=e77]:
+                - list [ref=e78]:
+                  - listitem [ref=e79]:
+                    - link "Code (...) results" [ref=e80] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo&type=code
+                      - generic:
+                        - img
+                      - generic [ref=e81]:
+                        - generic [ref=e82]: Code
+                        - generic:
+                          - generic: ...
+                          - generic: (...)
+                          - generic: results
+                  - listitem [ref=e83]:
+                    - link "Repositories (2) results" [ref=e84] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo&type=repositories
+                      - generic:
+                        - img
+                      - generic [ref=e85]:
+                        - generic [ref=e86]: Repositories
+                        - generic:
+                          - generic: "2"
+                          - generic: (2)
+                          - generic: results
+                  - listitem [ref=e87]:
+                    - link "Issues (4) results" [ref=e88] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo&type=issues
+                      - generic:
+                        - img
+                      - generic [ref=e89]:
+                        - generic [ref=e90]: Issues
+                        - generic:
+                          - generic: "4"
+                          - generic: (4)
+                          - generic: results
+                  - listitem [ref=e91]:
+                    - link "Pull requests (3) results" [ref=e92] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo&type=pullrequests
+                      - generic:
+                        - img
+                      - generic [ref=e93]:
+                        - generic [ref=e94]: Pull requests
+                        - generic:
+                          - generic: "3"
+                          - generic: (3)
+                          - generic: results
+                  - listitem [ref=e95]:
+                    - link "Discussions (0) results" [ref=e96] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo&type=discussions
+                      - generic:
+                        - img
+                      - generic [ref=e97]:
+                        - generic [ref=e98]: Discussions
+                        - generic:
+                          - generic: "0"
+                          - generic: (0)
+                          - generic: results
+                  - listitem [ref=e99]:
+                    - link "Users (0) results" [ref=e100] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo&type=users
+                      - generic:
+                        - img
+                      - generic [ref=e101]:
+                        - generic [ref=e102]: Users
+                        - generic:
+                          - generic: "0"
+                          - generic: (0)
+                          - generic: results
+                  - listitem [ref=e103]:
+                    - button "More" [ref=e104] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic [ref=e106]: More
+              - listitem [ref=e107]:
+                - heading "Advanced" [level=3] [ref=e109]
+                - list "Advanced" [ref=e110]:
+                  - listitem [ref=e111]:
+                    - button "Owner" [ref=e112] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Owner" [ref=e116]
+                  - listitem [ref=e117]:
+                    - button "Size" [ref=e118] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Size" [ref=e122]
+                  - listitem [ref=e123]:
+                    - button "Number of followers" [ref=e124] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Number of followers" [ref=e128]
+                  - listitem [ref=e129]:
+                    - button "Number of forks" [ref=e130] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Number of forks" [ref=e134]
+                  - listitem [ref=e135]:
+                    - button "Number of stars" [ref=e136] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Number of stars" [ref=e140]
+                  - listitem [ref=e141]:
+                    - button "Date created" [ref=e142] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Date created" [ref=e146]
+                  - listitem [ref=e147]:
+                    - button "Date pushed" [ref=e148] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Date pushed" [ref=e152]
+                  - listitem [ref=e153]:
+                    - button "Topic" [ref=e154] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Topic" [ref=e158]
+                  - listitem [ref=e159]:
+                    - button "License" [ref=e160] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "License" [ref=e164]
+                  - listitem [ref=e165]:
+                    - button "Archived" [ref=e166] [cursor=pointer]:
+                      - generic:
+                        - img
+                      - generic "Archived" [ref=e170]
+                  - listitem [ref=e171]:
+                    - link "Public" [ref=e172] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo+is%3Apublic&type=repositories
+                      - generic:
+                        - img
+                      - generic "Public" [ref=e176]
+                  - listitem [ref=e177]:
+                    - link "Private" [ref=e178] [cursor=pointer]:
+                      - /url: https://github.com/search?q=pyclaw-demo+is%3Aprivate&type=repositories
+                      - generic:
+                        - img
+                      - generic "Private" [ref=e182]
+              - listitem [ref=e183]
+              - listitem [ref=e184]:
+                - link "Advanced search" [ref=e185] [cursor=pointer]:
+                  - /url: /search/advanced
+                  - generic:
+                    - img
+                  - generic [ref=e187]: Advanced search
+          - slider "Draggable pane splitter" [ref=e189]
+        - generic [ref=e192]:
+          - generic [ref=e193]:
+            - generic [ref=e195]:
+              - generic [ref=e196]:
+                - generic [ref=e197]:
+                  - generic [ref=e198]: 2 results
+                  - generic [ref=e199]: (143 ms)
+                - heading "2 results" [active] [level=2] [ref=e200]
+              - generic [ref=e201]:
+                - 'button "Sort by: Best match" [ref=e203] [cursor=pointer]':
+                  - generic [ref=e205]: "Sort by: Best match"
+                  - generic:
+                    - img
+                - button "Open column options" [ref=e207] [cursor=pointer]:
+                  - img [ref=e208]
+            - generic [ref=e212]:
+              - generic [ref=e214]:
+                - generic [ref=e215]:
+                  - heading "xiangrong/pyclaw-demo" [level=3] [ref=e216]:
+                    - link "xiangrong/pyclaw-demo" [ref=e220] [cursor=pointer]:
+                      - /url: /xiangrong/pyclaw-demo
+                      - generic [ref=e221]:
+                        - text: xiangrong/
+                        - emphasis [ref=e222]: pyclaw-demo
+                  - generic [ref=e223]: Python AI Agent with Telegram integration
+                  - list [ref=e224]:
+                    - listitem [ref=e225]:
+                      - generic "Python language" [ref=e228]: Python
+                    - generic [ref=e229]: ·
+                    - listitem [ref=e230]:
+                      - link "1 stars" [ref=e231] [cursor=pointer]:
+                        - /url: /xiangrong/pyclaw-demo/stargazers
+                        - img [ref=e232]
+                        - generic [ref=e234]: "1"
+                    - generic [ref=e235]: ·
+                    - listitem [ref=e236]:
+                      - generic [ref=e237]:
+                        - text: Updated
+                        - generic "2026年5月30日 GMT+8 00:28" [ref=e238]: 22 hours ago
+                - link "Star" [ref=e241] [cursor=pointer]:
+                  - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Fsearch%3Fq%3Dpyclaw-demo%26type%3Drepositories
+                  - generic [ref=e242]:
+                    - generic:
+                      - img
+                    - generic [ref=e243]: Star
+              - generic [ref=e245]:
+                - generic [ref=e246]:
+                  - heading "liuchintao/PyClawerDemo" [level=3] [ref=e247]:
+                    - link "liuchintao/PyClawerDemo" [ref=e251] [cursor=pointer]:
+                      - /url: /liuchintao/PyClawerDemo
+                      - generic [ref=e252]:
+                        - text: liuchintao/PyClawer
+                        - emphasis [ref=e253]: Demo
+                  - generic [ref=e255]:
+                    - text: Python spider
+                    - emphasis [ref=e256]: demo
+                    - text: (s)????!!!
+                  - list [ref=e257]:
+                    - listitem [ref=e258]:
+                      - generic "Python language" [ref=e261]: Python
+                    - generic [ref=e262]: ·
+                    - listitem [ref=e263]:
+                      - link "0 stars" [ref=e264] [cursor=pointer]:
+                        - /url: /liuchintao/PyClawerDemo/stargazers
+                        - img [ref=e265]
+                        - generic [ref=e267]: "0"
+                    - generic [ref=e268]: ·
+                    - listitem [ref=e269]:
+                      - generic [ref=e270]:
+                        - text: Updated
+                        - generic "2017年4月18日 GMT+8 12:25" [ref=e271]: on 2017年4月18日
+                - link "Star" [ref=e274] [cursor=pointer]:
+                  - /url: /login?return_to=https%3A%2F%2Fgithub.com%2Fsearch%3Fq%3Dpyclaw-demo%26type%3Drepositories
+                  - generic [ref=e275]:
+                    - generic:
+                      - img
+                    - generic [ref=e276]: Star
+          - generic [ref=e279]:
+            - generic [ref=e280]:
+              - img "Package icon" [ref=e282]
+              - heading "Sponsor open source projects you depend on" [level=2] [ref=e283]
+              - generic [ref=e284]: Contributors are working behind the scenes to make open source better for everyone—give them the help and recognition they deserve.
+              - link "Explore sponsorable projects" [ref=e285] [cursor=pointer]:
+                - /url: https://github.com/sponsors/explore
+                - text: Explore sponsorable projects
+                - img [ref=e286]
+            - generic [ref=e288]:
+              - generic [ref=e289]:
+                - img [ref=e290]
+                - text: ProTip!
+              - generic [ref=e292]:
+                - text: Press the
+                - generic [ref=e293]: /
+                - text: key to activate the search input again and adjust your query.

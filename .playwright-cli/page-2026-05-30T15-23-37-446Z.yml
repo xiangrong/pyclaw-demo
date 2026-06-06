@@ -1,0 +1,56 @@
+- generic [ref=e2]:
+  - navigation [ref=e3]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - link "Gmail" [ref=e8] [cursor=pointer]:
+          - /url: https://mail.google.com/mail/&ogbl
+        - link "搜索图片" [ref=e10] [cursor=pointer]:
+          - /url: https://www.google.com/imghp?hl=zh-CN&ogbl
+          - text: 图片
+      - button "Google 应用" [ref=e13] [cursor=pointer]:
+        - img [ref=e14]
+      - link "登录" [ref=e18] [cursor=pointer]:
+        - /url: https://accounts.google.com/ServiceLogin?hl=zh-CN&passive=true&continue=https://www.google.com/&ec=futura_exp_og_so_72776762_e
+  - img "Google" [ref=e21]
+  - search [ref=e29]:
+    - generic [ref=e31]:
+      - generic [ref=e33]:
+        - img [ref=e37]
+        - combobox "搜索" [active] [ref=e40]
+        - generic [ref=e42]:
+          - button "按语音搜索" [ref=e43] [cursor=pointer]:
+            - img [ref=e44]
+          - button "按图搜索" [ref=e46] [cursor=pointer]:
+            - img [ref=e47]
+      - generic [ref=e50]:
+        - button "Google 搜索" [ref=e51] [cursor=pointer]
+        - button "手气不错" [ref=e52] [cursor=pointer]
+  - generic [ref=e55]:
+    - text: Google 提供：
+    - link "Indonesia" [ref=e56] [cursor=pointer]:
+      - /url: https://www.google.com/setprefs?sig=0_DQQMS2ruKo82BksC2sGF_1b5Enk%3D&hl=id&source=homepage&sa=X&ved=0ahUKEwiM097bqOGUAxVeTmwGHfVMO0EQ2ZgBCBU
+    - link "English" [ref=e57] [cursor=pointer]:
+      - /url: https://www.google.com/setprefs?sig=0_DQQMS2ruKo82BksC2sGF_1b5Enk%3D&hl=en&source=homepage&sa=X&ved=0ahUKEwiM097bqOGUAxVeTmwGHfVMO0EQ2ZgBCBY
+    - link:
+      - /url: https://www.google.com/setprefs?sig=0_DQQMS2ruKo82BksC2sGF_1b5Enk%3D&hl=jv&source=homepage&sa=X&ved=0ahUKEwiM097bqOGUAxVeTmwGHfVMO0EQ2ZgBCBc
+    - link "Basa Bali" [ref=e58] [cursor=pointer]:
+      - /url: https://www.google.com/setprefs?sig=0_DQQMS2ruKo82BksC2sGF_1b5Enk%3D&hl=ban&source=homepage&sa=X&ved=0ahUKEwiM097bqOGUAxVeTmwGHfVMO0EQ2ZgBCBg
+  - contentinfo [ref=e60]:
+    - generic [ref=e61]: 印度尼西亚
+    - generic [ref=e62]:
+      - generic [ref=e63]:
+        - link "关于 Google" [ref=e64] [cursor=pointer]:
+          - /url: https://about.google/?utm_source=google-ID&utm_medium=referral&utm_campaign=hp-footer&fg=1
+        - link "广告" [ref=e65] [cursor=pointer]:
+          - /url: https://www.google.com/intl/zh-CN_id/ads/?subid=ww-ww-et-g-awa-a-g_hpafoot1_1!o2&utm_source=google.com&utm_medium=referral&utm_campaign=google_hpafooter&fg=1
+        - link "商务" [ref=e66] [cursor=pointer]:
+          - /url: https://www.google.com/services/?subid=ww-ww-et-g-awa-a-g_hpbfoot1_1!o2&utm_source=google.com&utm_medium=referral&utm_campaign=google_hpbfooter&fg=1
+        - link "Google 搜索的运作方式" [ref=e67] [cursor=pointer]:
+          - /url: https://google.com/search/howsearchworks/?fg=1
+      - generic [ref=e68]:
+        - link "隐私权" [ref=e69] [cursor=pointer]:
+          - /url: https://policies.google.com/privacy?hl=zh-CN&fg=1
+        - link "条款" [ref=e70] [cursor=pointer]:
+          - /url: https://policies.google.com/terms?hl=zh-CN&fg=1
+        - button "设置" [ref=e74] [cursor=pointer]:
+          - generic [ref=e75]: 设置

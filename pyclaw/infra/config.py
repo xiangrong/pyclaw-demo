@@ -41,12 +41,19 @@ class ModelConfig(BaseModel):
     embedding_api_key: Optional[str] = None
 
 
+class SandboxConfig(BaseModel):
+    enabled: bool = False
+    image: str = "python:3.10-slim"
+    volumes: dict[str, str] = Field(default_factory=dict)
+
+
 class Config(BaseModel):
     telegram: Optional[TelegramConfig] = None
     feishu: Optional[FeishuConfig] = None
     wechat: Optional[WechatConfig] = None
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     model: ModelConfig
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
 
 
