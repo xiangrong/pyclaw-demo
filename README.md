@@ -15,7 +15,8 @@
 | 🧠 核心智能 | ✅ | 显式 ReAct 推理循环，支持 `<thought>` 思考过程 |
 | 🤝 协作能力 | ✅ | **多 Agent 协作**，支持通过子 Agent 委派复杂任务 |
 | 🧰 丰富工具 | ✅ | 终端命令、文件读写、网页搜索/解析、定时任务 |
-| 🧱 动态技能 | ✅ | 支持从 Git URL 动态安装新技能，热加载 `SKILL.md` |
+| 🧱 动态技能 | ✅ | 支持从 Git URL 动态安装，或**通过文档自主学习 (Doc-Learner)** |
+| 🧠 经验进化 | ✅ | **经验总结系统**，Agent 会自动总结成功案例并复用于未来任务 |
 
 ## 🚀 快速开始
 
@@ -69,10 +70,19 @@ python -m pyclaw start
 ### 1. ReAct 推理循环
 Agent 在执行任何动作前都会生成 `<thought>` 标签，详细记录其思考过程、工具选择和预期结果，确保决策透明可追溯。
 
-### 2. 语义记忆 (RAG) 系统
+### 2. 经验进化 (Experience Memory)
+Agent 现在拥有了“复盘”能力。在完成多步复杂任务后，它会自动提炼执行轨迹中的关键指令与避坑指南，存入语义记忆。下次遇到类似目标时，Bot 会在 `<past_experiences>` 中优先参考这些成功案例。
+
+### 3. 自主技能学习 (Doc-Learner)
+除了安装预设技能，Bot 还能“现学现卖”。你可以直接对它说：
+> "学习下这个 API 文档：https://example.com/docs ，并创建一个名为 'stripe' 的技能"
+
+Bot 会调用 `learn_skill_from_doc` 工具，分析文档并自动生成配套的 `SKILL.md` 与 Python 封装脚本，使其能力边界无限扩张。
+
+### 4. 语义记忆 (RAG) 系统
 基于 **LanceDB** 的向量存储。Agent 会自动记录并检索过去的对话精华。当更换 Embedding 模型导致维度不匹配时，系统会主动提示并引导重置，确保持续稳定。
 
-### 3. 动态技能生态
+### 5. 动态技能生态
 支持 **Progressive Disclosure** 模式。你可以直接对 Bot 说：
 > "帮我安装这个技能：https://github.com/example/coder-skill.git"
 

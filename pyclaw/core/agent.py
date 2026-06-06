@@ -67,6 +67,7 @@ class Agent:
 
         # 6. 获取语义记忆 (Semantic Memory / RAG)
         semantic_memory_content = ""
+        experience_memory_content = ""
         if session and self.memory:
             # 优先使用当前目标进行检索，如果没有则尝试获取最后一条用户消息
             query = session.metadata.get("current_objective")
@@ -78,16 +79,25 @@ class Agent:
             
             if query:
                 try:
-                    results = await self.memory.search(query, limit=3)
+                    results = await self.memory.search(query, limit=5)
                     if results:
                         mem_entries = []
+                        exp_entries = []
                         for r in results:
                             # 过滤掉分数太低（距离太远）的结果
                             if r["score"] < 1.0: # LanceDB 默认是 L2 距离，越小越近
-                                mem_entries.append(f"--- Memory ({r['timestamp']}) ---\n{r['text']}")
+                                text = r["text"]
+                                metadata = r.get("metadata", {})
+                                
+                                if metadata.get("type") == "experience":
+                                    exp_entries.append(f"--- Experience ({r['timestamp']}) ---\n{text}")
+                                else:
+                                    mem_entries.append(f"--- Interaction ({r['timestamp']}) ---\n{text}")
                         
                         if mem_entries:
                             semantic_memory_content = "\n".join(mem_entries)
+                        if exp_entries:
+                            experience_memory_content = "\n".join(exp_entries)
                 except Exception as e:
                     print(f"  ⚠️  语义记忆检索失败: {e}")
 
@@ -104,6 +114,9 @@ class Agent:
 
         if user_content:
             full_prompt += f"\n<user_context>\n{user_content}\n</user_context>\n"
+
+        if experience_memory_content:
+            full_prompt += f"\n<past_experiences>\n{experience_memory_content}\n</past_experiences>\n"
 
         if semantic_memory_content:
             full_prompt += f"\n<relevant_past_interactions>\n{semantic_memory_content}\n</relevant_past_interactions>\n"
@@ -506,10 +519,56 @@ class Agent:
                 # 如果所有周期都没有内容，且没有工具调用，说明模型可能返回了空响应
                 # 这种情况下尝试返回原始结果或给予提示
                 final_content = str(result) or "⚠️  大模型返回了空响应，且未调用任何工具。"
+            
+            # 如果执行过工具，且成功结束，异步提取并保存经验
+            if i > 0 and self.memory:
+                asyncio.create_task(self._extract_and_save_experience(session, final_content))
                 
             return final_content, pending_files
 
         return "\n\n".join(all_responses + [self._summarize_final(session)]), pending_files
+
+    async def _extract_and_save_experience(self, session: Session, final_response: str) -> None:
+        """提取本次任务的执行经验并保存到语义记忆"""
+        if not self.memory:
+            return
+
+        try:
+            # 仅提取包含工具调用的复杂任务
+            history = session.get_history()
+            has_tool_calls = any(m["role"] == "assistant" and "tool_calls" in m for m in history)
+            if not has_tool_calls:
+                return
+
+            print(f"🧠 [Memory] Extracting experience from session {session.session_id}...")
+
+            # 构造摘要请求
+            summary_prompt = (
+                "请总结本次任务的执行轨迹，提炼为一条「经验知识」。\n"
+                "要求包含：\n"
+                "1. 核心目标 (Goal)\n"
+                "2. 遇到的困难或报错 (Challenges)\n"
+                "3. 最终证明有效的解决方案或关键指令 (Solution)\n\n"
+                "请直接输出提炼后的技术笔记，格式简洁，不要包含无关废话。\n\n"
+                f"任务结果：\n{final_response}"
+            )
+            
+            messages = history + [{"role": "user", "content": summary_prompt}]
+            
+            # 使用模型生成摘要 (不使用工具)
+            experience_content = await self.model.chat(messages=messages, tools=None)
+            
+            if experience_content:
+                metadata = {
+                    "type": "experience",
+                    "session_id": session.session_id,
+                    "objective": session.metadata.get("current_objective", ""),
+                }
+                await self.memory.add_memory(experience_content, metadata)
+                print(f"✅ [Memory] Experience saved.")
+
+        except Exception as e:
+            print(f"⚠️ [Memory] Failed to extract experience: {e}")
 
 
     async def _update_session_state(self, session: Session, content: str) -> None:
