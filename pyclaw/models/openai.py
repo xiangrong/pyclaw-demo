@@ -25,17 +25,20 @@ class OpenAIProvider(BaseModelProvider):
     ) -> None:
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
-        self.embedding_model = embedding_model or "text-embedding-3-small"
         
         # 如果提供了独立的 embedding 配置，则创建一个独立的 client
         if embedding_base_url == "local":
+            # 本地模式默认使用 BAAI/bge-small-zh-v1.5
+            self.embedding_model = embedding_model or "BAAI/bge-small-zh-v1.5"
             self.embed_client = LocalEmbeddingProvider(model_name=self.embedding_model)
         elif embedding_base_url or embedding_api_key:
+            self.embedding_model = embedding_model or "text-embedding-3-small"
             self.embed_client = AsyncOpenAI(
                 api_key=embedding_api_key or api_key,
                 base_url=embedding_base_url or base_url
             )
         else:
+            self.embedding_model = embedding_model or "text-embedding-3-small"
             self.embed_client = self.client
 
     async def chat(
