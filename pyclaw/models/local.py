@@ -17,14 +17,21 @@ class LocalEmbeddingProvider(BaseModelProvider):
         self.device = device
         self._model = None
 
-    def _load_model(self):
+    async def _get_model(self):
         if self._model is None:
-            try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            
+            def load():
                 from sentence_transformers import SentenceTransformer
                 print(f"📡 [LocalEmbedding] Loading model {self.model_name} onto {self.device}...")
-                self._model = SentenceTransformer(self.model_name, device=self.device)
-            except ImportError:
-                raise ImportError("Please install 'sentence-transformers' to use local embeddings: pip install sentence-transformers")
+                return SentenceTransformer(self.model_name, device=self.device)
+                
+            try:
+                self._model = await loop.run_in_executor(None, load)
+            except Exception as e:
+                print(f"❌ Failed to load local model: {e}")
+                raise ImportError(f"Please install 'sentence-transformers' to use local embeddings: {e}")
         return self._model
 
     async def chat(
@@ -41,7 +48,7 @@ class LocalEmbeddingProvider(BaseModelProvider):
 
     async def embed(self, text: str) -> list[float]:
         """本地生成嵌入向量"""
-        model = self._load_model()
+        model = await self._get_model()
         import asyncio
         # 将同步推理放到线程池中执行，避免阻塞事件循环
         loop = asyncio.get_event_loop()
@@ -52,7 +59,7 @@ class LocalEmbeddingProvider(BaseModelProvider):
         """本地批量生成嵌入向量"""
         if not texts:
             return []
-        model = self._load_model()
+        model = await self._get_model()
         import asyncio
         loop = asyncio.get_event_loop()
         vectors = await loop.run_in_executor(None, lambda: model.encode(texts, normalize_embeddings=True))

@@ -110,7 +110,10 @@ class SemanticMemory:
         }
         
         # LanceDB add 也是同步阻塞的，在 async 中使用建议 wrap 或直接执行（通常很快）
-        self.table.add([record])
+        if self.table is not None:
+            self.table.add([record])
+        else:
+            print("  ⚠️  Memory table is not initialized, skipping add_memory.")
 
     async def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """搜索相关记忆"""

@@ -58,6 +58,8 @@ def main(
 @app.command()
 def start(config: str = typer.Option(None, help="Path to config file")) -> None:
     """启动 PyClaw Agent"""
+    print(f"🐍 Python Executable: {sys.executable}")
+    print(f"📂 Python Path: {sys.path}")
 
     async def _start() -> None:
         # 加载配置
@@ -173,16 +175,14 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         try:
             await gateway.start()
 
-            # 等待信号
-            stop_event = asyncio.Event()
-            loop = asyncio.get_running_loop()
-
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, stop_event.set)
-
-            print("\n🚀 PyClaw Agent 已启动，按 Ctrl+C 停止")
-            await stop_event.wait()
-
+            print("\n🚀 PyClaw Agent 已启动，使用 loop.run_forever() 保持运行")
+            # 简单粗暴的保持运行方式
+            while True:
+                await asyncio.sleep(3600)
+        except Exception as e:
+            print(f"❌ CRITICAL ERROR in start command: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             await gateway.stop()
             if 'mcp_manager' in locals():
