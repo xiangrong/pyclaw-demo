@@ -87,6 +87,8 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
+        from pyclaw.tools.python_interpreter import PythonInterpreterTool
+        tool_registry.register(PythonInterpreterTool())
         tool_registry.register(WebSearchTool())
         tool_registry.register(WebReadTool())
         tool_registry.register(CronJobTool())
@@ -227,6 +229,8 @@ def cron_exec(
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
+        from pyclaw.tools.python_interpreter import PythonInterpreterTool
+        tool_registry.register(PythonInterpreterTool())
         tool_registry.register(WebSearchTool())
         tool_registry.register(WebReadTool())
         tool_registry.register(ActivateSkillTool())
