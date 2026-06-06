@@ -62,9 +62,11 @@ class SemanticMemory:
             self.table = self.db.open_table(self.table_name)
         else:
             # 创建初始表结构
-            # 我们需要先拿到一个 embedding 维度，text-embedding-3-small 是 1536
-            # 为了通用性，我们先做一次 dummy embed 或者使用默认值
-            dim = 1536 
+            # 动态获取 embedding 维度
+            print(f"🔍 [Memory] Initializing table '{self.table_name}' with dynamic dimension...")
+            dummy_vector = await self.model.embed("health check")
+            dim = len(dummy_vector)
+            
             schema = pa.schema([
                 pa.field("vector", pa.list_(pa.float32(), dim)),
                 pa.field("text", pa.string()),
@@ -97,8 +99,17 @@ class SemanticMemory:
         import json
         query_vector = await self.model.embed(query)
         
-        # 执行向量搜索
-        results = self.table.search(query_vector).limit(limit).to_list()
+        # 执行向量搜索，明确指定向量列名
+        try:
+            results = self.table.search(query_vector, vector_column_name="vector").limit(limit).to_list()
+        except Exception as e:
+            # 如果搜索失败（可能是维度不匹配），提示用户
+            err_str = str(e).lower()
+            if "dimension" in err_str or "vector column" in err_str:
+                print(f"  ⚠️  语义记忆搜索失败 (可能是模型变更导致维度不匹配): {e}")
+                print(f"  💡 提示: 如果您更换了 Embedding 模型，请尝试删除 {self.db_path} 目录后重试。")
+                return []
+            raise e
         
         formatted_results = []
         for r in results:
