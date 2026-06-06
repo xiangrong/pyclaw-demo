@@ -20,10 +20,25 @@
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 1. 环境准备与安装
+
+我们建议在虚拟环境中运行 PyClaw，以保持系统环境整洁：
 
 ```bash
-# 安装核心依赖
+# 克隆仓库
+git clone https://github.com/xiangrong/pyclaw-demo.git
+cd pyclaw-demo
+
+# 1. 创建虚拟环境 (仅需执行一次)
+python3 -m venv venv
+
+# 2. 激活虚拟环境
+# macOS / Linux:
+source venv/bin/activate
+# Windows:
+# .\venv\Scripts\activate
+
+# 3. 安装核心依赖
 pip install -r requirements.txt
 
 # (可选) 启用语义记忆 (RAG) 功能，需要额外安装向量数据库：
