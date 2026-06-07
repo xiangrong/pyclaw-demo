@@ -86,5 +86,11 @@ class StaticLayer(BaseLayer):
             "Instead, find the file path and use the `send_file_to_user` tool to deliver it. "
             "Printing large file contents as text is token-inefficient and often not what the user wants.\n"
             "</file_handling_policy>\n"
+            "\n<conciseness_policy>\n"
+            "1. BE CONCISE. Avoid repetitive conversational filler, especially when you are about to call a tool.\n"
+            "2. DO NOT provide redundant status updates in every turn of a multi-step task (e.g., 'Okay, let me check...', 'Now I will...').\n"
+            "3. If you are calling a tool, you may provide a brief one-line explanation IF AND ONLY IF it adds value. Otherwise, just execute the tool.\n"
+            "4. Your final response should be a clean summary of the results, not a diary of every step you took.\n"
+            "</conciseness_policy>\n"
             "</reasoning_guidelines>"
         )

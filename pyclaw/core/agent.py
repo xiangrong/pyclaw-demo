@@ -390,13 +390,21 @@ class Agent:
                 for t in thoughts:
                     print(f"  🧠 [Thinking] {t.strip()}")
 
-            # 记录有效的文本内容
-            if content.strip():
-                if content not in all_responses:
-                    all_responses.append(content)
-
             # 检查是否有工具调用
-            if isinstance(result, dict) and result.get("__tool_calls__"):
+            has_tool_calls = isinstance(result, dict) and bool(result.get("__tool_calls__"))
+
+            # 记录有效的文本内容 (优化：如果这轮有工具调用，内容通常是状态描述，不加入最终回复以防啰嗦)
+            if content.strip():
+                if not has_tool_calls:
+                    if content not in all_responses:
+                        all_responses.append(content)
+                else:
+                    # 有工具调用时，内容仅打印在控制台作为状态追踪
+                    clean_content = re.sub(r"<thought>.*?</thought>", "", content, flags=re.DOTALL).strip()
+                    if clean_content:
+                        print(f"  💬 [Status] {clean_content}")
+
+            if has_tool_calls:
                 tool_calls = result["tool_calls"]
                 
                 # 循环检测与自我反思 (Self-Reflection)
