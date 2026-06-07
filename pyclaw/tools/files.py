@@ -21,7 +21,8 @@ class ReadFileTool(BaseTool):
         path = kwargs.get("path", "")
 
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            safe_path = self.validate_path(path)
+            with open(safe_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
 
             return ToolResult(
@@ -29,6 +30,8 @@ class ReadFileTool(BaseTool):
                 content=f"File: {path}\n\n{content[:8000]}",
             )
 
+        except PermissionError as e:
+            return ToolResult(success=False, content=str(e))
         except FileNotFoundError:
             return ToolResult(success=False, content=f"File not found: {path}")
         except Exception as e:
@@ -53,16 +56,18 @@ class WriteFileTool(BaseTool):
 
         try:
             import os
-
-            dirname = os.path.dirname(path)
+            safe_path = self.validate_path(path)
+            dirname = os.path.dirname(safe_path)
             if dirname and not os.path.exists(dirname):
                 os.makedirs(dirname)
 
-            with open(path, "w", encoding="utf-8") as f:
+            with open(safe_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
             return ToolResult(success=True, content=f"File written: {path}")
 
+        except PermissionError as e:
+            return ToolResult(success=False, content=str(e))
         except Exception as e:
             return ToolResult(success=False, content=f"Error writing file: {str(e)}")
 

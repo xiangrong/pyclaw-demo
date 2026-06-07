@@ -21,27 +21,38 @@ class Session(BaseModel):
     messages: list[Message] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def history_summary(self) -> Optional[str]:
+        return self.metadata.get("history_summary")
+
     def add_message(self, message: Message) -> None:
         """添加消息到内存中的会话历史"""
         self.messages.append(message)
 
-    def get_history(self, limit: int = 50) -> list[dict[str, Any]]:
-        """获取LLM格式的历史消息，确保系统提示词不会被截断"""
-        if len(self.messages) <= limit:
-            return [msg.to_llm_format() for msg in self.messages]
+    def get_history(self, limit: int = 10) -> list[dict[str, Any]]:
+        """获取LLM格式的历史消息，采用混合压缩策略：系统消息 + 历史摘要 + 最近消息"""
+        # PRD v0.7.0: 
+        # 1. 最近 10 轮完整保留
+        # 2. 11-30 轮用摘要替代 (存储在 metadata.history_summary)
+        # 3. 30 轮之前丢弃
         
-        # 提取系统消息（通常在最前面）
         system_msgs = [msg for msg in self.messages if msg.role == MessageRole.SYSTEM]
         
-        # 提取最近的 limit 个消息
+        # 提取最近的 limit (默认10) 条消息
         recent_msgs = self.messages[-limit:]
+        recent_ids = {m.id for m in recent_msgs}
         
-        # 确保 recent_msgs 中不包含已经提取的 system_msgs
-        recent_msgs = [m for m in recent_msgs if m.id not in [sm.id for sm in system_msgs]]
+        # 排除已经提取的系统消息
+        recent_msgs = [m for m in recent_msgs if m.id not in {sm.id for sm in system_msgs}]
         
-        # 合并返回
-        final_msgs = system_msgs + recent_msgs
-        return [msg.to_llm_format() for msg in final_msgs]
+        summary_msg = []
+        if self.history_summary:
+            summary_msg = [{
+                "role": "system", 
+                "content": f"PREVIOUS CONVERSATION SUMMARY: {self.history_summary}"
+            }]
+            
+        return [msg.to_llm_format() for msg in system_msgs] + summary_msg + [msg.to_llm_format() for msg in recent_msgs]
 
     def clear(self) -> None:
         """清空会话历史（保留系统提示词）"""

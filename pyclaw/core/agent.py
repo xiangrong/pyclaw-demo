@@ -5,7 +5,7 @@ import json
 import os
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
 from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.core.session import Session, SessionManager
@@ -79,20 +79,36 @@ class Agent:
             
             if query:
                 try:
-                    results = await self.memory.search(query, limit=5)
+                    # 增加召回数量以便后续过滤和排序
+                    results = await self.memory.search(query, limit=10)
                     if results:
                         mem_entries = []
                         exp_entries = []
+                        seen_texts = set()
+                        
+                        # 1. 过滤掉分数太低（距离太远）的结果
+                        # LanceDB 默认是 L2 距离，越小越近
+                        results = [r for r in results if r["score"] < 0.8] # 调严阈值
+                        
+                        # 2. 按时间排序（近因层）
+                        results.sort(key=lambda x: x["timestamp"], reverse=True)
+                        
                         for r in results:
-                            # 过滤掉分数太低（距离太远）的结果
-                            if r["score"] < 1.0: # LanceDB 默认是 L2 距离，越小越近
-                                text = r["text"]
-                                metadata = r.get("metadata", {})
-                                
-                                if metadata.get("type") == "experience":
-                                    exp_entries.append(f"--- Experience ({r['timestamp']}) ---\n{text}")
-                                else:
-                                    mem_entries.append(f"--- Interaction ({r['timestamp']}) ---\n{text}")
+                            # 3. 去重
+                            text = r["text"].strip()
+                            if text in seen_texts:
+                                continue
+                            seen_texts.add(text)
+                            
+                            metadata = r.get("metadata", {})
+                            if metadata.get("type") == "experience":
+                                exp_entries.append(f"--- Experience ({r['timestamp']}) ---\n{text}")
+                            else:
+                                mem_entries.append(f"--- Interaction ({r['timestamp']}) ---\n{text}")
+                            
+                            # 4. 合并去重后总数控制在 5 条以内
+                            if len(mem_entries) + len(exp_entries) >= 5:
+                                break
                         
                         if mem_entries:
                             semantic_memory_content = "\n".join(mem_entries)
@@ -327,6 +343,10 @@ class Agent:
         # 执行 Agent 循环
         response_content, pending_files = await self._agent_loop(session)
 
+        # 检查是否需要压缩历史消息 (PRD v0.7.0)
+        if len(session.messages) > 30:
+            asyncio.create_task(self._summarize_and_compress_history(session))
+
         # 创建并添加回复消息
         response = Message(
             id=f"response-{message.id}",
@@ -370,8 +390,9 @@ class Agent:
 
     async def _agent_loop(self, session: Session) -> tuple[str, list[dict[str, Any]]]:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
-        max_iterations = 25
+        max_iterations = 5 # PRD v0.7.0: 从 25 降至 5
         last_tool_calls = []  # 循环检测
+        consecutive_failures = 0 # 追踪连续工具失败次数
         pending_files = [] # 存储待发送的文件信息
         all_responses = [] # 存储所有周期的文本回复
 
@@ -480,6 +501,7 @@ class Agent:
                     return "\n\n".join(all_responses + [error_msg]), []
 
                 # 3. 将结果作为 Observation 添加到会话
+                any_failure = False
                 for tr in tool_results:
                     # 检查是否包含待发送文件
                     if tr.get("metadata", {}).get("is_file_transfer"):
@@ -503,9 +525,24 @@ class Agent:
                                 )
                                 await db.commit()
 
+                    if not tr["success"]:
+                        any_failure = True
+
                     truncated_content = self._truncate_content(tr["content"])
-                    observation_content = f"OBSERVATION from {tr['name']}:\n{truncated_content}"
                     
+                    # 如果工具失败，添加额外的引导提示 (Self-Correction Loop)
+                    if not tr["success"]:
+                        observation_content = (
+                            f"<error_context>\n"
+                            f"OBSERVATION from {tr['name']} (FAILED):\n{truncated_content}\n\n"
+                            f"NOTICE: The tool call failed. Please analyze the error message above, "
+                            f"explain what went wrong to the user, and try a different approach or "
+                            f"fix the parameters in the next turn.\n"
+                            f"</error_context>"
+                        )
+                    else:
+                        observation_content = f"OBSERVATION from {tr['name']}:\n{truncated_content}"
+
                     tool_msg = Message(
                         id=f"tool-{tr['tool_call_id']}-{session.session_id}",
                         channel=session.channel,
@@ -520,6 +557,17 @@ class Agent:
                         },
                     )
                     await self.sessions.save_message(session, tool_msg)
+
+                # 更新连续失败计数
+                if any_failure:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        print(f"  ❌ 连续工具调用失败次数达到上限 ({consecutive_failures})，停止迭代。")
+                        all_responses.append("⚠️  由于连续多次工具调用失败，我已停止当前尝试。请检查指令或环境。")
+                        break
+                else:
+                    consecutive_failures = 0 # 重置计数
+
                 continue
 
             # 没有工具调用，返回最终汇总结果
@@ -536,6 +584,73 @@ class Agent:
             return final_content, pending_files
 
         return "\n\n".join(all_responses + [self._summarize_final(session)]), pending_files
+
+    async def _summarize_and_compress_history(self, session: Session) -> None:
+        """对过长的历史消息进行摘要并压缩"""
+        try:
+            print(f"📝 [History] Summarizing session {session.session_id}...")
+            
+            # 1. 提取需要摘要的消息 (除了系统消息和最近 10 条之外的所有消息)
+            limit = 10
+            system_msgs = [msg for msg in session.messages if msg.role == MessageRole.SYSTEM]
+            recent_msgs = session.messages[-limit:]
+            recent_ids = {m.id for m in recent_msgs}
+            
+            msgs_to_summarize = [
+                m for m in session.messages 
+                if m.role != MessageRole.SYSTEM and m.id not in recent_ids
+            ]
+            
+            if not msgs_to_summarize:
+                return
+
+            # 2. 调用 LLM 生成摘要
+            summary_prompt = (
+                "Please provide a concise summary of the following conversation history. "
+                "Focus on the main objectives discussed and the outcomes achieved. "
+                "Keep it under 300 words.\n\n"
+                "CONVERSATION TO SUMMARIZE:\n"
+            )
+            for m in msgs_to_summarize:
+                summary_prompt += f"{m.role.upper()}: {m.content[:500]}\n"
+            
+            summary_result = await self.model.chat(
+                messages=[{"role": "user", "content": summary_prompt}],
+                tools=None
+            )
+            
+            if summary_result:
+                new_summary = str(summary_result)
+                
+                # 3. 更新会话 Metadata
+                # 如果已有摘要，可以合并
+                old_summary = session.metadata.get("history_summary", "")
+                if old_summary:
+                    # 再次摘要合并后的内容
+                    combined_prompt = f"Combine the old summary and the new summary into a single cohesive summary:\nOld: {old_summary}\nNew: {new_summary}"
+                    summary_result = await self.model.chat(
+                        messages=[{"role": "user", "content": combined_prompt}],
+                        tools=None
+                    )
+                    if summary_result:
+                        new_summary = str(summary_result)
+
+                session.metadata["history_summary"] = new_summary
+                
+                # 4. 物理删除数据库中过旧的消息 (PRD: 30 轮之前丢弃)
+                # 在本实现中，我们通过 get_history 逻辑来过滤，但为了性能可以清理数据库
+                # 暂时只更新 metadata
+                async with self.sessions.db_connect() as db:
+                    await db.execute(
+                        "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+                        (json.dumps(session.metadata), session.session_id)
+                    )
+                    await db.commit()
+                
+                print(f"✅ [History] Session {session.session_id} compressed.")
+
+        except Exception as e:
+            print(f"⚠️ [History] Failed to summarize history: {e}")
 
     async def _extract_and_save_experience(self, session: Session, final_response: str) -> None:
         """提取本次任务的执行经验并保存到语义记忆"""

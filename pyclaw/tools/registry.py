@@ -14,14 +14,21 @@ from .base import BaseTool, ToolResult
 class ToolRegistry:
     """工具注册和执行中心"""
 
-    def __init__(self, skills_dirs: Optional[list[str | Path]] = None) -> None:
+    def __init__(
+        self, 
+        skills_dirs: Optional[list[str | Path]] = None,
+        work_dir: Optional[str] = None
+    ) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._static_tools: set[str] = set()
         self.skills_dirs = [Path(d) for d in skills_dirs] if skills_dirs else []
         self._file_mtimes: dict[str, float] = {}
+        self.work_dir = work_dir
 
     def register(self, tool: BaseTool, is_static: bool = True) -> None:
         """注册一个工具"""
+        if self.work_dir:
+            tool.set_work_dir(self.work_dir)
         self._tools[tool.name] = tool
         if is_static:
             self._static_tools.add(tool.name)
@@ -64,6 +71,8 @@ class ToolRegistry:
                                 if obj.__module__ != module_name:
                                     continue
                                 tool_instance = obj()
+                                if self.work_dir:
+                                    tool_instance.set_work_dir(self.work_dir)
                                 self._tools[tool_instance.name] = tool_instance
                                 self._static_tools.discard(tool_instance.name)
                                 print(f"📦 [ToolRegistry] 加载技能成功: {tool_instance.name}")
@@ -134,6 +143,7 @@ class ToolRegistry:
                     "tool_call_id": call_id,
                     "name": tool_name,
                     "content": result.content,
+                    "success": result.success,
                     "metadata": result.metadata,
                 }
             )

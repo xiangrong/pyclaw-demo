@@ -20,30 +20,91 @@ class TerminalTool(BaseTool):
     description = "Execute shell commands on the system"
     args_schema = TerminalArgs
 
+    def _classify_command(self, command: str) -> int:
+        """分类指令风险等级：1(安全), 2(需确认), 3(高风险)"""
+        import re
+        # 级别 3：危险操作
+        risk_patterns = [
+            r"rm\s+-rf", r"rmdir", r">\s*/dev/", r"mkfs", r"dd\s+", 
+            r"shutdown", r"reboot", r":\(\)\{ :|:& \};:", r"fdisk", r"parted"
+        ]
+        if any(re.search(p, command) for p in risk_patterns):
+            return 3
+            
+        # 级别 2：有副作用的操作
+        confirm_patterns = [
+            r"rm\s+", r"mkdir", r"touch", r"cp\s+", r"mv\s+", 
+            r"pip\s+install", r"npm\s+install", r"apt-get", r"yum", r"brew",
+            r"git\s+commit", r"git\s+push", r"kill\s+", r"pkill"
+        ]
+        if any(re.search(p, command) for p in confirm_patterns):
+            return 2
+            
+        # 级别 1：只读或安全操作
+        return 1
+
     async def execute(self, **kwargs: str) -> ToolResult:
         command = kwargs.get("command", "")
         timeout = int(kwargs.get("timeout", "60"))
 
-        # 1. 简单的高风险指令拦截 (HITL 强制执行)
-        risk_keywords = ["rm ", "rmdir ", "> /dev/", "mkfs", "dd ", "shutdown", "reboot", ":(){ :|:& };:"]
-        is_risky = any(k in command for k in risk_keywords)
+        # 1. 增强型高风险指令拦截 (Command Firewall)
+        # 拒绝任何包含 ~ 或绝对路径（且不在工作目录内）的指令
+        # 逻辑：查找指令中所有看起来像路径的部分
+        import os
+        import re
         
-        # 允许用户在指令中包含批准标记，或者由 Agent 先询问
-        if is_risky and not kwargs.get("approved"):
+        # 匹配看起来像路径的字符串 (以 / 或 ~ 开头，或者包含 /)
+        path_patterns = re.findall(r"(?:^|\s)([/~][\w\.\-/]*)", command)
+        for p in path_patterns:
+            try:
+                # 尝试验证每一个潜在路径
+                self.validate_path(p.strip())
+            except PermissionError as e:
+                return ToolResult(
+                    success=False,
+                    content=f"⚠️ 拦截到非法路径访问: `{p.strip()}`。\n指令: `{command}`\n原因: {str(e)}"
+                )
+
+        # 拒绝尝试跳出工作目录的操作 (如 cd ..)
+        if ".." in command:
+            return ToolResult(
+                success=False,
+                content=f"⚠️ 拦截到尝试跳出工作目录的操作: `{command}`。请不要使用 `..`。"
+            )
+
+        # 2. 风险等级分类处理
+        level = self._classify_command(command)
+        approved = kwargs.get("approved", False)
+        
+        if level == 3 and not approved:
             return ToolResult(
                 success=False,
                 content=(
-                    f"⚠️ 检测到高风险指令: `{command}`\n"
-                    "为了系统安全，请在对话中明确表示『允许执行该指令』后再试，"
-                    "或者在工具调用中添加 `approved=True` 参数（仅限 Agent 确认用户已授权时使用）。"
+                    f"🛑 拦截到高风险指令: `{command}`\n"
+                    "该指令具有破坏性，默认拒绝执行。如果你确定要执行，请确保已经过用户明确授权，"
+                    "并在工具调用中显式设置 `approved=True`。"
+                )
+            )
+        
+        if level == 2 and not approved:
+            return ToolResult(
+                success=False,
+                content=(
+                    f"⚠️ 检测到有副作用的指令: `{command}`\n"
+                    "为了安全起见，请在对话中先询问用户是否允许执行该操作，"
+                    "并在用户同意后，在工具调用中添加 `approved=True` 参数。"
                 )
             )
 
         try:
+            import os
+            cwd = self.work_dir if self.work_dir and os.path.exists(self.work_dir) else None
+            
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(

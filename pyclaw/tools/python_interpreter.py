@@ -33,6 +33,20 @@ class PythonInterpreterTool(BaseTool):
     async def execute(self, code: str, session_id: Optional[str] = None) -> ToolResult:
         print(f"  🐍 [Python] Executing code snippet (Session: {session_id or 'global'})...")
         
+        # 简单代码沙箱化：拦截敏感操作 (仅限 Workspace Lockdown 模式)
+        if self.work_dir:
+            restricted_keywords = [
+                "open(", "os.listdir", "os.walk", "os.remove", "os.system", 
+                "subprocess", "shutil", "pathlib.Path.unlink", "Path.mkdir"
+            ]
+            # 这里可以用抽象语法树 (AST) 做更精确的检查，现在先用简单字符串匹配
+            for kw in restricted_keywords:
+                if kw in code:
+                    return ToolResult(
+                        success=False,
+                        content=f"⚠️ Python 解释器安全拦截: 检测到受限的文件系统或系统操作 `{kw}`。在沙箱模式下，请使用 FileTool 进行文件操作。"
+                    )
+
         # 使用 global 作为默认 session
         sid = session_id or "global"
         

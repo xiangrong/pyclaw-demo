@@ -83,7 +83,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             if abs_fallback not in [os.path.abspath(d) for d in skills_dirs]:
                 skills_dirs.append(abs_fallback)
                 
-        tool_registry = ToolRegistry(skills_dirs=skills_dirs)
+        tool_registry = ToolRegistry(skills_dirs=skills_dirs, work_dir=cfg.work_dir)
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
@@ -123,7 +123,10 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         semantic_memory = None
         if SemanticMemory.is_available():
             semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
+            from pyclaw.tools.memory_search import MemorySearchTool
+            from pyclaw.tools.memory_ops import SaveMemoryTool
             tool_registry.register(MemorySearchTool(semantic_memory))
+            tool_registry.register(SaveMemoryTool(semantic_memory))
         else:
             print("  ℹ️  LanceDB not found, Memory Search tool is disabled.")
 
@@ -225,7 +228,7 @@ def cron_exec(
             if abs_fallback not in [os.path.abspath(d) for d in skills_dirs]:
                 skills_dirs.append(abs_fallback)
                 
-        tool_registry = ToolRegistry(skills_dirs=skills_dirs)
+        tool_registry = ToolRegistry(skills_dirs=skills_dirs, work_dir=cfg.work_dir)
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
@@ -258,7 +261,10 @@ def cron_exec(
         semantic_memory = None
         if SemanticMemory.is_available():
             semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
+            from pyclaw.tools.memory_search import MemorySearchTool
+            from pyclaw.tools.memory_ops import SaveMemoryTool
             tool_registry.register(MemorySearchTool(semantic_memory))
+            tool_registry.register(SaveMemoryTool(semantic_memory))
         else:
             print("  ℹ️  LanceDB not found, Memory Search tool is disabled.")
 

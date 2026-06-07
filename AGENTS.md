@@ -9,10 +9,12 @@ PyClaw is designed to be a high-performance, lightweight AI Agent framework. Foc
 1. **Async Everywhere**: Use `asyncio` for all I/O bound tasks.
 2. **Type Hints**: Always include type hints for new functions and methods.
 3. **Decoupling**: Keep channels, tools, and core logic decoupled.
-4. **Error Handling**: Provide informative error messages that help the user or Agent diagnose issues.
-5. **Tool Execution**: When using the `TerminalTool`, ensure commands are non-interactive and safe.
+4. **Error Handling & Self-Healing**: Implement and support self-correction loops. Agents should retry failed tool calls up to 3 times with corrected parameters.
+5. **Security & Sandboxing**: All file and terminal tools must respect the `work_dir` boundary. Paths must be validated using `validate_path`. High-risk commands in `TerminalTool` require explicit `approved=True` flag.
+6. **Context Management**: Use the hybrid history compression strategy (System + Summary + Recent 10) to optimize token usage.
 
 ## Active Tasks
 - Improving the Core Intelligence Layer (v0.7.0).
 - Implementing ReAct and CoT reasoning loops.
-- Developing multi-agent collaboration tools.
+- Enhancing Sandboxing (Docker integration for TerminalTool).
+- Implementing background history summarization and memory cleanup.
