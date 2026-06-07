@@ -140,16 +140,104 @@ class TelegramChannel(BaseChannel):
             return
 
         chat_id = int(message.channel_user_id)
-        text = message.content
+        formatted_text = self._format_markdown(message.content)
 
-        # 长消息分块发送
-        chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+        # 长消息分块发送，尽量在换行处切割
+        chunks = self._split_message(formatted_text, 4000)
         for chunk in chunks:
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode=None,
-            )
+            try:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                print(f"⚠️ [Telegram] 发送 HTML 消息失败，尝试回退到纯文本: {e}")
+                # 回退方案：如果 HTML 解析失败，发送纯文本
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=message.content[:4000],
+                    parse_mode=None,
+                )
+
+    def _format_markdown(self, text: str) -> str:
+        """将 Markdown 转换为 Telegram 兼容的 HTML 格式"""
+        import re
+
+        # 1. 基础转义 (Telegram HTML 要求所有内容都要转义，包括 pre 内部)
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # 2. 格式化思维链 <thought> 为 <blockquote>
+        text = re.sub(r"&lt;thought&gt;(.*?)&lt;/thought&gt;", r"<i>🧠 思维过程:</i>\n<blockquote>\1</blockquote>", text, flags=re.DOTALL)
+
+        # 3. 处理代码块 (防止内部内容被进一步处理)
+        code_blocks = []
+        def save_code_block(match):
+            code_blocks.append(match.group(1))
+            return f"___CODE_BLOCK_{len(code_blocks)-1}___"
+        
+        # 匹配 ```code```
+        text = re.sub(r"```(?:\w+)?\n?(.*?)\n?```", save_code_block, text, flags=re.DOTALL)
+
+        # 4. 处理行内代码
+        inline_codes = []
+        def save_inline_code(match):
+            inline_codes.append(match.group(1))
+            return f"___INLINE_CODE_{len(inline_codes)-1}___"
+        
+        text = re.sub(r"`(.*?)`", save_inline_code, text)
+
+        # 5. 其他 Markdown 语法转换
+        # 加粗
+        text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"__(.*?)__", r"<b>\1</b>", text)
+        # 斜体
+        text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
+        text = re.sub(r"_(.*?)_", r"<i>\1</i>", text)
+        # 链接
+        text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2">\1</a>', text)
+
+        # 6. 还原代码块和行内代码
+        for i, code in enumerate(inline_codes):
+            text = text.replace(f"___INLINE_CODE_{i}___", f"<code>{code}</code>")
+        for i, code in enumerate(code_blocks):
+            text = text.replace(f"___CODE_BLOCK_{i}___", f"<pre>{code}</pre>")
+
+        return text
+
+    def _split_message(self, text: str, max_len: int = 4000) -> list[str]:
+        """将消息安全地切分为块，尽量不破坏 HTML 标签"""
+        if len(text) <= max_len:
+            return [text]
+
+        chunks = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            
+            # 尝试在段落处切割
+            split_idx = text.rfind("\n\n", 0, max_len)
+            if split_idx == -1:
+                # 尝试在行处切割
+                split_idx = text.rfind("\n", 0, max_len)
+            
+            if split_idx == -1 or split_idx < max_len // 2:
+                # 如果找不到合适的切割点，强制切割
+                split_idx = max_len
+            
+            # 检查是否切在了 HTML 标签中间 (简单检查)
+            # 如果最后包含未闭合的 < 符号
+            open_tag = text.rfind("<", 0, split_idx)
+            close_tag = text.rfind(">", 0, split_idx)
+            if open_tag > close_tag:
+                split_idx = open_tag
+
+            chunks.append(text[:split_idx])
+            text = text[split_idx:].lstrip()
+
+        return chunks
 
     async def send_file(
         self,
@@ -213,24 +301,44 @@ class TelegramChannel(BaseChannel):
                         )
                         last_update_time = current_time
 
-            # 流式结束，确保最后更新一次
+            # 流式结束，确保最后更新一次并格式化为 HTML
             if full_content.strip():
-                await self._app.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=full_content,
-                    parse_mode=None,
-                )
+                formatted_final = self._format_markdown(full_content)
+                try:
+                    await self._app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=formatted_final,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    # 如果 HTML 格式化失败，降级回纯文本
+                    await self._app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=full_content,
+                        parse_mode=None,
+                    )
 
         except Exception as e:
             print(f"⚠️ Stream error: {e}")
-            # 出错时发送完整内容
+            # 出错时尝试发送完整内容
             if full_content.strip():
-                await self._app.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=full_content,
-                    parse_mode=None,
-                )
+                formatted_error = self._format_markdown(full_content)
+                try:
+                    await self._app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=formatted_error,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    await self._app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=full_content,
+                        parse_mode=None,
+                    )
 
         return full_content
