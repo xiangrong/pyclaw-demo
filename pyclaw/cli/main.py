@@ -14,6 +14,7 @@ from pyclaw.channels.telegram import TelegramChannel
 from pyclaw.core.agent import Agent
 from pyclaw.core.session import SessionManager
 from pyclaw.core.memory import SemanticMemory
+from pyclaw.core.path_discovery import discover_tool_paths
 from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
 from pyclaw.models.openai import OpenAIProvider
@@ -84,16 +85,20 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
                 skills_dirs.append(abs_fallback)
         
         # 汇总允许访问的路径
-        allowed_paths = cfg.allowed_paths or []
+        allowed_paths = set(cfg.allowed_paths or [])
+        # 自动发现常用工具目录
+        discovered = discover_tool_paths()
+        allowed_paths.update(discovered)
+        
         if cfg.config_dir:
-            allowed_paths.append(cfg.config_dir)
+            allowed_paths.add(cfg.config_dir)
         # 默认允许 ~/.config/pyclaw 以兼容设计规范
-        allowed_paths.append("~/.config/pyclaw")
+        allowed_paths.add("~/.config/pyclaw")
                 
         tool_registry = ToolRegistry(
             skills_dirs=skills_dirs, 
             work_dir=cfg.work_dir,
-            allowed_paths=allowed_paths
+            allowed_paths=list(allowed_paths)
         )
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
@@ -242,16 +247,20 @@ def cron_exec(
                 skills_dirs.append(abs_fallback)
         
         # 汇总允许访问的路径
-        allowed_paths = cfg.allowed_paths or []
+        allowed_paths = set(cfg.allowed_paths or [])
+        # 自动发现常用工具目录
+        discovered = discover_tool_paths()
+        allowed_paths.update(discovered)
+        
         if cfg.config_dir:
-            allowed_paths.append(cfg.config_dir)
+            allowed_paths.add(cfg.config_dir)
         # 默认允许 ~/.config/pyclaw 以兼容设计规范
-        allowed_paths.append("~/.config/pyclaw")
+        allowed_paths.add("~/.config/pyclaw")
                 
         tool_registry = ToolRegistry(
             skills_dirs=skills_dirs, 
             work_dir=cfg.work_dir,
-            allowed_paths=allowed_paths
+            allowed_paths=list(allowed_paths)
         )
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())

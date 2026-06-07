@@ -25,7 +25,7 @@ class TerminalTool(BaseTool):
         import re
         # 级别 3：危险操作
         risk_patterns = [
-            r"rm\s+-rf", r"rmdir", r">\s*/dev/", r"mkfs", r"dd\s+", 
+            r"rm\s+-rf", r"rmdir", r">\s*/dev/(?!null)", r"mkfs", r"dd\s+", 
             r"shutdown", r"reboot", r":\(\)\{ :|:& \};:", r"fdisk", r"parted"
         ]
         if any(re.search(p, command) for p in risk_patterns):
