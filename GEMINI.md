@@ -24,7 +24,11 @@ PyClaw is a lightweight Python AI Agent framework designed to connect Large Lang
 **Configuration:**
 - Run `python -m pyclaw init` to generate a configuration template at `~/.config/pyclaw/config.yaml`.
 - Edit the generated YAML file to add your API keys, Bot tokens (Feishu, Telegram, or WeChat), and allowed users.
-- For WeChat, a QR code will be displayed on the first run. After scanning and confirming, the console will output a `bot_token` and `bot_id`; save these to your config to avoid re-scanning.
+- **Key Config Parameters:**
+  - `max_iterations`: Maximum number of tool execution loops (default: 30).
+  - `max_consecutive_failures`: Maximum number of consecutive tool failures before stopping the agent (default: 8).
+- For WeChat, a QR code will be displayed on the first run.
+ After scanning and confirming, the console will output a `bot_token` and `bot_id`; save these to your config to avoid re-scanning.
 - Alternatively, you can copy the example from `config/config.example.yaml`.
 
 **Starting the Agent:**
@@ -53,3 +57,4 @@ python -m pyclaw start
 - **Type Safety:** Strict static type checking is enforced using `mypy` (`strict = true`). All new functions and methods should be properly typed.
 - **Formatting:** The codebase uses `ruff` for linting and formatting (line-length=100).
 - **OOP and Inheritance:** Strong adherence to Object-Oriented design patterns. Components are highly decoupled through base classes (`BaseTool`, `BaseChannel`, `BaseModelProvider`).
+- **Parallelism & Forking:** When using local embedding models (via `sentence-transformers`), we must set `os.environ["TOKENIZERS_PARALLELISM"] = "false"` before forking or using `asyncio.subprocess` to avoid deadlocks and fork warnings. This is already handled in the CLI entry point.

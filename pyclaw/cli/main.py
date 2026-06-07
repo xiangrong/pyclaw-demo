@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+
+# Set TOKENIZERS_PARALLELISM=false to avoid fork warnings and potential deadlocks
+# when using sentence-transformers (tokenizers) before asyncio.subprocess (fork).
+# This MUST be done before importing any huggingface-related libraries.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import signal
 import sys
 from importlib import metadata
@@ -154,6 +160,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             config_dir=cfg.config_dir,
             memory=semantic_memory,
             max_iterations=cfg.max_iterations,
+            max_consecutive_failures=cfg.max_consecutive_failures,
         )
 
         # 注册需要 Agent 实例的工具
@@ -309,6 +316,7 @@ def cron_exec(
             config_dir=cfg.config_dir,
             memory=semantic_memory,
             max_iterations=cfg.max_iterations,
+            max_consecutive_failures=cfg.max_consecutive_failures,
         )
 
         # 注册需要 Agent 实例的工具
@@ -419,6 +427,9 @@ allowed_paths:
 
 # 最大思考深度 (Agent 循环执行工具的最大次数，默认 30)
 max_iterations: 30
+
+# 连续工具调用失败的最大次数 (触发自我保护停止迭代，默认 8)
+max_consecutive_failures: 8
 
 # 安全沙箱配置 (可选)
 sandbox:

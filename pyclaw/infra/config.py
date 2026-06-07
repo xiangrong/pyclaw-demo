@@ -59,6 +59,7 @@ class Config(BaseModel):
     config_dir: Optional[str] = None
     allowed_paths: list[str] = Field(default_factory=list)
     max_iterations: int = 30
+    max_consecutive_failures: int = 8
 
 
 def load_config(config_path: Optional[str] = None) -> Config:

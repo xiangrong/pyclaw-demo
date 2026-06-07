@@ -29,6 +29,7 @@ class Agent:
         config_dir: Optional[str] = None,
         memory: Optional[SemanticMemory] = None,
         max_iterations: int = 30,
+        max_consecutive_failures: int = 8,
     ) -> None:
         self.model = model_provider
         self.tools = tool_registry
@@ -47,6 +48,7 @@ class Agent:
             os.makedirs(self.config_dir, exist_ok=True)
             
         self.max_iterations = max_iterations
+        self.max_consecutive_failures = max_consecutive_failures
         self.system_prompt_manager = SystemPromptManager()
         
         # 仅在 LanceDB 可用时初始化语义记忆
@@ -520,7 +522,7 @@ class Agent:
                 # 更新连续失败计数
                 if any_failure:
                     consecutive_failures += 1
-                    if consecutive_failures >= 3:
+                    if consecutive_failures >= self.max_consecutive_failures:
                         print(f"  ❌ 连续工具调用失败次数达到上限 ({consecutive_failures})，停止迭代。")
                         all_responses.append("⚠️  由于连续多次工具调用失败，我已停止当前尝试。请检查指令或环境。")
                         break
