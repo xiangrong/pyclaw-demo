@@ -55,6 +55,7 @@ class Config(BaseModel):
     model: ModelConfig
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
+    max_iterations: int = 30
 
 
 def load_config(config_path: Optional[str] = None) -> Config:

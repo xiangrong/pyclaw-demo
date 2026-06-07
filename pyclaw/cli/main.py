@@ -136,6 +136,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             session_manager=session_manager,
             work_dir=cfg.work_dir,
             memory=semantic_memory,
+            max_iterations=cfg.max_iterations,
         )
 
         # 注册需要 Agent 实例的工具
@@ -274,6 +275,7 @@ def cron_exec(
             session_manager=session_manager,
             work_dir=cfg.work_dir,
             memory=semantic_memory,
+            max_iterations=cfg.max_iterations,
         )
 
         # 注册需要 Agent 实例的工具

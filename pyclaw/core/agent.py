@@ -25,11 +25,13 @@ class Agent:
         system_prompt: Optional[str] = None,
         work_dir: Optional[str] = None,
         memory: Optional[SemanticMemory] = None,
+        max_iterations: int = 30,
     ) -> None:
         self.model = model_provider
         self.tools = tool_registry
         self.sessions = session_manager
         self.work_dir = work_dir or os.getcwd()
+        self.max_iterations = max_iterations
         
         # 仅在 LanceDB 可用时初始化语义记忆
         if memory:
@@ -390,7 +392,7 @@ class Agent:
 
     async def _agent_loop(self, session: Session) -> tuple[str, list[dict[str, Any]]]:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
-        max_iterations = 5 # PRD v0.7.0: 从 25 降至 5
+        max_iterations = self.max_iterations
         last_tool_calls = []  # 循环检测
         consecutive_failures = 0 # 追踪连续工具失败次数
         pending_files = [] # 存储待发送的文件信息
