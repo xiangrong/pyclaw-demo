@@ -21,3 +21,21 @@ model:
 
 # 工作目录 (Agent执行命令的默认目录)
 work_dir: "~/pyclaw"
+
+# 配置目录 (存放 SOUL.md, MEMORY.md, USER.md)
+# config_dir: "~/.config/pyclaw"
+
+# 安全路径白名单 (允许 Agent 访问的外部路径列表)
+allowed_paths:
+  - "~/.config/pyclaw"
+  - "~/Downloads"
+
+# 最大思考深度 (Agent 循环执行工具的最大次数，默认 30)
+max_iterations: 30
+
+# 安全沙箱配置 (可选)
+sandbox:
+  enabled: false
+  # 允许沙箱访问的宿主机路径映射
+  volumes:
+    "/tmp": "/tmp"
