@@ -12,6 +12,8 @@ from pyclaw.core.session import Session, SessionManager
 from pyclaw.core.memory import SemanticMemory
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
+from pyclaw.core.system_prompt.manager import SystemPromptManager
+from pyclaw.core.system_prompt.models import LayerContext
 
 
 class Agent:
@@ -24,6 +26,7 @@ class Agent:
         session_manager: SessionManager,
         system_prompt: Optional[str] = None,
         work_dir: Optional[str] = None,
+        config_dir: Optional[str] = None,
         memory: Optional[SemanticMemory] = None,
         max_iterations: int = 30,
     ) -> None:
@@ -31,7 +34,20 @@ class Agent:
         self.tools = tool_registry
         self.sessions = session_manager
         self.work_dir = work_dir or os.getcwd()
+        
+        # 默认配置目录
+        default_config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
+        if config_dir:
+            self.config_dir = config_dir
+        elif os.path.exists(default_config_dir):
+            self.config_dir = default_config_dir
+        else:
+            # 沙箱环境 fallback: 使用工作目录下的 config 文件夹
+            self.config_dir = os.path.join(self.work_dir, "config")
+            os.makedirs(self.config_dir, exist_ok=True)
+            
         self.max_iterations = max_iterations
+        self.system_prompt_manager = SystemPromptManager()
         
         # 仅在 LanceDB 可用时初始化语义记忆
         if memory:
@@ -49,160 +65,95 @@ class Agent:
         )
         self.base_system_prompt = self.system_prompt # save base
 
-    async def _get_dynamic_system_prompt(self, session: Optional[Session] = None) -> str:
-        """动态生成增强版系统提示词 (Soul + Agents + Skills + MCP + Session State + Memory + Semantic Memory)"""
-        # 1. 加载 SOUL.md (全局人格)
-        soul_content = self._load_soul_md()
-        
-        # 2. 加载 AGENTS.md (项目规范)
-        agents_content = self._load_agents_md()
-        
-        # 3. 加载 MEMORY.md 和 USER.md (持久化知识)
-        memory_content = self._load_memory_md()
-        user_content = self._load_user_md()
-        
-        # 4. 加载技能索引
-        skills_index = self._get_skills_index()
-        
-        # 5. 加载 MCP 信息
-        mcp_str = self._get_mcp_info()
-
-        # 6. 获取语义记忆 (Semantic Memory / RAG)
+    async def _get_semantic_memories(self, session: Session) -> tuple[str, str]:
+        """获取语义记忆 (Semantic Memory / RAG)"""
         semantic_memory_content = ""
         experience_memory_content = ""
-        if session and self.memory:
-            # 优先使用当前目标进行检索，如果没有则尝试获取最后一条用户消息
-            query = session.metadata.get("current_objective")
-            if not query:
-                for msg in reversed(session.messages):
-                    if msg.role == MessageRole.USER:
-                        query = msg.content
+        
+        if not self.memory:
+            return "", ""
+
+        # 优先使用当前目标进行检索，如果没有则尝试获取最后一条用户消息
+        query = session.metadata.get("current_objective")
+        if not query:
+            for msg in reversed(session.messages):
+                if msg.role == MessageRole.USER:
+                    query = msg.content
+                    break
+        
+        if not query:
+            return "", ""
+
+        try:
+            # 增加召回数量以便后续过滤和排序
+            results = await self.memory.search(query, limit=10)
+            if results:
+                mem_entries = []
+                exp_entries = []
+                seen_texts = set()
+                
+                # 1. 过滤掉分数太低（距离太远）的结果
+                # LanceDB 默认是 L2 距离，越小越近
+                results = [r for r in results if r["score"] < 0.8] # 调严阈值
+                
+                # 2. 按时间排序（近因层）
+                results.sort(key=lambda x: x["timestamp"], reverse=True)
+                
+                for r in results:
+                    # 3. 去重
+                    text = r["text"].strip()
+                    if text in seen_texts:
+                        continue
+                    seen_texts.add(text)
+                    
+                    metadata = r.get("metadata", {})
+                    if metadata.get("type") == "experience":
+                        exp_entries.append(f"--- Experience ({r['timestamp']}) ---\n{text}")
+                    else:
+                        mem_entries.append(f"--- Interaction ({r['timestamp']}) ---\n{text}")
+                    
+                    # 4. 合并去重后总数控制在 5 条以内
+                    if len(mem_entries) + len(exp_entries) >= 5:
                         break
+                
+                if mem_entries:
+                    semantic_memory_content = "\n".join(mem_entries)
+                if exp_entries:
+                    experience_memory_content = "\n".join(exp_entries)
+        except Exception as e:
+            print(f"  ⚠️  语义记忆检索失败: {e}")
             
-            if query:
-                try:
-                    # 增加召回数量以便后续过滤和排序
-                    results = await self.memory.search(query, limit=10)
-                    if results:
-                        mem_entries = []
-                        exp_entries = []
-                        seen_texts = set()
-                        
-                        # 1. 过滤掉分数太低（距离太远）的结果
-                        # LanceDB 默认是 L2 距离，越小越近
-                        results = [r for r in results if r["score"] < 0.8] # 调严阈值
-                        
-                        # 2. 按时间排序（近因层）
-                        results.sort(key=lambda x: x["timestamp"], reverse=True)
-                        
-                        for r in results:
-                            # 3. 去重
-                            text = r["text"].strip()
-                            if text in seen_texts:
-                                continue
-                            seen_texts.add(text)
-                            
-                            metadata = r.get("metadata", {})
-                            if metadata.get("type") == "experience":
-                                exp_entries.append(f"--- Experience ({r['timestamp']}) ---\n{text}")
-                            else:
-                                mem_entries.append(f"--- Interaction ({r['timestamp']}) ---\n{text}")
-                            
-                            # 4. 合并去重后总数控制在 5 条以内
-                            if len(mem_entries) + len(exp_entries) >= 5:
-                                break
-                        
-                        if mem_entries:
-                            semantic_memory_content = "\n".join(mem_entries)
-                        if exp_entries:
-                            experience_memory_content = "\n".join(exp_entries)
-                except Exception as e:
-                    print(f"  ⚠️  语义记忆检索失败: {e}")
+        return semantic_memory_content, experience_memory_content
 
-        full_prompt = self.base_system_prompt
-        
-        if soul_content:
-            full_prompt += f"\n<soul>\n{soul_content}\n</soul>\n"
-            
-        if agents_content:
-            full_prompt += f"\n<agents_context>\n{agents_content}\n</agents_context>\n"
-            
-        if memory_content:
-            full_prompt += f"\n<long_term_memory>\n{memory_content}\n</long_term_memory>\n"
-
-        if user_content:
-            full_prompt += f"\n<user_context>\n{user_content}\n</user_context>\n"
-
-        if experience_memory_content:
-            full_prompt += f"\n<past_experiences>\n{experience_memory_content}\n</past_experiences>\n"
-
-        if semantic_memory_content:
-            full_prompt += f"\n<relevant_past_interactions>\n{semantic_memory_content}\n</relevant_past_interactions>\n"
-
-        full_prompt += f"\n<available_skills>\n{skills_index}\n</available_skills>"
-        full_prompt += mcp_str
-        
-        # 7. 注入当前会话状态 (Plan & Objective)
-        if session and session.metadata:
-            objective = session.metadata.get("current_objective")
-            plan = session.metadata.get("current_plan")
-            if objective or plan:
-                full_prompt += "\n\n<current_session_state>\n"
-                if objective:
-                    full_prompt += f"CURRENT OBJECTIVE: {objective}\n"
-                if plan:
-                    full_prompt += f"CURRENT PLAN:\n{plan}\n"
-                full_prompt += "</current_session_state>"
-
-        # 注入 ReAct 引导
-        full_prompt += (
-            "\n\n<reasoning_guidelines>\n"
-            "You operate using a ReAct (Reasoning and Acting) pattern. For every turn:\n"
-            "1. THOUGHT: Process the current state and observations.\n"
-            "2. PLAN: Update your step-by-step plan if necessary. If the task is new, CREATE a plan.\n"
-            "3. ACTION: Call the appropriate tools to execute the next step of your plan.\n"
-            "4. OBSERVATION: Carefully evaluate the tool results (Observations) in the next turn.\n"
-            "\n Output your reasoning process inside <thought> tags. Keep your plan updated.\n"
-            "\n<coding_and_debugging_policy>\n"
-            "You are a skilled software engineer. When writing code or executing commands:\n"
-            "1. PREFER the `python_interpreter` for complex logic, data processing, or script prototyping. It is stateful and maintains variables across turns in the same session.\n"
-            "2. If a tool call returns an ERROR (stderr or Exception), you MUST NOT give up immediately. Instead, enter a **Self-Correction Loop**:\n"
-                "   - Carefully analyze the TRACEBACK or error message to identify the root cause.\n"
-                "   - Explain your understanding of the bug to the user.\n"
-                "   - Propose a fix and RETRY the tool call with corrected parameters or code.\n"
-            "3. Your goal is to reach a SUCCESSFUL outcome autonomously through iteration.\n"
-            "</coding_and_debugging_policy>\n"
-            "\n<memory_policy>\n"
-            "You have access to a durable long-term memory (`MEMORY.md`) and user context (`USER.md`).\n"
-            "- Read them at the start of a session to understand your standing orders and user preferences.\n"
-            "- When you learn a new important fact about the user or complete a major project, proactively use the `write_file` tool to update `~/.config/pyclaw/MEMORY.md` or `~/.config/pyclaw/USER.md`.\n"
-            "- Keep these files concise and structured.\n"
-            "</memory_policy>\n"
-            "\n<skill_creation_policy>\n"
-            "If you identify a missing capability or successfully complete a complex reusable procedure, you are encouraged to expand your own capabilities.\n"
-            "- Use the `save_as_skill` tool to persist this knowledge. Create a SKILL.md for natural language instructions/workflows, or a .py script for executable custom tools.\n"
-            "</skill_creation_policy>\n"
-            "\n<human_in_the_loop_policy>\n"
-            "For HIGH-RISK actions, you MUST ask for user approval BEFORE execution. High-risk actions include:\n"
-            "- Deleting files or directories (`rm`, `rf`).\n"
-            "- Overwriting important system or project files.\n"
-            "- Executing complex shell scripts that modify the system state.\n"
-            "To ask for approval, state clearly what you intend to do and wait for the user to say 'Yes' or 'Go ahead'.\n"
-            "</human_in_the_loop_policy>\n"
-            "\n<file_handling_policy>\n"
-            "When a user asks you to 'send' a file, DO NOT just print its content. "
-            "Instead, find the file path and use the `send_file_to_user` tool to deliver it. "
-            "Printing large file contents as text is token-inefficient and often not what the user wants.\n"
-            "</file_handling_policy>\n"
-            "</reasoning_guidelines>"
+    async def _get_dynamic_system_prompt(self, session: Optional[Session] = None) -> str:
+        """动态生成增强版系统提示词 (采用三层架构: 静态 + 会话 + 实时)"""
+        # 1. 准备 Context
+        context = LayerContext(
+            base_system_prompt=self.base_system_prompt,
+            soul_content=self._load_soul_md(),
+            agents_content=self._load_agents_md(),
+            memory_md_content=self._load_memory_md(),
+            user_md_content=self._load_user_md(),
+            skills_index=self._get_skills_index(),
+            mcp_info=self._get_mcp_info(),
         )
-        
-        return full_prompt
+
+        if session:
+            context.session_id = session.session_id
+            context.current_objective = session.metadata.get("current_objective", "")
+            context.current_plan = session.metadata.get("current_plan", "")
+            
+            # 获取语义记忆
+            semantic_memory, experience_memory = await self._get_semantic_memories(session)
+            context.semantic_memory = semantic_memory
+            context.experience_memory = experience_memory
+
+        # 2. 调用管理器生成
+        return await self.system_prompt_manager.generate_prompt(context)
 
     def _load_soul_md(self) -> str:
         """加载全局灵魂配置"""
-        config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
-        soul_path = os.path.join(config_dir, "SOUL.md")
+        soul_path = os.path.join(self.config_dir, "SOUL.md")
         if os.path.exists(soul_path):
             try:
                 with open(soul_path, "r", encoding="utf-8") as f:
@@ -213,8 +164,7 @@ class Agent:
 
     def _load_memory_md(self) -> str:
         """加载长期记忆"""
-        config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
-        memory_path = os.path.join(config_dir, "MEMORY.md")
+        memory_path = os.path.join(self.config_dir, "MEMORY.md")
         if os.path.exists(memory_path):
             try:
                 with open(memory_path, "r", encoding="utf-8") as f:
@@ -225,8 +175,7 @@ class Agent:
 
     def _load_user_md(self) -> str:
         """加载用户信息"""
-        config_dir = os.path.join(os.path.expanduser("~"), ".config", "pyclaw")
-        user_path = os.path.join(config_dir, "USER.md")
+        user_path = os.path.join(self.config_dir, "USER.md")
         if os.path.exists(user_path):
             try:
                 with open(user_path, "r", encoding="utf-8") as f:
@@ -614,7 +563,7 @@ class Agent:
                 "CONVERSATION TO SUMMARIZE:\n"
             )
             for m in msgs_to_summarize:
-                summary_prompt += f"{m.role.upper()}: {m.content[:500]}\n"
+                summary_prompt += f"{m.role.value.upper()}: {m.content[:500]}\n"
             
             summary_result = await self.model.chat(
                 messages=[{"role": "user", "content": summary_prompt}],

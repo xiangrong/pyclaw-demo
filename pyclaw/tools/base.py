@@ -20,13 +20,18 @@ class BaseTool(ABC):
     description: str
     args_schema: type[BaseModel]
     work_dir: Optional[str] = None
+    allowed_paths: list[str] = []
 
     def set_work_dir(self, work_dir: str) -> None:
         """设置工作目录，用于沙箱路径校验"""
         self.work_dir = work_dir
 
+    def set_allowed_paths(self, allowed_paths: list[str]) -> None:
+        """设置允许访问的其他路径列表"""
+        self.allowed_paths = allowed_paths
+
     def validate_path(self, path: str) -> str:
-        """校验并转换路径，确保在工作目录内"""
+        """校验并转换路径，确保在允许的目录内"""
         import os
         
         # 扩展 ~ 用户目录
@@ -35,16 +40,28 @@ class BaseTool(ABC):
         # 转换为绝对路径
         abs_path = os.path.abspath(expanded_path)
         
-        if not self.work_dir:
+        # 收集所有允许的根目录
+        allowed_roots = []
+        if self.work_dir:
+            allowed_roots.append(os.path.abspath(self.work_dir))
+        
+        for p in self.allowed_paths:
+            allowed_roots.append(os.path.abspath(os.path.expanduser(p)))
+
+        if not allowed_roots:
             return abs_path
             
-        abs_work_dir = os.path.abspath(self.work_dir)
+        # 检查是否在任何一个允许的目录内
+        is_allowed = False
+        for root in allowed_roots:
+            if abs_path.startswith(root):
+                is_allowed = True
+                break
         
-        # 检查是否在工作目录内
-        if not abs_path.startswith(abs_work_dir):
+        if not is_allowed:
             raise PermissionError(
                 f"Access denied: Path '{path}' (resolved to '{abs_path}') "
-                f"is outside the allowed workspace '{abs_work_dir}'"
+                f"is outside the allowed workspace(s): {', '.join(allowed_roots)}"
             )
             
         return abs_path

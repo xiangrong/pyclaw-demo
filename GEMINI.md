@@ -42,7 +42,7 @@ python -m pyclaw start
 
 **Architecture & Project Structure:**
 - `pyclaw/cli/`: CLI entry point using `typer`.
-- `pyclaw/core/`: Contains the core `Agent` loop, session state, and message models. The agent iteratively calls the LLM, parses tool requests, and dispatches them.
+- `pyclaw/core/`: Contains the core `Agent` loop, session state, and message models. Includes `system_prompt/` module which manages a three-layer (static, session, realtime) cached prompt architecture.
 - `pyclaw/gateway/`: The `Gateway` class unifies multi-channel communication, managing the lifecycle of plugins and routing incoming events to the core agent.
 - `pyclaw/models/`: Wrappers for LLM provider APIs (inheriting from `BaseModelProvider`).
 - `pyclaw/channels/`: Plugins for messaging platforms (e.g., `FeishuChannel`, `TelegramChannel`). To add a new channel, subclass `BaseChannel`.

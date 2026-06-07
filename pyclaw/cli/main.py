@@ -82,8 +82,19 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             abs_fallback = os.path.abspath(fallback_skills)
             if abs_fallback not in [os.path.abspath(d) for d in skills_dirs]:
                 skills_dirs.append(abs_fallback)
+        
+        # 汇总允许访问的路径
+        allowed_paths = cfg.allowed_paths or []
+        if cfg.config_dir:
+            allowed_paths.append(cfg.config_dir)
+        # 默认允许 ~/.config/pyclaw 以兼容设计规范
+        allowed_paths.append("~/.config/pyclaw")
                 
-        tool_registry = ToolRegistry(skills_dirs=skills_dirs, work_dir=cfg.work_dir)
+        tool_registry = ToolRegistry(
+            skills_dirs=skills_dirs, 
+            work_dir=cfg.work_dir,
+            allowed_paths=allowed_paths
+        )
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
@@ -135,6 +146,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             tool_registry=tool_registry,
             session_manager=session_manager,
             work_dir=cfg.work_dir,
+            config_dir=cfg.config_dir,
             memory=semantic_memory,
             max_iterations=cfg.max_iterations,
         )
@@ -228,8 +240,19 @@ def cron_exec(
             abs_fallback = os.path.abspath(fallback_skills)
             if abs_fallback not in [os.path.abspath(d) for d in skills_dirs]:
                 skills_dirs.append(abs_fallback)
+        
+        # 汇总允许访问的路径
+        allowed_paths = cfg.allowed_paths or []
+        if cfg.config_dir:
+            allowed_paths.append(cfg.config_dir)
+        # 默认允许 ~/.config/pyclaw 以兼容设计规范
+        allowed_paths.append("~/.config/pyclaw")
                 
-        tool_registry = ToolRegistry(skills_dirs=skills_dirs, work_dir=cfg.work_dir)
+        tool_registry = ToolRegistry(
+            skills_dirs=skills_dirs, 
+            work_dir=cfg.work_dir,
+            allowed_paths=allowed_paths
+        )
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
         tool_registry.register(WriteFileTool())
@@ -274,6 +297,7 @@ def cron_exec(
             tool_registry=tool_registry,
             session_manager=session_manager,
             work_dir=cfg.work_dir,
+            config_dir=cfg.config_dir,
             memory=semantic_memory,
             max_iterations=cfg.max_iterations,
         )
@@ -313,8 +337,14 @@ def init(config: str = typer.Option(None, help="Path to create config file")) ->
     """创建配置文件模板"""
     if config is None:
         from pathlib import Path
-
-        config = str(Path.home() / ".config" / "pyclaw" / "config.yaml")
+        
+        home_config = Path.home() / ".config" / "pyclaw" / "config.yaml"
+        try:
+            home_config.parent.mkdir(parents=True, exist_ok=True)
+            config = str(home_config)
+        except (PermissionError, OSError):
+            # 沙箱环境 fallback
+            config = "config/config.yaml"
 
     template = """# PyClaw 配置文件示例
 

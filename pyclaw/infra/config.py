@@ -45,6 +45,7 @@ class SandboxConfig(BaseModel):
     enabled: bool = False
     image: str = "python:3.10-slim"
     volumes: dict[str, str] = Field(default_factory=dict)
+    allowed_paths: list[str] = Field(default_factory=list)
 
 
 class Config(BaseModel):
@@ -55,6 +56,8 @@ class Config(BaseModel):
     model: ModelConfig
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
+    config_dir: Optional[str] = None
+    allowed_paths: list[str] = Field(default_factory=list)
     max_iterations: int = 30
 
 

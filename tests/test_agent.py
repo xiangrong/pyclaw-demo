@@ -152,7 +152,7 @@ async def test_agent_max_iterations():
     
     sessions.get_or_create.return_value = session
     
-    agent = Agent(model, tools, sessions)
+    agent = Agent(model, tools, sessions, max_iterations=5)
     user_msg = Message(
         id="m2", channel="t", channel_user_id="u1", session_id="s2",
         type=MessageType.TEXT, role=MessageRole.USER, content="Loop me"

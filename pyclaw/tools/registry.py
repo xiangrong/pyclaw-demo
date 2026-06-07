@@ -17,18 +17,22 @@ class ToolRegistry:
     def __init__(
         self, 
         skills_dirs: Optional[list[str | Path]] = None,
-        work_dir: Optional[str] = None
+        work_dir: Optional[str] = None,
+        allowed_paths: Optional[list[str]] = None
     ) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._static_tools: set[str] = set()
         self.skills_dirs = [Path(d) for d in skills_dirs] if skills_dirs else []
         self._file_mtimes: dict[str, float] = {}
         self.work_dir = work_dir
+        self.allowed_paths = allowed_paths or []
 
     def register(self, tool: BaseTool, is_static: bool = True) -> None:
         """注册一个工具"""
         if self.work_dir:
             tool.set_work_dir(self.work_dir)
+        if self.allowed_paths:
+            tool.set_allowed_paths(self.allowed_paths)
         self._tools[tool.name] = tool
         if is_static:
             self._static_tools.add(tool.name)
