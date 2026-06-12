@@ -263,6 +263,19 @@ class Agent:
             user_id=message.channel_user_id,
         )
 
+        # 检查是否是 /new 指令
+        if message.content.strip().lower() == "/new":
+            await self.sessions.clear_session(session)
+            return Message(
+                id=f"response-{message.id}",
+                channel=message.channel,
+                channel_user_id=message.channel_user_id,
+                session_id=session.session_id,
+                type=MessageType.TEXT,
+                role=MessageRole.ASSISTANT,
+                content="✨ 会话已重置，开始新的一轮会话！",
+            )
+
         # 动态更新系统提示词（允许技能热插拔被感知）
         current_system_prompt = await self._get_dynamic_system_prompt(session)
 

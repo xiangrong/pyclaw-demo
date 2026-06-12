@@ -163,3 +163,39 @@ async def test_agent_max_iterations():
     # Should stop after max_iterations = 5
     assert model.chat.call_count == 5
     assert "达到最大思考深度" in response.content or "⚠️  思考超时" in response.content
+
+@pytest.mark.asyncio
+async def test_agent_clear_session_on_new_command():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.skills_dirs = []
+    
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s3"
+    session.channel = "t"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    
+    sessions.get_or_create.return_value = session
+    
+    agent = Agent(model, tools, sessions)
+    
+    # User sends /new command
+    user_msg = Message(
+        id="m3", channel="t", channel_user_id="u1", session_id="s3",
+        type=MessageType.TEXT, role=MessageRole.USER, content="/new"
+    )
+    
+    response = await agent.process_message(user_msg)
+    
+    # clear_session should have been called
+    sessions.clear_session.assert_called_once_with(session)
+    
+    # The model should not have been called (LLM loop skipped)
+    model.chat.assert_not_called()
+    
+    # We should get a reset confirmation reply
+    assert "会话已重置" in response.content

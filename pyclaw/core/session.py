@@ -235,6 +235,19 @@ class SessionManager:
                     m.metadata = message.metadata
                     break
 
+    async def clear_session(self, session: Session) -> None:
+        """清空会话在内存和数据库中的所有消息及元数据"""
+        session.messages = []
+        session.metadata = {}
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM messages WHERE session_id = ?", (session.session_id,))
+            await db.execute(
+                "UPDATE sessions SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (json.dumps({}), session.session_id)
+            )
+            await db.commit()
+
     def get_by_id(self, session_id: str) -> Optional[Session]:
         """通过会话ID从缓存获取"""
         for session in self._sessions.values():
