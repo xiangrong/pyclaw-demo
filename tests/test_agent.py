@@ -231,7 +231,7 @@ async def test_agent_repeated_read_only_tools_force_final_answer_without_raw_obs
 
 
 @pytest.mark.asyncio
-async def test_cron_agent_soft_deadline_forces_final_answer(monkeypatch):
+async def test_cron_agent_soft_deadline_stops_research_and_synthesizes(monkeypatch):
     model = AsyncMock()
     tools = MagicMock()
     tools.execute_tool_calls = AsyncMock()
@@ -272,9 +272,138 @@ async def test_cron_agent_soft_deadline_forces_final_answer(monkeypatch):
     response = await agent.process_message(user_msg)
 
     assert response.content == "已基于已有结果总结。"
-    tools.get_all_specs.assert_not_called()
+    tools.get_all_specs.assert_called()
     tools.execute_tool_calls.assert_not_called()
-    assert any("Tool usage must stop now" in m.content for m in session.messages)
+    assert any("cron research budget is exhausted" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_cron_soft_deadline_allows_one_delivery_tool(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock(return_value=[
+        {
+            "role": "tool",
+            "tool_call_id": "mail1",
+            "name": "163email__send_email",
+            "content": "email sent",
+            "success": True,
+            "metadata": {},
+        }
+    ])
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_read", "description": "read", "parameters": {}},
+        {"name": "163email__send_email", "description": "send", "parameters": {}},
+    ]
+
+    model.chat.side_effect = [
+        {
+            "content": "准备发送邮件",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "mail1",
+                "function": {"name": "163email__send_email", "arguments": '{"to":"u@example.com"}'},
+            }],
+        },
+        {"content": "邮件已发送，任务完成。", "__tool_calls__": False},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-delivery"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {"soft_deadline_seconds": 1}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    real_monotonic = time.monotonic
+    times = [real_monotonic(), real_monotonic() + 2]
+    monkeypatch.setattr("pyclaw.core.agent.time.monotonic", lambda: times.pop(0) if times else real_monotonic() + 2)
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-delivery", channel="cron", channel_user_id="job_1", session_id="s-cron-delivery",
+        type=MessageType.TEXT, role=MessageRole.USER, content="发送一封定时邮件"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "邮件已发送，任务完成。"
+    tools.execute_tool_calls.assert_awaited_once()
+    first_chat_tools = model.chat.await_args_list[0].kwargs["tools"]
+    assert first_chat_tools == [{"name": "163email__send_email", "description": "send", "parameters": {}}]
+    assert any("收尾交付动作已执行" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_cron_soft_deadline_blocks_more_research_tools(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_read", "description": "read", "parameters": {}},
+        {"name": "163email__send_email", "description": "send", "parameters": {}},
+    ]
+
+    model.chat.side_effect = [
+        {
+            "content": "还想继续读网页",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "read1",
+                "function": {"name": "web_read", "arguments": '{"url":"https://example.com"}'},
+            }],
+        },
+        {"content": "基于已有信息总结。", "__tool_calls__": False},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-block-research"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {"soft_deadline_seconds": 1}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    real_monotonic = time.monotonic
+    times = [real_monotonic(), real_monotonic() + 2]
+    monkeypatch.setattr("pyclaw.core.agent.time.monotonic", lambda: times.pop(0) if times else real_monotonic() + 2)
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-block-research", channel="cron", channel_user_id="job_1", session_id="s-cron-block-research",
+        type=MessageType.TEXT, role=MessageRole.USER, content="执行一个快超时的定时任务"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "基于已有信息总结。"
+    tools.execute_tool_calls.assert_not_called()
+    assert any("只允许一次邮件/消息等交付动作" in m.content for m in session.messages)
 
 
 @pytest.mark.asyncio

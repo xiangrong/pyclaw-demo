@@ -388,17 +388,15 @@ class Agent:
         tool_name_counts: dict[str, int] = {}
         side_effect_call_counts: dict[str, int] = {}
         force_final_answer = False
+        soft_deadline_reached = False
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
 
             if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
-                if not force_final_answer:
-                    await self._request_final_answer_without_tools(
-                        session,
-                        "定时任务即将达到执行时限。请停止调用任何工具，直接基于已有观察结果输出当前最完整的结果。",
-                    )
-                    force_final_answer = True
+                if not soft_deadline_reached and not force_final_answer:
+                    await self._request_soft_deadline_wrap_up(session)
+                    soft_deadline_reached = True
 
             # 动态更新系统提示词内容 (包含最新的 Plan & Objective)
             current_system_prompt = await self._get_dynamic_system_prompt(session)
@@ -416,7 +414,12 @@ class Agent:
             # 判断是否是最后几次迭代，强制禁用工具
             is_final_iteration = i >= max_iterations - 2
             active_skills = session.metadata.get("active_skills", [])
-            tools = None if (is_final_iteration or force_final_answer) else self.tools.get_all_specs(active_skills=active_skills)
+            if is_final_iteration or force_final_answer:
+                tools = None
+            elif soft_deadline_reached:
+                tools = self._get_delivery_tool_specs(active_skills=active_skills)
+            else:
+                tools = self.tools.get_all_specs(active_skills=active_skills)
 
             try:
                 # 调用 LLM
@@ -463,6 +466,22 @@ class Agent:
                     ), pending_files
 
                 tool_calls = result["tool_calls"]
+                if soft_deadline_reached and not self._are_delivery_tool_calls(tool_calls):
+                    await self._request_final_answer_without_tools(
+                        session,
+                        "定时任务已进入收尾阶段，只允许一次邮件/消息等交付动作；不要继续搜索、读网页或执行其他工具。",
+                    )
+                    force_final_answer = True
+                    continue
+
+                if soft_deadline_reached and len(tool_calls) > 1:
+                    await self._request_final_answer_without_tools(
+                        session,
+                        "定时任务已进入收尾阶段，交付工具一次只能调用一个。请基于已有结果直接输出最终答复。",
+                    )
+                    force_final_answer = True
+                    continue
+
                 tool_call_count += len(tool_calls)
 
                 for tc in tool_calls:
@@ -553,10 +572,13 @@ class Agent:
 
                 # 2. 执行工具调用。工具框架异常也转为 Observation，避免直接中断 Agent loop。
                 try:
-                    if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
+                    if (
+                        self._is_near_soft_deadline(started_at, soft_deadline_seconds)
+                        and not self._are_delivery_tool_calls(tool_calls)
+                    ):
                         await self._request_final_answer_without_tools(
                             session,
-                            "定时任务即将达到执行时限。请不要继续执行工具，直接基于已有观察结果输出最终答复。",
+                            "定时任务即将达到执行时限。请不要继续搜索或读取网页，直接基于已有观察结果输出最终答复。",
                         )
                         force_final_answer = True
                         continue
@@ -644,6 +666,13 @@ class Agent:
                 else:
                     consecutive_failures = 0 # 重置计数
 
+                if soft_deadline_reached:
+                    await self._request_final_answer_without_tools(
+                        session,
+                        "定时任务收尾交付动作已执行或尝试执行。请不要再调用工具，直接输出最终答复。",
+                    )
+                    force_final_answer = True
+
                 continue
 
             # 没有工具调用，返回最终汇总结果
@@ -696,6 +725,30 @@ class Agent:
         )
         await self.sessions.save_message(session, final_request)
 
+    async def _request_soft_deadline_wrap_up(self, session: Session) -> None:
+        """Ask a cron task to stop research but allow one final delivery action.
+
+        Cron jobs often have two phases: gather data, then deliver it. When the
+        soft deadline is reached we must stop expensive read/search tools, but
+        blocking delivery tools entirely causes jobs to produce a draft without
+        sending it. The next model turn therefore receives only delivery tools.
+        """
+        final_request = Message(
+            id=f"soft-deadline-wrap-up-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: The cron research budget is exhausted. "
+                "Do not call web_search, web_read, python, terminal, cronjob, file, or other research tools. "
+                "If the task explicitly requires final delivery by email or message, call exactly one delivery tool now. "
+                "Otherwise, produce the final answer immediately from existing observations."
+            ),
+        )
+        await self.sessions.save_message(session, final_request)
+
     def _is_near_soft_deadline(self, started_at: float, soft_deadline_seconds: Any) -> bool:
         """Return True when a task should stop tool use and synthesize."""
         if soft_deadline_seconds is None:
@@ -705,6 +758,33 @@ class Agent:
         except (TypeError, ValueError):
             return False
         return time.monotonic() - started_at >= deadline
+
+    def _get_delivery_tool_specs(self, active_skills: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        """Return only tools suitable for final cron delivery after soft deadline."""
+        return [
+            spec
+            for spec in self.tools.get_all_specs(active_skills=active_skills)
+            if self._is_delivery_tool_name(str(spec.get("name", "")))
+        ]
+
+    def _are_delivery_tool_calls(self, tool_calls: list[dict[str, Any]]) -> bool:
+        """Return True when every requested call is a final-delivery tool."""
+        if not tool_calls:
+            return False
+        for tc in tool_calls:
+            tool_name = tc.get("function", {}).get("name", "")
+            if not self._is_delivery_tool_name(str(tool_name)):
+                return False
+        return True
+
+    def _is_delivery_tool_name(self, tool_name: str) -> bool:
+        """Return True for email/message tools that can complete task delivery."""
+        normalized = tool_name.lower()
+        if normalized in {"terminal", "cronjob", "web_read", "web_search", "python_interpreter"}:
+            return False
+        if any(keyword in normalized for keyword in ("read", "search", "list", "get_recent", "test", "connection")):
+            return False
+        return any(keyword in normalized for keyword in ("send_email", "send_mail", "send_message", "send_", "__send"))
 
     def _is_side_effect_tool(self, tool_name: str) -> bool:
         """Return True for tools that can mutate state or notify users.
