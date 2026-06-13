@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import sys
+import asyncio
 from pathlib import Path
 from typing import Any, Optional
 
@@ -165,7 +166,21 @@ class ToolRegistry:
                 )
                 continue
 
-            result = await self.execute(tool_name, **args)
+            if tool_name in {"web_read", "web_search"}:
+                if "timeout" not in args:
+                    args["timeout"] = 10 if tool_name == "web_search" else 15
+                try:
+                    result = await asyncio.wait_for(
+                        self.execute(tool_name, **args),
+                        timeout=20,
+                    )
+                except asyncio.TimeoutError:
+                    result = ToolResult(
+                        success=False,
+                        content=f"Tool '{tool_name}' timed out while executing.",
+                    )
+            else:
+                result = await self.execute(tool_name, **args)
 
             results.append(
                 {

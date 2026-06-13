@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 # 静默标记
 SILENT_MARKER = "[SILENT]"
+CRON_HARD_TIMEOUT_SECONDS = 120
+CRON_SOFT_DEADLINE_SECONDS = 80
 CRON_STOP_MARKERS = (
     "工具调用次数过多",
     "工具重复调用过多",
@@ -207,9 +209,21 @@ async def run_job_with_agent(
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=cron_prompt,
+            metadata={
+                "soft_deadline_seconds": CRON_SOFT_DEADLINE_SECONDS,
+                "hard_timeout_seconds": CRON_HARD_TIMEOUT_SECONDS,
+            },
         )
 
         # 执行
+        session = await agent.sessions.get_or_create(
+            channel=message.channel,
+            user_id=message.channel_user_id,
+        )
+        session.metadata["soft_deadline_seconds"] = CRON_SOFT_DEADLINE_SECONDS
+        session.metadata["hard_timeout_seconds"] = CRON_HARD_TIMEOUT_SECONDS
+        session.metadata["cron_job_id"] = job_id
+
         response = await agent.process_message(message)
 
         # 获取响应内容
@@ -280,7 +294,7 @@ def tick(
                 if _global_agent is not None and _global_loop is not None:
                     coro = run_job_with_agent(job, _global_agent)
                     future = asyncio.run_coroutine_threadsafe(coro, _global_loop)
-                    timeout_seconds = 120
+                    timeout_seconds = CRON_HARD_TIMEOUT_SECONDS
                     try:
                         success, full_output, final_response, error = future.result(timeout=timeout_seconds)
                     except FutureTimeoutError as e:

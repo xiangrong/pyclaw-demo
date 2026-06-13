@@ -1,5 +1,6 @@
 import pytest
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 from pyclaw.core.agent import Agent
 from pyclaw.core.message import Message, MessageRole, MessageType
@@ -227,6 +228,53 @@ async def test_agent_repeated_read_only_tools_force_final_answer_without_raw_obs
     assert tools.execute_tool_calls.call_count == 4
     assert "OBSERVATION from" not in response.content
     assert "A very long raw web page observation" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_cron_agent_soft_deadline_forces_final_answer(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.return_value = {"content": "已基于已有结果总结。", "__tool_calls__": False}
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-soft-deadline"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {"soft_deadline_seconds": 1}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    real_monotonic = time.monotonic
+    times = [real_monotonic(), real_monotonic() + 2]
+    monkeypatch.setattr("pyclaw.core.agent.time.monotonic", lambda: times.pop(0) if times else real_monotonic() + 2)
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-soft-deadline", channel="cron", channel_user_id="job_1", session_id="s-cron-soft-deadline",
+        type=MessageType.TEXT, role=MessageRole.USER, content="执行一个快超时的定时任务"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "已基于已有结果总结。"
+    tools.get_all_specs.assert_not_called()
+    tools.execute_tool_calls.assert_not_called()
+    assert any("Tool usage must stop now" in m.content for m in session.messages)
 
 
 @pytest.mark.asyncio

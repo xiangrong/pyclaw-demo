@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime
 from typing import Optional, Any
 
@@ -377,6 +378,8 @@ class Agent:
         max_tool_calls = 12 if is_cron_session else 20
         repeated_tool_limit = 4 if is_cron_session else 8
         side_effect_tool_limit = 1
+        started_at = time.monotonic()
+        soft_deadline_seconds = session.metadata.get("soft_deadline_seconds") if is_cron_session else None
         last_tool_calls = []  # 循环检测
         consecutive_failures = 0 # 追踪连续工具失败次数
         pending_files = [] # 存储待发送的文件信息
@@ -388,6 +391,14 @@ class Agent:
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
+
+            if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
+                if not force_final_answer:
+                    await self._request_final_answer_without_tools(
+                        session,
+                        "定时任务即将达到执行时限。请停止调用任何工具，直接基于已有观察结果输出当前最完整的结果。",
+                    )
+                    force_final_answer = True
 
             # 动态更新系统提示词内容 (包含最新的 Plan & Objective)
             current_system_prompt = await self._get_dynamic_system_prompt(session)
@@ -448,7 +459,7 @@ class Agent:
                 if force_final_answer:
                     return self._with_stop_notice(
                         all_responses,
-                        "⚠️  工具预算已用完，但模型仍尝试继续调用工具；我已停止执行以避免刷屏。",
+                        "⚠️  工具预算或时间预算已用完，但模型仍尝试继续调用工具；我已停止执行以避免刷屏。",
                     ), pending_files
 
                 tool_calls = result["tool_calls"]
@@ -542,6 +553,14 @@ class Agent:
 
                 # 2. 执行工具调用。工具框架异常也转为 Observation，避免直接中断 Agent loop。
                 try:
+                    if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
+                        await self._request_final_answer_without_tools(
+                            session,
+                            "定时任务即将达到执行时限。请不要继续执行工具，直接基于已有观察结果输出最终答复。",
+                        )
+                        force_final_answer = True
+                        continue
+
                     tool_results = await self.tools.execute_tool_calls(
                         json.dumps(result)
                     )
@@ -676,6 +695,16 @@ class Agent:
             ),
         )
         await self.sessions.save_message(session, final_request)
+
+    def _is_near_soft_deadline(self, started_at: float, soft_deadline_seconds: Any) -> bool:
+        """Return True when a task should stop tool use and synthesize."""
+        if soft_deadline_seconds is None:
+            return False
+        try:
+            deadline = float(soft_deadline_seconds)
+        except (TypeError, ValueError):
+            return False
+        return time.monotonic() - started_at >= deadline
 
     def _is_side_effect_tool(self, tool_name: str) -> bool:
         """Return True for tools that can mutate state or notify users.

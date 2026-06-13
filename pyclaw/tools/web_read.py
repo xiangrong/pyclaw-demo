@@ -10,6 +10,7 @@ from .base import BaseTool, ToolResult
 class WebReadArgs(BaseModel):
     url: str = Field(description="The URL of the web page to read")
     include_tables: bool = Field(default=True, description="Whether to include tables in the output")
+    timeout: int = Field(default=20, ge=1, le=60, description="Timeout in seconds")
 
 
 class WebReadTool(BaseTool):
@@ -22,6 +23,7 @@ class WebReadTool(BaseTool):
     async def execute(self, **kwargs) -> ToolResult:
         url = kwargs.get("url", "")
         include_tables = kwargs.get("include_tables", True)
+        timeout = int(kwargs.get("timeout", 20))
 
         if not url:
             return ToolResult(success=False, content="URL is required.")
@@ -41,7 +43,10 @@ class WebReadTool(BaseTool):
                 )
 
             loop = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, _fetch_and_extract)
+            content = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch_and_extract),
+                timeout=timeout,
+            )
 
             if content is None:
                 return ToolResult(success=False, content=f"Failed to download or extract content from: {url}")
@@ -53,4 +58,6 @@ class WebReadTool(BaseTool):
             )
 
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                return ToolResult(success=False, content=f"Web read timed out after {timeout} seconds: {url}")
             return ToolResult(success=False, content=f"Error reading web page: {str(e)}")

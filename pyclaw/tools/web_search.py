@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pydantic import BaseModel, Field
 from ddgs import DDGS
 
@@ -10,6 +11,7 @@ from .base import BaseTool, ToolResult
 class WebSearchArgs(BaseModel):
     query: str = Field(description="Search query")
     max_results: int = Field(default=5, description="Maximum number of results to return")
+    timeout: int = Field(default=15, ge=1, le=60, description="Timeout in seconds")
 
 
 class WebSearchTool(BaseTool):
@@ -22,16 +24,18 @@ class WebSearchTool(BaseTool):
     async def execute(self, **kwargs) -> ToolResult:
         query = kwargs.get("query", "")
         max_results = int(kwargs.get("max_results", 5))
+        timeout = int(kwargs.get("timeout", 15))
 
         try:
-            import asyncio
-
             def _search():
                 with DDGS() as ddgs:
                     return list(ddgs.text(query, max_results=max_results))
 
             loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(None, _search)
+            results = await asyncio.wait_for(
+                loop.run_in_executor(None, _search),
+                timeout=timeout,
+            )
 
             if not results:
                 return ToolResult(success=True, content="No results found.")
@@ -52,4 +56,6 @@ class WebSearchTool(BaseTool):
             )
 
         except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                return ToolResult(success=False, content=f"Search timed out after {timeout} seconds: {query}")
             return ToolResult(success=False, content=f"Search failed: {str(e)}")
