@@ -354,6 +354,119 @@ async def test_agent_allows_repeated_read_only_cronjob_list():
 
 
 @pytest.mark.asyncio
+async def test_agent_allows_triggering_multiple_distinct_cron_jobs_once():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "触发多个任务...",
+            "__tool_calls__": True,
+            "tool_calls": [
+                {
+                    "id": "trigger1",
+                    "function": {"name": "cronjob", "arguments": '{"action": "trigger", "job_id": "job-a"}'},
+                },
+                {
+                    "id": "trigger2",
+                    "function": {"name": "cronjob", "arguments": '{"action": "trigger", "job_id": "job-b"}'},
+                },
+            ],
+        },
+        {"content": "两个任务都已触发。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {"role": "tool", "tool_call_id": "trigger1", "name": "cronjob", "content": "job-a triggered", "success": True, "metadata": {}},
+        {"role": "tool", "tool_call_id": "trigger2", "name": "cronjob", "content": "job-b triggered", "success": True, "metadata": {}},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-trigger-batch"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-trigger-batch", channel="telegram", channel_user_id="u1", session_id="s-cron-trigger-batch",
+        type=MessageType.TEXT, role=MessageRole.USER, content="触发所有任务"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "两个任务都已触发。"
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_retriggering_same_cron_job():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.return_value = {
+        "content": "重复触发同一任务...",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "trigger",
+            "function": {"name": "cronjob", "arguments": '{"action": "trigger", "job_id": "job-a"}'},
+        }],
+    }
+    tools.execute_tool_calls.return_value = [
+        {"role": "tool", "tool_call_id": "trigger", "name": "cronjob", "content": "job-a triggered", "success": True, "metadata": {}},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-retrigger"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-retrigger", channel="telegram", channel_user_id="u1", session_id="s-cron-retrigger",
+        type=MessageType.TEXT, role=MessageRole.USER, content="触发任务"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert "副作用工具重复调用" in response.content
+    assert "cronjob:trigger:job-a" in response.content
+
+
+@pytest.mark.asyncio
 async def test_agent_converts_tool_executor_exception_to_observation():
     model = AsyncMock()
     tools = MagicMock()

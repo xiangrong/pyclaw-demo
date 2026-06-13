@@ -383,7 +383,7 @@ class Agent:
         all_responses = [] # 存储所有周期的文本回复
         tool_call_count = 0
         tool_name_counts: dict[str, int] = {}
-        side_effect_tool_counts: dict[str, int] = {}
+        side_effect_call_counts: dict[str, int] = {}
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
@@ -451,8 +451,9 @@ class Agent:
                     tool_name = tc.get("function", {}).get("name", "unknown")
                     tool_arguments = tc.get("function", {}).get("arguments", "")
                     tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
-                    if self._is_side_effect_tool_call(tool_name, tool_arguments):
-                        side_effect_tool_counts[tool_name] = side_effect_tool_counts.get(tool_name, 0) + 1
+                    side_effect_key = self._side_effect_call_key(tool_name, tool_arguments)
+                    if side_effect_key:
+                        side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
 
                 if tool_call_count > max_tool_calls:
                     return self._with_stop_notice(
@@ -460,17 +461,17 @@ class Agent:
                         "⚠️  工具调用次数过多，我已停止继续执行，避免重复触发任务或刷屏。",
                     ), pending_files
 
-                repeated_side_effect_tools = [
-                    name
-                    for name, count in side_effect_tool_counts.items()
+                repeated_side_effect_calls = [
+                    key
+                    for key, count in side_effect_call_counts.items()
                     if count > side_effect_tool_limit
                 ]
-                if repeated_side_effect_tools:
+                if repeated_side_effect_calls:
                     return self._with_stop_notice(
                         all_responses,
                         (
                             "⚠️  检测到副作用工具重复调用"
-                            f"（{', '.join(repeated_side_effect_tools)}），我已停止继续执行，"
+                            f"（{', '.join(repeated_side_effect_calls)}），我已停止继续执行，"
                             "避免重复触发任务、重复发消息或重复写入。"
                         ),
                     ), pending_files
@@ -651,8 +652,14 @@ class Agent:
             return True
         return any(keyword in normalized for keyword in self.SIDE_EFFECT_TOOL_KEYWORDS)
 
-    def _is_side_effect_tool_call(self, tool_name: str, arguments: Any) -> bool:
-        """Return True when a concrete tool call can cause external effects."""
+    def _side_effect_call_key(self, tool_name: str, arguments: Any) -> Optional[str]:
+        """Return a repeat-detection key for side-effectful calls.
+
+        Multiple distinct cron triggers in one user-requested batch are valid,
+        so cronjob is keyed by action and job id instead of only by tool name.
+        Terminal remains keyed only by tool name because repeated shell side
+        effects commonly mean duplicate notifications or duplicate writes.
+        """
         normalized = tool_name.lower()
         if normalized == "cronjob":
             try:
@@ -660,7 +667,7 @@ class Agent:
             except (TypeError, json.JSONDecodeError):
                 args = {}
             action = str(args.get("action", "")).lower() if isinstance(args, dict) else ""
-            return action in {
+            if action not in {
                 "create",
                 "update",
                 "delete",
@@ -669,8 +676,13 @@ class Agent:
                 "trigger",
                 "disable",
                 "enable",
-            }
-        return self._is_side_effect_tool(tool_name)
+            }:
+                return None
+            job_id = str(args.get("job_id", "")) if isinstance(args, dict) else ""
+            return f"cronjob:{action}:{job_id or '<no-job-id>'}"
+        if self._is_side_effect_tool(tool_name):
+            return normalized
+        return None
 
     async def _summarize_and_compress_history(self, session: Session) -> None:
         """对过长的历史消息进行摘要并压缩"""
