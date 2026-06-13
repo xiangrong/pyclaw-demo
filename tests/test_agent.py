@@ -167,7 +167,7 @@ async def test_agent_max_iterations():
 
 
 @pytest.mark.asyncio
-async def test_agent_repeated_tool_fuse_does_not_append_raw_observations():
+async def test_agent_repeated_read_only_tools_force_final_answer_without_raw_observations():
     model = AsyncMock()
     tools = MagicMock()
     tools.execute_tool_calls = AsyncMock()
@@ -176,7 +176,7 @@ async def test_agent_repeated_tool_fuse_does_not_append_raw_observations():
     tools.skills_dirs = []
     tools.get_all_specs.return_value = []
 
-    model.chat.return_value = {
+    repeated_tool_response = {
         "content": "继续读取网页...",
         "__tool_calls__": True,
         "tool_calls": [{
@@ -184,6 +184,9 @@ async def test_agent_repeated_tool_fuse_does_not_append_raw_observations():
             "function": {"name": "web_read", "arguments": '{"url": "https://example.com"}'}
         }]
     }
+    model.chat.side_effect = [repeated_tool_response] * 9 + [
+        {"content": "基于已有信息，这是最终答复。", "__tool_calls__": False}
+    ]
     tools.execute_tool_calls.return_value = [
         {
             "role": "tool",
@@ -220,7 +223,8 @@ async def test_agent_repeated_tool_fuse_does_not_append_raw_observations():
 
     response = await agent.process_message(user_msg)
 
-    assert "工具重复调用过多" in response.content
+    assert response.content == "基于已有信息，这是最终答复。"
+    assert tools.execute_tool_calls.call_count == 4
     assert "OBSERVATION from" not in response.content
     assert "A very long raw web page observation" not in response.content
 

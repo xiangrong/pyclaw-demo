@@ -384,6 +384,7 @@ class Agent:
         tool_call_count = 0
         tool_name_counts: dict[str, int] = {}
         side_effect_call_counts: dict[str, int] = {}
+        force_final_answer = False
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
@@ -404,7 +405,7 @@ class Agent:
             # 判断是否是最后几次迭代，强制禁用工具
             is_final_iteration = i >= max_iterations - 2
             active_skills = session.metadata.get("active_skills", [])
-            tools = None if is_final_iteration else self.tools.get_all_specs(active_skills=active_skills)
+            tools = None if (is_final_iteration or force_final_answer) else self.tools.get_all_specs(active_skills=active_skills)
 
             try:
                 # 调用 LLM
@@ -444,6 +445,12 @@ class Agent:
                         print(f"  💬 [Status] {clean_content}")
 
             if has_tool_calls:
+                if force_final_answer:
+                    return self._with_stop_notice(
+                        all_responses,
+                        "⚠️  工具预算已用完，但模型仍尝试继续调用工具；我已停止执行以避免刷屏。",
+                    ), pending_files
+
                 tool_calls = result["tool_calls"]
                 tool_call_count += len(tool_calls)
 
@@ -456,10 +463,12 @@ class Agent:
                         side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
 
                 if tool_call_count > max_tool_calls:
-                    return self._with_stop_notice(
-                        all_responses,
-                        "⚠️  工具调用次数过多，我已停止继续执行，避免重复触发任务或刷屏。",
-                    ), pending_files
+                    await self._request_final_answer_without_tools(
+                        session,
+                        "工具调用次数已达到上限。请停止调用任何工具，直接基于已有观察结果给用户一个完整、简洁的最终答复。",
+                    )
+                    force_final_answer = True
+                    continue
 
                 repeated_side_effect_calls = [
                     key
@@ -478,10 +487,15 @@ class Agent:
 
                 repeated_tools = [name for name, count in tool_name_counts.items() if count > repeated_tool_limit]
                 if repeated_tools:
-                    return self._with_stop_notice(
-                        all_responses,
-                        f"⚠️  检测到工具重复调用过多（{', '.join(repeated_tools)}），我已停止继续执行，避免刷屏。",
-                    ), pending_files
+                    await self._request_final_answer_without_tools(
+                        session,
+                        (
+                            f"检测到只读/查询类工具重复调用过多（{', '.join(repeated_tools)}）。"
+                            "请不要继续搜索或读取网页，直接基于已经获得的信息给用户一个完整、简洁的最终答复。"
+                        ),
+                    )
+                    force_final_answer = True
+                    continue
                 
                 # 循环检测与自我反思 (Self-Reflection)
                 tool_call_signature = str(tool_calls)
@@ -639,6 +653,29 @@ class Agent:
         if cleaned_responses:
             return "\n\n".join(cleaned_responses + [notice])
         return notice
+
+    async def _request_final_answer_without_tools(self, session: Session, reason: str) -> None:
+        """Ask the model to produce a final answer using existing observations.
+
+        This is used for read-only/query tool budget guardrails. Unlike
+        side-effect guardrails, the safest user experience is not to abort with
+        a warning; it is to stop tool access and force a final synthesis from
+        the observations already in context.
+        """
+        final_request = Message(
+            id=f"final-no-tools-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: Tool usage must stop now. "
+                f"Reason: {reason}\n"
+                "Do not call any more tools. Produce the final answer now."
+            ),
+        )
+        await self.sessions.save_message(session, final_request)
 
     def _is_side_effect_tool(self, tool_name: str) -> bool:
         """Return True for tools that can mutate state or notify users.
