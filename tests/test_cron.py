@@ -1,4 +1,5 @@
 from pyclaw.cron import jobs as cron_jobs
+from datetime import datetime, timezone
 
 
 def test_running_jobs_are_not_due(monkeypatch, tmp_path):
@@ -147,3 +148,96 @@ def test_tick_records_readable_timeout_error(monkeypatch, tmp_path):
     assert updated is not None
     assert updated["last_status"] == "failed"
     assert updated["last_error"] == "Cron job timed out after 120 seconds"
+
+
+def test_cron_due_checks_day_month_and_weekday():
+    assert cron_jobs._is_cron_due(
+        "0 11 9 6 *",
+        datetime(2026, 6, 9, 11, 0, tzinfo=timezone.utc),
+    )
+    assert not cron_jobs._is_cron_due(
+        "0 11 9 6 *",
+        datetime(2026, 6, 10, 11, 0, tzinfo=timezone.utc),
+    )
+    assert not cron_jobs._is_cron_due(
+        "0 11 9 6 *",
+        datetime(2026, 7, 9, 11, 0, tzinfo=timezone.utc),
+    )
+
+    # 2026-06-13 is Saturday; cron uses 0/7=Sunday, 6=Saturday.
+    assert cron_jobs._is_cron_due(
+        "0 21 * * 6",
+        datetime(2026, 6, 13, 21, 0, tzinfo=timezone.utc),
+    )
+    assert not cron_jobs._is_cron_due(
+        "0 21 * * 0",
+        datetime(2026, 6, 13, 21, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_cron_due_uses_system_cron_day_or_weekday_semantics():
+    # When both day-of-month and day-of-week are restricted, system cron runs
+    # when either one matches.
+    assert cron_jobs._is_cron_due(
+        "0 9 10 * 6",
+        datetime(2026, 6, 13, 9, 0, tzinfo=timezone.utc),  # Saturday, not day 10.
+    )
+    assert cron_jobs._is_cron_due(
+        "0 9 10 * 6",
+        datetime(2026, 6, 10, 9, 0, tzinfo=timezone.utc),  # Day 10, not Saturday.
+    )
+    assert not cron_jobs._is_cron_due(
+        "0 9 10 * 6",
+        datetime(2026, 6, 11, 9, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_cron_due_supports_step_values():
+    assert cron_jobs._is_cron_due(
+        "*/15 */2 * * *",
+        datetime(2026, 6, 13, 10, 30, tzinfo=timezone.utc),
+    )
+    assert not cron_jobs._is_cron_due(
+        "*/15 */2 * * *",
+        datetime(2026, 6, 13, 11, 30, tzinfo=timezone.utc),
+    )
+    assert not cron_jobs._is_cron_due(
+        "*/15 */2 * * *",
+        datetime(2026, 6, 13, 10, 31, tzinfo=timezone.utc),
+    )
+
+
+def test_compute_next_run_never_returns_current_past_minute(monkeypatch):
+    fixed_now = datetime(2026, 6, 13, 10, 0, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(cron_jobs, "_now", lambda: fixed_now)
+
+    schedule = cron_jobs.parse_schedule("0 10 * * *")
+
+    assert cron_jobs.compute_next_run(schedule) == "2026-06-14T10:00:00+00:00"
+
+
+def test_compute_next_run_can_find_annual_cron(monkeypatch):
+    fixed_now = datetime(2026, 6, 13, 10, 0, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(cron_jobs, "_now", lambda: fixed_now)
+
+    schedule = cron_jobs.parse_schedule("0 11 9 6 *")
+
+    assert cron_jobs.compute_next_run(schedule) == "2027-06-09T11:00:00+00:00"
+
+
+def test_compute_next_run_can_find_leap_day_cron(monkeypatch):
+    fixed_now = datetime(2026, 6, 13, 10, 0, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(cron_jobs, "_now", lambda: fixed_now)
+
+    schedule = cron_jobs.parse_schedule("0 9 29 2 *")
+
+    assert cron_jobs.compute_next_run(schedule) == "2028-02-29T09:00:00+00:00"
+
+
+def test_parse_schedule_rejects_non_five_field_cron():
+    try:
+        cron_jobs.parse_schedule("0 10 * * * *")
+    except ValueError as e:
+        assert "无效的调度格式" in str(e)
+    else:
+        raise AssertionError("expected invalid six-field cron expression")

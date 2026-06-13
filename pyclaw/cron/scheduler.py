@@ -363,12 +363,21 @@ def start_background_ticker(
 
     def tick_loop():
         logger.info("Cron ticker started (interval: %ds)", interval)
+        next_tick_at = time.monotonic()
         while True:
             try:
                 tick(verbose=False, adapters=adapters, loop=loop, use_subprocess=False)
             except Exception as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
-            time.sleep(interval)
+            next_tick_at += interval
+            now = time.monotonic()
+            if next_tick_at <= now:
+                # If a long-running job made us miss the next scheduled tick,
+                # run one catch-up tick immediately instead of drifting by the
+                # whole job duration plus another interval.
+                next_tick_at = now
+            sleep_seconds = max(0, next_tick_at - now)
+            time.sleep(sleep_seconds)
 
     thread = threading.Thread(target=tick_loop, daemon=True, name="pyclaw-cron-ticker")
     thread.start()

@@ -10,7 +10,7 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -70,6 +70,128 @@ def parse_duration(s: str) -> int:
     raise ValueError(f"无效的时长格式: '{s}'. 请使用如 '30m', '2h', '1d' 格式")
 
 
+MONTH_NAMES = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+DOW_NAMES = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+
+
+def _cron_value(token: str, names: Optional[Dict[str, int]] = None) -> int:
+    """Parse a single cron field value, including month/day names."""
+    lowered = token.strip().lower()
+    if names and lowered in names:
+        return names[lowered]
+    return int(lowered)
+
+
+def _parse_cron_field(
+    field: str,
+    min_value: int,
+    max_value: int,
+    *,
+    names: Optional[Dict[str, int]] = None,
+    allow_question: bool = False,
+    normalize_7_to_0: bool = False,
+) -> Set[int]:
+    """Parse one cron field.
+
+    Supports the common subset used by PyClaw schedules: ``*``, ``*/n``,
+    numbers, comma lists, ranges, and range steps such as ``1-5/2``.
+    """
+    field = field.strip().lower()
+    if allow_question and field == "?":
+        field = "*"
+
+    allowed = set(range(min_value, max_value + 1))
+    values: Set[int] = set()
+
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"empty cron field segment in '{field}'")
+
+        if "/" in part:
+            base, step_text = part.split("/", 1)
+            step = int(step_text)
+            if step <= 0:
+                raise ValueError(f"cron step must be positive in '{part}'")
+        else:
+            base = part
+            step = 1
+
+        if base in {"*", ""}:
+            start, end = min_value, max_value
+        elif "-" in base:
+            start_text, end_text = base.split("-", 1)
+            start = _cron_value(start_text, names)
+            end = _cron_value(end_text, names)
+        else:
+            start = end = _cron_value(base, names)
+
+        if normalize_7_to_0:
+            if start == 7:
+                start = 0
+            if end == 7:
+                end = 0
+
+        if start not in allowed or end not in allowed:
+            raise ValueError(f"cron value out of range in '{part}'")
+
+        if start <= end:
+            values.update(range(start, end + 1, step))
+        elif normalize_7_to_0:
+            # Day-of-week ranges may wrap, e.g. fri-mon.
+            values.update(range(start, max_value + 1, step))
+            values.update(range(min_value, end + 1, step))
+        else:
+            raise ValueError(f"cron range start must be <= end in '{part}'")
+
+    return values
+
+
+def _parse_cron_parts(cron_expr: str) -> Tuple[Set[int], Set[int], Set[int], Set[int], Set[int]]:
+    """Parse a five-field cron expression into allowed value sets."""
+    parts = cron_expr.split()
+    if len(parts) < 5:
+        raise ValueError("cron expression must contain at least 5 fields")
+
+    minute_expr, hour_expr, dom_expr, month_expr, dow_expr = parts[:5]
+    return (
+        _parse_cron_field(minute_expr, 0, 59),
+        _parse_cron_field(hour_expr, 0, 23),
+        _parse_cron_field(dom_expr, 1, 31, allow_question=True),
+        _parse_cron_field(month_expr, 1, 12, names=MONTH_NAMES),
+        _parse_cron_field(
+            dow_expr,
+            0,
+            6,
+            names=DOW_NAMES,
+            allow_question=True,
+            normalize_7_to_0=True,
+        ),
+    )
+
+
 def parse_schedule(schedule: str) -> Dict[str, Any]:
     """
     解析调度字符串为结构化格式
@@ -125,7 +247,11 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
 
     # 4. 尝试解析为 cron 表达式
     parts = schedule.split()
-    if len(parts) >= 5:
+    if len(parts) == 5:
+        try:
+            _parse_cron_parts(schedule)
+        except ValueError as e:
+            raise ValueError(f"无效的Cron表达式 '{schedule}': {e}")
         return {
             "kind": "cron",
             "expr": schedule,
@@ -147,26 +273,43 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
 
 def _is_cron_due(cron_expr: str, now: datetime) -> bool:
     """
-    简单的cron表达式检查（只支持分钟、小时）
-    完整cron支持需要安装croniter库
+    检查cron表达式是否匹配当前分钟。
+
+    支持五字段 cron 的常用子集：``*``、``*/n``、数字、列表、范围、范围步进，
+    并正确处理日、月、星期字段。
     """
-    parts = cron_expr.split()
-    if len(parts) < 2:
+    try:
+        minute_expr, hour_expr, dom_expr, month_expr, dow_expr = cron_expr.split()[:5]
+        minutes, hours, days, months, weekdays = _parse_cron_parts(cron_expr)
+    except ValueError:
         return False
 
-    minute_expr, hour_expr = parts[0], parts[1]
+    # Python: Monday=0; cron: Sunday=0/7, Monday=1.
+    cron_weekday = (now.weekday() + 1) % 7
+    day_matches = now.day in days
+    weekday_matches = cron_weekday in weekdays
 
-    # 检查分钟
-    if minute_expr != "*":
-        if not re.match(r'^\d+$', minute_expr) or int(minute_expr) != now.minute:
-            return False
+    # Match Vixie/system cron semantics: when both day-of-month and day-of-week
+    # are restricted, either field may match. If one side is '*', the restricted
+    # side controls the match.
+    dom_restricted = dom_expr not in {"*", "?"}
+    dow_restricted = dow_expr not in {"*", "?"}
+    if dom_restricted and dow_restricted:
+        date_matches = day_matches or weekday_matches
+    else:
+        date_matches = day_matches and weekday_matches
 
-    # 检查小时
-    if hour_expr != "*":
-        if not re.match(r'^\d+$', hour_expr) or int(hour_expr) != now.hour:
-            return False
+    return (
+        now.minute in minutes
+        and now.hour in hours
+        and now.month in months
+        and date_matches
+    )
 
-    return True
+
+def _next_minute_after(dt: datetime) -> datetime:
+    """Return the next minute boundary strictly after ``dt``."""
+    return (dt.replace(second=0, microsecond=0) + timedelta(minutes=1))
 
 
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
@@ -192,22 +335,25 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         return next_run.isoformat()
 
     elif schedule["kind"] == "cron":
-        # 简单cron处理：从当前时间开始向后找下一个匹配时间
-        # 完整功能建议安装 croniter
+        # 从当前时间之后的下一分钟开始找，避免把“当前分钟但已过去的
+        # 00秒”计算为下次执行时间，导致创建/恢复后立刻误触发。
         cron_expr = schedule["expr"]
-        check_time = now.replace(second=0, microsecond=0)
+        base_time = now
+        if last_run_at:
+            try:
+                last = datetime.fromisoformat(last_run_at)
+                if last.tzinfo is None:
+                    last = last.astimezone() if HAS_TIMEZONE else last
+                if last > base_time:
+                    base_time = last
+            except ValueError:
+                pass
 
-        # 最多查找24小时
-        for _ in range(1440):
+        check_time = _next_minute_after(base_time)
+
+        # 最多查找5年，覆盖闰年 2/29 这类低频年度任务。
+        for _ in range(366 * 5 * 24 * 60):
             if _is_cron_due(cron_expr, check_time):
-                if last_run_at:
-                    try:
-                        last = datetime.fromisoformat(last_run_at)
-                        if check_time <= last:
-                            check_time += timedelta(minutes=1)
-                            continue
-                    except ValueError:
-                        pass
                 return check_time.isoformat()
             check_time += timedelta(minutes=1)
 
