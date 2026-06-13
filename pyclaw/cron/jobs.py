@@ -335,6 +335,9 @@ def get_due_jobs() -> List[Dict[str, Any]]:
         if not job.get("enabled", True):
             continue
 
+        if job.get("state") == "running":
+            continue
+
         next_run_at = job.get("next_run_at")
         if not next_run_at:
             continue
@@ -360,6 +363,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             save_jobs(jobs)
             return jobs[i]
     return None
+
+
+def mark_job_started(job_id: str) -> Optional[Dict[str, Any]]:
+    """标记任务正在执行，防止同一任务被重复调度。"""
+    return update_job(job_id, {
+        "state": "running",
+        "last_status": "running",
+        "last_error": None,
+    })
 
 
 def advance_next_run(job_id: str) -> Optional[str]:
@@ -392,6 +404,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
         "last_run_at": _now().isoformat(),
         "last_status": "success" if success else "failed",
         "last_error": error,
+        "state": "scheduled",
     }
 
     # 更新完成计数
@@ -453,8 +466,16 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     """立即触发任务（用于测试）"""
+    job = get_job(job_id)
+    if not job:
+        return None
+
+    if job.get("state") == "running":
+        return job
+
     return update_job(job_id, {
         "next_run_at": _now().isoformat(),
+        "state": "scheduled",
     })
 
 

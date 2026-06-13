@@ -205,12 +205,24 @@ class WechatChannel(BaseChannel):
         from_user_id = data.get("from_user_id", "")
         to_user_id = data.get("to_user_id", "")
         context_token = data.get("context_token", "")
+        msg_id = data.get("msg_id", "")
         
         # 自动捕获 bot_id (如果当前为空)
         if not self.bot_id and to_user_id:
             self.bot_id = to_user_id
             print(f"🎯 自动捕获到 Bot ID: {self.bot_id}")
             print(f"请将其更新到 config.yaml: bot_id: \"{self.bot_id}\"")
+
+        # 不处理机器人自己发出的消息，避免平台回投导致自触发循环。
+        if self.bot_id and from_user_id == self.bot_id:
+            return
+
+        # iLink polling/reconnect may redeliver a message with the same msg_id.
+        # Only dedupe when the upstream provides a stable id so users can still
+        # intentionally send the same text twice on platforms without msg_id.
+        if msg_id and not self._remember_source_message_id(msg_id):
+            print(f"↩️ [WeChat] 忽略重复消息: {msg_id}")
+            return
 
         if context_token:
             self.context_tokens[from_user_id] = context_token
@@ -236,7 +248,7 @@ class WechatChannel(BaseChannel):
             return
 
         msg = Message(
-            id=data.get("msg_id", str(uuid.uuid4())),
+            id=msg_id or str(uuid.uuid4()),
             channel="wechat",
             channel_user_id=from_user_id,
             user_id=from_user_id,
@@ -244,7 +256,7 @@ class WechatChannel(BaseChannel):
             type=msg_type,
             role=MessageRole.USER,
             content=content,
-            metadata={"context_token": context_token}
+            metadata={"context_token": context_token, "source_message_id": msg_id}
         )
 
         await self._handle_message(msg)

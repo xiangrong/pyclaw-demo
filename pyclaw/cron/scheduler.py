@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from pyclaw.cron.jobs import (
     get_due_jobs,
+    mark_job_started,
     mark_job_run,
     save_job_output,
     advance_next_run,
@@ -175,7 +176,9 @@ async def run_job_with_agent(
         origin = job.get("origin", {})
 
         # 创建任务专用的独立会话（不要用户普通会话的历史上下文）
-        # 避免会话历史干扰，让Agent专注于执行当前任务prompt
+        # 避免会话历史干扰，让Agent专注于执行当前任务prompt。
+        # channel/user_id 也必须使用 cron 专用值；SessionManager 以
+        # channel:user_id 作为真实会话 key，不能复用 Telegram 用户会话。
         cron_session_id = f"cron_{job_id}_{int(time.time())}"
 
         # 创建消息（用独立的cron会话，干净的上下文）
@@ -184,8 +187,8 @@ async def run_job_with_agent(
 
         message = Message(
             id=f"cron-{job_id}",
-            channel=origin.get("platform", "cron"),
-            channel_user_id=origin.get("chat_id", "cron_user"),
+            channel="cron",
+            channel_user_id=f"job_{job_id}",
             session_id=cron_session_id,  # 任务专用会话
             type=MessageType.TEXT,
             role=MessageRole.USER,
@@ -245,14 +248,19 @@ def tick(
             try:
                 logger.info("Executing cron job: %s (%s)", job_id, job.get("name"))
 
-                # 1. 先更新下次执行时间（避免崩溃后重复执行）
+                # 1. 先标记 running 并更新下次执行时间（避免重复执行）
+                mark_job_started(job_id)
                 advance_next_run(job_id)
 
                 # 2. 执行任务（使用全局Agent）
                 if _global_agent is not None and _global_loop is not None:
                     coro = run_job_with_agent(job, _global_agent)
                     future = asyncio.run_coroutine_threadsafe(coro, _global_loop)
-                    success, full_output, final_response, error = future.result(timeout=120)
+                    try:
+                        success, full_output, final_response, error = future.result(timeout=120)
+                    except Exception:
+                        future.cancel()
+                        raise
                 else:
                     # 测试模式：简单回显
                     prompt = job["prompt"]

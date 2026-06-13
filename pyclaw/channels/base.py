@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+import time
 from typing import Any, AsyncGenerator, Callable, Optional
 
 from pyclaw.core.message import Message
@@ -13,6 +15,7 @@ class BaseChannel(ABC):
 
     def __init__(self) -> None:
         self._message_handler: Optional[Callable[[Message], Any]] = None
+        self._recent_source_message_ids: OrderedDict[str, float] = OrderedDict()
 
     @abstractmethod
     async def start(self) -> None:
@@ -62,3 +65,37 @@ class BaseChannel(ABC):
         """处理收到的消息"""
         if self._message_handler:
             await self._message_handler(message)
+
+    def _remember_source_message_id(
+        self,
+        source_message_id: str,
+        *,
+        ttl_seconds: int = 600,
+        max_entries: int = 1024,
+    ) -> bool:
+        """Record a source-platform message id and report whether it is new.
+
+        Some push/polling channels can redeliver the same source message after a
+        timeout or reconnect. Without a lightweight idempotency guard one user
+        message can start multiple Agent loops. Returns ``True`` for the first
+        time an id is seen and ``False`` for duplicates.
+        """
+        if not source_message_id:
+            return True
+
+        now = time.monotonic()
+        cutoff = now - ttl_seconds
+        while self._recent_source_message_ids:
+            _, seen_at = next(iter(self._recent_source_message_ids.items()))
+            if seen_at >= cutoff:
+                break
+            self._recent_source_message_ids.popitem(last=False)
+
+        if source_message_id in self._recent_source_message_ids:
+            self._recent_source_message_ids.move_to_end(source_message_id)
+            return False
+
+        self._recent_source_message_ids[source_message_id] = now
+        while len(self._recent_source_message_ids) > max_entries:
+            self._recent_source_message_ids.popitem(last=False)
+        return True

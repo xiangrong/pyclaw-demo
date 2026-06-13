@@ -253,6 +253,14 @@ class CronJobTool(BaseTool):
 
                 job = trigger_job(str(job_id))
                 if job:
+                    if job.get("state") == "running":
+                        return ToolResult(
+                            success=False,
+                            content=(
+                                f"⏳ 任务正在执行中，未重复触发: {job_id} "
+                                f"({job.get('name', 'Unnamed')})"
+                            ),
+                        )
                     return ToolResult(success=True, content=f"🔔 任务已标记为立即执行: {job_id} ({job.get('name', 'Unnamed')})")
                 return ToolResult(success=False, content=f"❌ 未找到任务: {job_id}")
 

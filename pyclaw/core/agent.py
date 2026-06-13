@@ -361,6 +361,8 @@ class Agent:
         consecutive_failures = 0 # 追踪连续工具失败次数
         pending_files = [] # 存储待发送的文件信息
         all_responses = [] # 存储所有周期的文本回复
+        tool_call_count = 0
+        tool_name_counts: dict[str, int] = {}
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
@@ -422,6 +424,24 @@ class Agent:
 
             if has_tool_calls:
                 tool_calls = result["tool_calls"]
+                tool_call_count += len(tool_calls)
+
+                for tc in tool_calls:
+                    tool_name = tc.get("function", {}).get("name", "unknown")
+                    tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
+
+                if tool_call_count > 20:
+                    all_responses.append(
+                        "⚠️  工具调用次数过多，我已停止继续执行，避免重复触发任务或刷屏。"
+                    )
+                    break
+
+                repeated_tools = [name for name, count in tool_name_counts.items() if count > 8]
+                if repeated_tools:
+                    all_responses.append(
+                        f"⚠️  检测到工具重复调用过多（{', '.join(repeated_tools)}），我已停止继续执行。"
+                    )
+                    break
                 
                 # 循环检测与自我反思 (Self-Reflection)
                 tool_call_signature = str(tool_calls)

@@ -92,9 +92,16 @@ class FeishuChannel(BaseChannel):
                 # 发送者信息
                 open_id = sender.sender_id.open_id
                 sender_type = sender.sender_type
+                message_id = message.message_id
 
                 # 不处理机器人自己发的消息
                 if sender_type == "bot":
+                    return
+
+                # 飞书长连接/事件回调可能在重连或超时后重复投递同一条消息。
+                # 使用飞书原始 message_id 做幂等，避免一条用户消息启动多个 Agent loop。
+                if not self._remember_source_message_id(message_id):
+                    print(f"↩️ [飞书] 忽略重复消息: {message_id}")
                     return
 
                 # 权限检查
@@ -103,12 +110,11 @@ class FeishuChannel(BaseChannel):
                     return
 
                 # 给用户消息添加 OK 反应标签 - 表示已收到并处理
-                message_id = message.message_id
                 self._add_ok_reaction_sync(message_id)
 
                 # 创建消息
                 msg = Message(
-                    id=str(uuid.uuid4()),
+                    id=message_id or str(uuid.uuid4()),
                     channel="feishu",
                     channel_user_id=open_id,
                     user_id=open_id,
@@ -116,7 +122,7 @@ class FeishuChannel(BaseChannel):
                     type=m_type,
                     role=MessageRole.USER,
                     content=text,
-                    metadata={"file_path": file_path} if file_path else {},
+                    metadata={"file_path": file_path, "source_message_id": message_id} if file_path else {"source_message_id": message_id},
                 )
 
                 # 处理消息
