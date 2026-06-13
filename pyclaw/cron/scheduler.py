@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -190,7 +191,13 @@ async def run_job_with_agent(
 
         # 创建消息（用独立的cron会话，干净的上下文）
         # 在prompt前加强制前缀，明确告诉Agent这是定时任务执行
-        cron_prompt = f"【定时任务执行 - 请只执行以下任务，不要创建新任务，不要回复关于任务本身的说明】\n\n{prompt}"
+        cron_prompt = (
+            "【定时任务执行 - 请只执行以下任务，不要创建新任务，不要回复关于任务本身的说明】\n"
+            "硬性限制：最多进行少量必要查询；优先使用 2-3 个可靠来源；不要反复读取同一类网页；"
+            "terminal、cronjob、发邮件、发消息、写文件等有副作用工具在本任务中最多执行一次。"
+            "如果信息不足，请基于已获取内容输出简短结论，而不是继续无限搜索。\n\n"
+            f"{prompt}"
+        )
 
         message = Message(
             id=f"cron-{job_id}",
@@ -273,8 +280,12 @@ def tick(
                 if _global_agent is not None and _global_loop is not None:
                     coro = run_job_with_agent(job, _global_agent)
                     future = asyncio.run_coroutine_threadsafe(coro, _global_loop)
+                    timeout_seconds = 120
                     try:
-                        success, full_output, final_response, error = future.result(timeout=120)
+                        success, full_output, final_response, error = future.result(timeout=timeout_seconds)
+                    except FutureTimeoutError as e:
+                        future.cancel()
+                        raise TimeoutError(f"Cron job timed out after {timeout_seconds} seconds") from e
                     except Exception:
                         future.cancel()
                         raise

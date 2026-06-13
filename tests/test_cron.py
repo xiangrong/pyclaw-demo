@@ -102,3 +102,48 @@ def test_incomplete_agent_response_is_not_success():
     assert _is_incomplete_agent_response("⚠️  检测到工具重复调用过多（web_read），我已停止继续执行。")
     assert _is_incomplete_agent_response("⚠️  达到最大思考深度，我已停止继续调用工具，避免刷屏。")
     assert not _is_incomplete_agent_response("# 今日早报\n\n这里是完整结果。")
+
+
+def test_tick_records_readable_timeout_error(monkeypatch, tmp_path):
+    import concurrent.futures
+    from pyclaw.cron import scheduler
+
+    jobs_file = tmp_path / "jobs.json"
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path)
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", jobs_file)
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(scheduler, "LOCK_FILE", tmp_path / ".tick.lock")
+
+    job = cron_jobs.create_job(
+        prompt="Slow job",
+        schedule="every 1m",
+        name="slow job",
+    )
+    cron_jobs.trigger_job(job["id"])
+
+    class DummyFuture:
+        def result(self, timeout=None):
+            raise concurrent.futures.TimeoutError()
+
+        def cancel(self):
+            return True
+
+    monkeypatch.setattr(scheduler, "_global_agent", object())
+    monkeypatch.setattr(scheduler, "_global_loop", object())
+    def fake_run_coroutine_threadsafe(coro, loop):
+        coro.close()
+        return DummyFuture()
+
+    monkeypatch.setattr(
+        scheduler.asyncio,
+        "run_coroutine_threadsafe",
+        fake_run_coroutine_threadsafe,
+    )
+
+    scheduler.tick()
+
+    updated = cron_jobs.get_job(job["id"])
+    assert updated is not None
+    assert updated["last_status"] == "failed"
+    assert updated["last_error"] == "Cron job timed out after 120 seconds"

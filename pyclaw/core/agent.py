@@ -19,6 +19,22 @@ from pyclaw.core.system_prompt.models import LayerContext
 class Agent:
     """Agent核心类 - 支持规划、推理和指令驱动架构"""
 
+    SIDE_EFFECT_TOOL_NAMES = {
+        "terminal",
+        "cronjob",
+        "edit_file",
+        "write_file",
+        "delete_file",
+    }
+    SIDE_EFFECT_TOOL_KEYWORDS = (
+        "send_email",
+        "send_message",
+        "create",
+        "update",
+        "delete",
+        "trigger",
+    )
+
     def __init__(
         self,
         model_provider: BaseModelProvider,
@@ -356,13 +372,18 @@ class Agent:
 
     async def _agent_loop(self, session: Session) -> tuple[str, list[dict[str, Any]]]:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
-        max_iterations = self.max_iterations
+        is_cron_session = session.channel == "cron"
+        max_iterations = min(self.max_iterations, 10) if is_cron_session else self.max_iterations
+        max_tool_calls = 12 if is_cron_session else 20
+        repeated_tool_limit = 4 if is_cron_session else 8
+        side_effect_tool_limit = 1
         last_tool_calls = []  # 循环检测
         consecutive_failures = 0 # 追踪连续工具失败次数
         pending_files = [] # 存储待发送的文件信息
         all_responses = [] # 存储所有周期的文本回复
         tool_call_count = 0
         tool_name_counts: dict[str, int] = {}
+        side_effect_tool_counts: dict[str, int] = {}
 
         for i in range(max_iterations):
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
@@ -428,15 +449,33 @@ class Agent:
 
                 for tc in tool_calls:
                     tool_name = tc.get("function", {}).get("name", "unknown")
+                    tool_arguments = tc.get("function", {}).get("arguments", "")
                     tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
+                    if self._is_side_effect_tool_call(tool_name, tool_arguments):
+                        side_effect_tool_counts[tool_name] = side_effect_tool_counts.get(tool_name, 0) + 1
 
-                if tool_call_count > 20:
+                if tool_call_count > max_tool_calls:
                     return self._with_stop_notice(
                         all_responses,
                         "⚠️  工具调用次数过多，我已停止继续执行，避免重复触发任务或刷屏。",
                     ), pending_files
 
-                repeated_tools = [name for name, count in tool_name_counts.items() if count > 8]
+                repeated_side_effect_tools = [
+                    name
+                    for name, count in side_effect_tool_counts.items()
+                    if count > side_effect_tool_limit
+                ]
+                if repeated_side_effect_tools:
+                    return self._with_stop_notice(
+                        all_responses,
+                        (
+                            "⚠️  检测到副作用工具重复调用"
+                            f"（{', '.join(repeated_side_effect_tools)}），我已停止继续执行，"
+                            "避免重复触发任务、重复发消息或重复写入。"
+                        ),
+                    ), pending_files
+
+                repeated_tools = [name for name, count in tool_name_counts.items() if count > repeated_tool_limit]
                 if repeated_tools:
                     return self._with_stop_notice(
                         all_responses,
@@ -599,6 +638,39 @@ class Agent:
         if cleaned_responses:
             return "\n\n".join(cleaned_responses + [notice])
         return notice
+
+    def _is_side_effect_tool(self, tool_name: str) -> bool:
+        """Return True for tools that can mutate state or notify users.
+
+        These tools are intentionally budgeted more strictly than read-only
+        tools because repeating them can send duplicate notifications, trigger
+        cron jobs multiple times, or write files repeatedly.
+        """
+        normalized = tool_name.lower()
+        if normalized in self.SIDE_EFFECT_TOOL_NAMES:
+            return True
+        return any(keyword in normalized for keyword in self.SIDE_EFFECT_TOOL_KEYWORDS)
+
+    def _is_side_effect_tool_call(self, tool_name: str, arguments: Any) -> bool:
+        """Return True when a concrete tool call can cause external effects."""
+        normalized = tool_name.lower()
+        if normalized == "cronjob":
+            try:
+                args = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (TypeError, json.JSONDecodeError):
+                args = {}
+            action = str(args.get("action", "")).lower() if isinstance(args, dict) else ""
+            return action in {
+                "create",
+                "update",
+                "delete",
+                "pause",
+                "resume",
+                "trigger",
+                "disable",
+                "enable",
+            }
+        return self._is_side_effect_tool(tool_name)
 
     async def _summarize_and_compress_history(self, session: Session) -> None:
         """对过长的历史消息进行摘要并压缩"""

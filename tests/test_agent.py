@@ -112,19 +112,19 @@ async def test_agent_max_iterations():
     
     sessions = AsyncMock()
     
-    # Always returns a tool call to simulate infinite loop
+    # Always returns a read-only tool call to simulate infinite loop
     infinite_resp = {
         "content": "looping...",
         "__tool_calls__": True,
         "tool_calls": [{
             "id": "loop",
-            "function": {"name": "terminal", "arguments": '{"command": "ls"}'}
+            "function": {"name": "web_read", "arguments": '{"url": "https://example.com"}'}
         }]
     }
     model.chat.return_value = infinite_resp
     
     tools.execute_tool_calls.return_value = [
-        {"role": "tool", "tool_call_id": "loop", "name": "terminal", "content": "ok", "success": True, "metadata": {}}
+        {"role": "tool", "tool_call_id": "loop", "name": "web_read", "content": "ok", "success": True, "metadata": {}}
     ]
     
     session = MagicMock()
@@ -223,6 +223,134 @@ async def test_agent_repeated_tool_fuse_does_not_append_raw_observations():
     assert "工具重复调用过多" in response.content
     assert "OBSERVATION from" not in response.content
     assert "A very long raw web page observation" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_before_repeating_side_effect_tool():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.return_value = {
+        "content": "继续执行通知命令...",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "notify",
+            "function": {"name": "terminal", "arguments": '{"command": "notify"}'}
+        }]
+    }
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "notify",
+            "name": "terminal",
+            "content": "notification sent",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-side-effect"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-side-effect", channel="cron", channel_user_id="job_1", session_id="s-side-effect",
+        type=MessageType.TEXT, role=MessageRole.USER, content="发送一次通知"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert "副作用工具重复调用" in response.content
+    assert "notification sent" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_allows_repeated_read_only_cronjob_list():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "查看任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "list1",
+                "function": {"name": "cronjob", "arguments": '{"action": "list"}'}
+            }],
+        },
+        {
+            "content": "再次确认任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "list2",
+                "function": {"name": "cronjob", "arguments": '{"action": "list"}'}
+            }],
+        },
+        {"content": "任务状态已确认。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "list",
+            "name": "cronjob",
+            "content": "[]",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-list"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-list", channel="telegram", channel_user_id="u1", session_id="s-cron-list",
+        type=MessageType.TEXT, role=MessageRole.USER, content="看看任务状态"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "任务状态已确认。"
 
 
 @pytest.mark.asyncio
