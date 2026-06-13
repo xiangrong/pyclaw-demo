@@ -224,6 +224,46 @@ class TelegramChannel(BaseChannel):
 
         text = re.sub(r"```(?:([\w+-]+)\n)?(.*?)```", compact_code_block, text, flags=re.DOTALL)
 
+        def is_code_like_line(line: str) -> bool:
+            stripped = line.strip()
+            if not stripped or len(stripped) > 200:
+                return False
+            if stripped.startswith(("`", "#", "- ", "* ", ">", "|")):
+                return False
+            if re.match(r"^\d+[.)]\s", stripped):
+                return False
+
+            command_pattern = r"^(?:print|python3?|pip3?|git|curl|npm|pnpm|yarn|uv|pytest|docker|kubectl|osascript)\b"
+            if re.match(command_pattern, stripped):
+                return True
+
+            # Standalone identifiers / snippets used in explanations, e.g.
+            # provider.name, provider.name = "brave", provider=brave.
+            if re.match(r"^[A-Za-z_][\w.]*\s*=\s*.+$", stripped):
+                return True
+            if re.match(r"^[A-Za-z_][\w.]*$", stripped) and "." in stripped:
+                return True
+
+            # Function calls and f-string/code fragments often contain Python
+            # dunder names such as __name__; wrap them before Markdown parsing
+            # so Telegram does not turn them into bold text.
+            return bool(re.match(r"^[A-Za-z_][\w.]*\(.*\)$", stripped))
+
+        lines = []
+        in_code_block = False
+        for line in text.splitlines():
+            if line.strip().startswith("```"):
+                in_code_block = not in_code_block
+                lines.append(line)
+                continue
+            if not in_code_block and is_code_like_line(line):
+                leading = line[: len(line) - len(line.lstrip())]
+                trailing = line[len(line.rstrip()) :]
+                lines.append(f"{leading}`{line.strip()}`{trailing}")
+            else:
+                lines.append(line)
+        text = "\n".join(lines)
+
         # 常见验证结果短语压缩成移动端更醒目的形式。
         text = re.sub(r"结果[：:]?\s*通过[。.!]?", "结果：✅ 通过", text)
         text = re.sub(r"语法检查[：:]?\s*✅?\s*通过", "语法检查：✅ 通过", text)
@@ -260,9 +300,21 @@ class TelegramChannel(BaseChannel):
         text = re.sub(r"`(.*?)`", save_inline_code, text)
 
         # 5. 其他 Markdown 语法转换
+        # 标题：Telegram 不支持 Markdown 标题，转为粗体，避免原样展示 ##/###。
+        text = re.sub(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", r"<b>\1</b>", text)
+        # 分隔线：原样的 --- 在聊天里噪声较大，转成更清晰的细分隔线。
+        text = re.sub(r"(?m)^\s*---+\s*$", "────────", text)
         # 加粗
         text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
-        text = re.sub(r"__(.*?)__", r"<b>\1</b>", text)
+
+        def replace_underscore_bold(match):
+            content = match.group(1)
+            # Do not treat Python dunder identifiers like __name__ as Markdown.
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", content):
+                return match.group(0)
+            return f"<b>{content}</b>"
+
+        text = re.sub(r"__(.*?)__", replace_underscore_bold, text)
         # 斜体
         text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
         # 不处理 _italic_，避免误伤文件名、变量名和路径中的下划线。
@@ -383,7 +435,7 @@ class TelegramChannel(BaseChannel):
 
             # 流式结束，确保最后更新一次并格式化为 HTML
             if full_content.strip():
-                formatted_final = self._format_markdown(full_content)
+                formatted_final = self._format_markdown(self._format_telegram_readable(full_content))
                 try:
                     await self._app.bot.edit_message_text(
                         chat_id=chat_id,
@@ -405,7 +457,7 @@ class TelegramChannel(BaseChannel):
             print(f"⚠️ Stream error: {e}")
             # 出错时尝试发送完整内容
             if full_content.strip():
-                formatted_error = self._format_markdown(full_content)
+                formatted_error = self._format_markdown(self._format_telegram_readable(full_content))
                 try:
                     await self._app.bot.edit_message_text(
                         chat_id=chat_id,

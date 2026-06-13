@@ -940,3 +940,37 @@ def test_telegram_markdown_does_not_italicize_underscores():
     assert "foo_bar_baz" in formatted
     assert "<i>" not in formatted
     assert "<code>inline_code</code>" in formatted
+
+
+def test_telegram_formatter_wraps_code_explanation_lines():
+    from pyclaw.channels.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+    source = '''## 拆解这行代码
+
+print(f"🔎 [web_search] provider={provider.name} failed: {type(e).__name__}: {e}")
+
+### 1. {provider.name}
+
+provider.name
+
+假设：
+
+provider.name = "brave"
+
+---
+
+### 2. {type(e).__name__}
+'''
+
+    readable = channel._format_telegram_readable(source)
+    formatted = channel._format_markdown(readable)
+
+    assert "<b>拆解这行代码</b>" in formatted
+    assert "<b>1. {provider.name}</b>" in formatted
+    assert '<code>print(f"🔎 [web_search] provider={provider.name} failed: {type(e).__name__}: {e}")</code>' in formatted
+    assert "<code>provider.name</code>" in formatted
+    assert '<code>provider.name = "brave"</code>' in formatted
+    assert "type(e).<b>name</b>" not in formatted
+    assert "##" not in formatted
+    assert "###" not in formatted
