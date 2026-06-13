@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import shlex
 import time
 from datetime import datetime
 from typing import Optional, Any
@@ -803,8 +805,11 @@ class Agent:
 
         Multiple distinct cron triggers in one user-requested batch are valid,
         so cronjob is keyed by action and job id instead of only by tool name.
-        Terminal remains keyed only by tool name because repeated shell side
-        effects commonly mean duplicate notifications or duplicate writes.
+        Terminal calls are keyed by a hash of the concrete command instead of
+        only by tool name. This still blocks the same shell side effect from
+        being repeated, but it does not stop legitimate multi-step CLI
+        workflows, such as opening an authenticated browser page and then
+        inspecting its state. Known read-only terminal commands are exempt.
         """
         normalized = tool_name.lower()
         if normalized == "cronjob":
@@ -826,9 +831,116 @@ class Agent:
                 return None
             job_id = str(args.get("job_id", "")) if isinstance(args, dict) else ""
             return f"cronjob:{action}:{job_id or '<no-job-id>'}"
+        if normalized == "terminal":
+            return self._terminal_side_effect_call_key(arguments)
         if self._is_side_effect_tool(tool_name):
             return normalized
         return None
+
+    def _terminal_side_effect_call_key(self, arguments: Any) -> Optional[str]:
+        """Return a repeat key for terminal calls, or None for safe reads."""
+        if self._is_read_only_terminal_call(arguments):
+            return None
+        command = self._extract_terminal_command(arguments)
+        if not command:
+            return "terminal:<unknown>"
+        normalized_command = " ".join(command.split())
+        digest = hashlib.sha256(normalized_command.encode("utf-8")).hexdigest()[:12]
+        return f"terminal:{digest}"
+
+    def _extract_terminal_command(self, arguments: Any) -> str:
+        """Extract the shell command from terminal tool arguments."""
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (TypeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(args, dict):
+            return ""
+        return str(args.get("command", "")).strip()
+
+    def _is_read_only_terminal_call(self, arguments: Any) -> bool:
+        """Return True for terminal commands that are known to be read-only.
+
+        This deliberately uses a small allowlist. The terminal tool can perform
+        arbitrary side effects, but some authenticated services are only exposed
+        through local CLIs. Treating those safe read commands as non-side-effect
+        avoids false positives such as `lark-cli wiki spaces get_node` followed
+        by `lark-cli docs +fetch` when reading a private Lark wiki article.
+        """
+        command = self._extract_terminal_command(arguments)
+        if not command:
+            return False
+
+        # Do not mark compound shell snippets, redirects, pipes, substitutions,
+        # or background jobs as read-only; those should keep the stricter
+        # terminal repeat guard.
+        if re.search(r"[;&|<>`]", command) or "$" in command:
+            return False
+
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
+        if not parts:
+            return False
+
+        return self._is_read_only_lark_cli(parts)
+
+    def _is_read_only_lark_cli(self, parts: list[str]) -> bool:
+        """Return True for allowlisted read-only lark-cli commands."""
+        if os.path.basename(parts[0]) != "lark-cli":
+            return False
+        if len(parts) < 2:
+            return False
+
+        service = parts[1]
+        rest = parts[2:]
+        read_verbs = {
+            "+fetch",
+            "+search",
+            "+get",
+            "+list",
+            "fetch",
+            "get",
+            "list",
+            "search",
+            "info",
+            "schema",
+            "whoami",
+        }
+        mutating_verbs = {
+            "+create",
+            "+update",
+            "+delete",
+            "+send",
+            "+reply",
+            "+forward",
+            "create",
+            "update",
+            "delete",
+            "send",
+            "reply",
+            "forward",
+            "upload",
+            "move",
+            "copy",
+            "auth",
+        }
+
+        if service in {"docs", "doc", "wiki"}:
+            if not rest:
+                return False
+            if any(part in mutating_verbs for part in rest):
+                return False
+            if rest[0] in read_verbs:
+                return True
+            # Native-style read commands, e.g. `lark-cli wiki spaces get_node`.
+            return any(part in read_verbs for part in rest)
+
+        if service in {"schema", "whoami"}:
+            return True
+
+        return False
 
     async def _summarize_and_compress_history(self, session: Session) -> None:
         """对过长的历史消息进行摘要并压缩"""
@@ -922,11 +1034,16 @@ class Agent:
                 f"任务结果：\n{final_response}"
             )
             
-            messages = history + [{"role": "user", "content": summary_prompt}]
+            messages = self._sanitize_history_for_memory_summary(history) + [
+                {"role": "user", "content": summary_prompt}
+            ]
             
             # 使用模型生成摘要 (不使用工具)
             experience_content = await self.model.chat(messages=messages, tools=None)
             
+            if isinstance(experience_content, dict):
+                experience_content = str(experience_content.get("content", "")).strip()
+
             if experience_content:
                 metadata = {
                     "type": "experience",
@@ -938,6 +1055,66 @@ class Agent:
 
         except Exception as e:
             print(f"⚠️ [Memory] Failed to extract experience: {e}")
+
+    def _sanitize_history_for_memory_summary(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert internal chat history to plain text messages for memory summarization.
+
+        The experience extractor calls the chat model without tools. Some model
+        adapters treat dict content as multimodal payloads; forwarding internal
+        tool-call dictionaries such as `{"__tool_calls__": ..., "tool_calls": ...}`
+        can therefore fail with "unrecognized modality keys". This method keeps
+        the useful trajectory while ensuring every message content is text-only.
+        """
+        sanitized: list[dict[str, Any]] = []
+        for msg in history:
+            role = str(msg.get("role", "user"))
+            if role not in {"system", "user", "assistant", "tool"}:
+                role = "user"
+
+            content = self._stringify_memory_message_content(msg.get("content", ""))
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                content = f"{content}\n[Tool calls]\n{json.dumps(tool_calls, ensure_ascii=False)}".strip()
+
+            if role == "tool":
+                tool_name = msg.get("name") or msg.get("tool_name") or "unknown"
+                content = f"Tool {tool_name} result:\n{content}".strip()
+                # Tool messages without matching assistant tool_calls are invalid
+                # for OpenAI-style chat requests. As a summarization transcript,
+                # they are safer and equally useful as user-role text.
+                role = "user"
+
+            sanitized.append({"role": role, "content": content})
+        return sanitized
+
+    def _stringify_memory_message_content(self, content: Any) -> str:
+        """Return text-only content safe for chat/memory summarization calls."""
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if isinstance(content, dict):
+            if "content" in content and isinstance(content.get("content"), str):
+                text = content["content"]
+                tool_calls = content.get("tool_calls")
+                if tool_calls:
+                    text = f"{text}\n[Tool calls]\n{json.dumps(tool_calls, ensure_ascii=False)}".strip()
+                return text
+            return json.dumps(content, ensure_ascii=False)
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                    elif item.get("type") == "text" and isinstance(item.get("content"), str):
+                        parts.append(item["content"])
+                    else:
+                        parts.append(json.dumps(item, ensure_ascii=False))
+                else:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        return str(content)
 
 
     async def _update_session_state(self, session: Session, content: str) -> None:

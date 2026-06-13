@@ -466,6 +466,85 @@ async def test_agent_stops_before_repeating_side_effect_tool():
 
 
 @pytest.mark.asyncio
+async def test_agent_allows_distinct_terminal_commands_without_repeat_guard():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "打开页面...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "open",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({
+                        "command": "opencli browser open https://example.larkoffice.com/wiki/WIKI_TOKEN_EXAMPLE",
+                        "timeout": 30,
+                    }),
+                },
+            }],
+        },
+        {
+            "content": "查看页面状态...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "state",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "opencli browser state", "timeout": 30}),
+                },
+            }],
+        },
+        {"content": "页面状态已读取。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "terminal",
+            "name": "terminal",
+            "content": "ok",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-distinct"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-distinct", channel="telegram", channel_user_id="u1", session_id="s-terminal-distinct",
+        type=MessageType.TEXT, role=MessageRole.USER, content="打开并读取页面",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "页面状态已读取。"
+    assert "副作用工具重复调用" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_agent_allows_repeated_read_only_cronjob_list():
     model = AsyncMock()
     tools = MagicMock()
@@ -532,6 +611,89 @@ async def test_agent_allows_repeated_read_only_cronjob_list():
 
     assert tools.execute_tool_calls.call_count == 2
     assert response.content == "任务状态已确认。"
+
+
+@pytest.mark.asyncio
+async def test_agent_allows_multiple_read_only_lark_cli_terminal_calls():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "先查 wiki 元数据...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "wiki_meta",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({
+                        "command": "lark-cli wiki spaces get_node --params '{\"token\":\"WIKI_TOKEN_EXAMPLE\"}'",
+                        "timeout": 15,
+                    }),
+                },
+            }],
+        },
+        {
+            "content": "再读取正文...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "doc_fetch",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({
+                        "command": "lark-cli docs +fetch --api-version v2 --doc https://example.larkoffice.com/wiki/WIKI_TOKEN_EXAMPLE --doc-format markdown",
+                        "timeout": 30,
+                    }),
+                },
+            }],
+        },
+        {"content": "文章已读完。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lark",
+            "name": "terminal",
+            "content": "ok",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-lark-read"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-lark-read", channel="telegram", channel_user_id="u1", session_id="s-lark-read",
+        type=MessageType.TEXT, role=MessageRole.USER,
+        content="你给我阅读这篇文章 https://example.larkoffice.com/wiki/WIKI_TOKEN_EXAMPLE",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "文章已读完。"
+    assert "副作用工具重复调用" not in response.content
 
 
 @pytest.mark.asyncio
