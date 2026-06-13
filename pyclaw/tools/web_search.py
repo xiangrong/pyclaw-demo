@@ -204,10 +204,15 @@ class WebSearchTool(BaseTool):
     )
     args_schema = WebSearchArgs
 
-    def __init__(self, providers: list[SearchProvider] | None = None) -> None:
+    def __init__(
+        self,
+        providers: list[SearchProvider] | None = None,
+        tavily_api_key: str | None = None,
+        brave_api_key: str | None = None,
+    ) -> None:
         self.providers = providers or [
-            TavilySearchProvider(),
-            BraveSearchProvider(),
+            TavilySearchProvider(api_key=tavily_api_key),
+            BraveSearchProvider(api_key=brave_api_key),
             DDGSSearchProvider(),
         ]
 

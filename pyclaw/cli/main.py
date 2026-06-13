@@ -112,7 +112,10 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(WriteFileTool())
         from pyclaw.tools.python_interpreter import PythonInterpreterTool
         tool_registry.register(PythonInterpreterTool())
-        tool_registry.register(WebSearchTool())
+        tool_registry.register(WebSearchTool(
+            tavily_api_key=cfg.web_search.tavily_api_key,
+            brave_api_key=cfg.web_search.brave_api_key,
+        ))
         tool_registry.register(WebReadTool())
         tool_registry.register(CronJobTool())
         tool_registry.register(ActivateSkillTool())
@@ -276,7 +279,10 @@ def cron_exec(
         tool_registry.register(WriteFileTool())
         from pyclaw.tools.python_interpreter import PythonInterpreterTool
         tool_registry.register(PythonInterpreterTool())
-        tool_registry.register(WebSearchTool())
+        tool_registry.register(WebSearchTool(
+            tavily_api_key=cfg.web_search.tavily_api_key,
+            brave_api_key=cfg.web_search.brave_api_key,
+        ))
         tool_registry.register(WebReadTool())
         tool_registry.register(ActivateSkillTool())
         tool_registry.register(ListSkillsTool())
@@ -415,6 +421,13 @@ model:
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   # 模型名称
   model: "ep-xxxxxxxxx"
+
+# 搜索 Provider 配置 (可选；未配置时 web_search 会回退到 DDGS)
+web_search:
+  # Tavily API Key (推荐，面向 Agent/RAG 的搜索)
+  tavily_api_key: ""
+  # Brave Search API Key (备用搜索)
+  brave_api_key: ""
 
 # 工作目录 (Agent执行命令的默认目录)
 work_dir: "~/pyclaw"

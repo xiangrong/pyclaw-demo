@@ -41,6 +41,11 @@ class ModelConfig(BaseModel):
     embedding_api_key: Optional[str] = None
 
 
+class WebSearchConfig(BaseModel):
+    tavily_api_key: Optional[str] = None
+    brave_api_key: Optional[str] = None
+
+
 class SandboxConfig(BaseModel):
     enabled: bool = False
     image: str = "python:3.10-slim"
@@ -54,6 +59,7 @@ class Config(BaseModel):
     wechat: Optional[WechatConfig] = None
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     model: ModelConfig
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
     config_dir: Optional[str] = None

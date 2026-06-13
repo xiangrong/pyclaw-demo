@@ -88,3 +88,10 @@ async def test_web_search_provider_error_falls_back_in_auto_mode():
     assert "tavily: RuntimeError: boom" in result.metadata["fallback_errors"]
     assert tavily.calls == 1
     assert ddgs.calls == 1
+
+
+def test_web_search_tool_passes_config_keys_to_default_providers():
+    tool = WebSearchTool(tavily_api_key="tavily-key", brave_api_key="brave-key")
+
+    assert tool.providers[0].api_key == "tavily-key"
+    assert tool.providers[1].api_key == "brave-key"
