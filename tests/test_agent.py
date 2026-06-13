@@ -163,6 +163,66 @@ async def test_agent_max_iterations():
     # Should stop after max_iterations = 5
     assert model.chat.call_count == 5
     assert "达到最大思考深度" in response.content or "⚠️  思考超时" in response.content
+    assert "OBSERVATION from" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_repeated_tool_fuse_does_not_append_raw_observations():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.return_value = {
+        "content": "继续读取网页...",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "read-loop",
+            "function": {"name": "web_read", "arguments": '{"url": "https://example.com"}'}
+        }]
+    }
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "read-loop",
+            "name": "web_read",
+            "content": "A very long raw web page observation",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-repeated-tool"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-repeated-tool", channel="telegram", channel_user_id="u1", session_id="s-repeated-tool",
+        type=MessageType.TEXT, role=MessageRole.USER, content="查一下"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "工具重复调用过多" in response.content
+    assert "OBSERVATION from" not in response.content
+    assert "A very long raw web page observation" not in response.content
 
 
 @pytest.mark.asyncio

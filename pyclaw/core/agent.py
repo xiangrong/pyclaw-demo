@@ -431,17 +431,17 @@ class Agent:
                     tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
 
                 if tool_call_count > 20:
-                    all_responses.append(
-                        "⚠️  工具调用次数过多，我已停止继续执行，避免重复触发任务或刷屏。"
-                    )
-                    break
+                    return self._with_stop_notice(
+                        all_responses,
+                        "⚠️  工具调用次数过多，我已停止继续执行，避免重复触发任务或刷屏。",
+                    ), pending_files
 
                 repeated_tools = [name for name, count in tool_name_counts.items() if count > 8]
                 if repeated_tools:
-                    all_responses.append(
-                        f"⚠️  检测到工具重复调用过多（{', '.join(repeated_tools)}），我已停止继续执行。"
-                    )
-                    break
+                    return self._with_stop_notice(
+                        all_responses,
+                        f"⚠️  检测到工具重复调用过多（{', '.join(repeated_tools)}），我已停止继续执行，避免刷屏。",
+                    ), pending_files
                 
                 # 循环检测与自我反思 (Self-Reflection)
                 tool_call_signature = str(tool_calls)
@@ -586,7 +586,19 @@ class Agent:
                 
             return final_content, pending_files
 
-        return "\n\n".join(all_responses + [self._summarize_final(session)]), pending_files
+        return self._with_stop_notice(all_responses, self._summarize_final(session)), pending_files
+
+    def _with_stop_notice(self, responses: list[str], notice: str) -> str:
+        """Combine partial user-facing responses with a concise stop notice.
+
+        Do not append raw tool observations here. Tool observations are useful in
+        logs/history, but sending them to chat channels makes failures extremely
+        noisy and hard to read.
+        """
+        cleaned_responses = [r for r in responses if r and r.strip()]
+        if cleaned_responses:
+            return "\n\n".join(cleaned_responses + [notice])
+        return notice
 
     async def _summarize_and_compress_history(self, session: Session) -> None:
         """对过长的历史消息进行摘要并压缩"""
@@ -806,23 +818,25 @@ class Agent:
         return messages + [boundary_msg]
 
     def _summarize_final(self, session: Session) -> str:
-        """达到最大迭代次数时，强制总结已有的信息"""
+        """达到最大迭代次数时，返回简洁说明，避免泄露原始 Observation。"""
         messages = session.messages
         
-        # 收集所有工具返回的结果
-        tool_results = []
+        # 只收集工具名称，避免把大段网页/日志 Observation 直接刷到聊天通道。
+        tool_names = []
         for msg in messages:
             if msg.role == MessageRole.TOOL:
-                tool_results.append(msg.content)
+                tool_name = msg.metadata.get("tool_name")
+                if tool_name and tool_name not in tool_names:
+                    tool_names.append(tool_name)
         
-        if tool_results:
+        if tool_names:
             return (
-                "⚠️  达到最大思考深度，基于已获取的信息总结如下：\n\n"
-                + "\n\n---\n\n".join(tool_results[-2:])  # 只取最后两个结果
-                + "\n\n💡 提示：可以尝试更简单的问题，或者分步骤询问"
-            )
-        else:
-            return (
-                "⚠️  思考超时，未能完成任务。\n\n"
+                "⚠️  达到最大思考深度，我已停止继续调用工具，避免刷屏。\n\n"
+                f"最后涉及工具：{', '.join(tool_names[-5:])}\n"
                 "💡 建议：简化问题描述，或者分步骤询问。"
             )
+
+        return (
+            "⚠️  思考超时，未能完成任务。\n\n"
+            "💡 建议：简化问题描述，或者分步骤询问。"
+        )

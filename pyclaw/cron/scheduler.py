@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 # 静默标记
 SILENT_MARKER = "[SILENT]"
+CRON_STOP_MARKERS = (
+    "工具调用次数过多",
+    "工具重复调用过多",
+    "达到最大思考深度",
+    "思考超时",
+    "连续多次工具调用失败",
+)
 
 # 全局Agent引用（由Gateway设置）
 _global_agent = None
@@ -205,12 +212,22 @@ async def run_job_with_agent(
             final_response = str(response)
 
         full_output = f"# Cron Job Execution: {job_id}\n\nPrompt: {prompt}\n\nResponse: {final_response}"
-        return True, full_output, final_response, None
+        error = None
+        success = True
+        if _is_incomplete_agent_response(final_response):
+            success = False
+            error = "Agent stopped before producing a complete cron result"
+        return success, full_output, final_response, error
 
     except Exception as e:
         error = f"Execution error: {e}"
         logger.exception("Job execution error")
         return False, error, error, error
+
+
+def _is_incomplete_agent_response(content: str) -> bool:
+    """Return True when an Agent response is a guardrail/timeout notice."""
+    return any(marker in content for marker in CRON_STOP_MARKERS)
 
 
 # ---------------------------------------------------------------------------

@@ -66,3 +66,11 @@ def test_mark_job_run_resets_running_state(monkeypatch, tmp_path):
     assert updated["state"] == "scheduled"
     assert updated["last_status"] == "failed"
     assert updated["last_error"] == "timeout"
+
+
+def test_incomplete_agent_response_is_not_success():
+    from pyclaw.cron.scheduler import _is_incomplete_agent_response
+
+    assert _is_incomplete_agent_response("⚠️  检测到工具重复调用过多（web_read），我已停止继续执行。")
+    assert _is_incomplete_agent_response("⚠️  达到最大思考深度，我已停止继续调用工具，避免刷屏。")
+    assert not _is_incomplete_agent_response("# 今日早报\n\n这里是完整结果。")
