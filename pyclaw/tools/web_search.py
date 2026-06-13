@@ -235,22 +235,38 @@ class WebSearchTool(BaseTool):
         saw_configured_provider = False
         for provider in providers:
             if not provider.is_configured():
+                print(f"🔎 [web_search] provider={provider.name} skipped: not configured")
                 errors.append(f"{provider.name}: not configured")
                 continue
 
             saw_configured_provider = True
+            print(
+                f"🔎 [web_search] provider={provider.name} "
+                f"query={query!r} max_results={max_results} timeout={timeout}s"
+            )
             try:
                 results = await provider.search(query, max_results=max_results, timeout=timeout)
             except asyncio.TimeoutError:
+                print(f"🔎 [web_search] provider={provider.name} failed: timeout after {timeout}s")
                 errors.append(f"{provider.name}: timed out after {timeout} seconds")
                 continue
             except Exception as e:
+                print(f"🔎 [web_search] provider={provider.name} failed: {type(e).__name__}: {e}")
                 errors.append(f"{provider.name}: {type(e).__name__}: {e}")
                 continue
 
             if not results:
+                print(f"🔎 [web_search] provider={provider.name} returned no results")
                 errors.append(f"{provider.name}: no results")
                 continue
+
+            if errors:
+                print(
+                    f"🔎 [web_search] provider={provider.name} succeeded "
+                    f"after fallback: {' | '.join(errors)}"
+                )
+            else:
+                print(f"🔎 [web_search] provider={provider.name} succeeded")
 
             return ToolResult(
                 success=True,
