@@ -49,7 +49,10 @@ def test_session_history_with_summary():
     assert len(history) == 7
     assert history[0]["role"] == "system"
     assert history[1]["role"] == "system"
-    assert "PREVIOUS CONVERSATION SUMMARY" in history[1]["content"]
+    assert "<read_only_conversation_summary>" in history[1]["content"]
+    assert "NOT a new user request" in history[1]["content"]
+    assert "MUST NOT be executed" in history[1]["content"]
+    assert "We talked about AI." in history[1]["content"]
     assert history[-1]["content"] == "Msg 14"
 
 @pytest.mark.asyncio

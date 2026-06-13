@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from pydantic import ValidationError
+
 from .base import BaseTool, ToolResult
 
 
@@ -118,7 +120,22 @@ class ToolRegistry:
                 success=False,
                 content=f"Tool not found: {tool_name}",
             )
-        return await tool.execute(**kwargs)
+
+        try:
+            validated_args = tool.args_schema.model_validate(kwargs)
+        except ValidationError as e:
+            return ToolResult(
+                success=False,
+                content=f"Invalid arguments for tool '{tool_name}': {e}",
+            )
+
+        try:
+            return await tool.execute(**validated_args.model_dump())
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                content=f"Tool '{tool_name}' raised an exception: {type(e).__name__}: {e}",
+            )
 
     async def execute_tool_calls(self, message_data: str) -> list[dict[str, Any]]:
         """执行LLM返回的工具调用列表"""
@@ -130,16 +147,25 @@ class ToolRegistry:
 
         results: list[dict[str, Any]] = []
         for tc in tool_calls:
-            tool_name = tc["function"]["name"]
+            tool_name = tc.get("function", {}).get("name", "unknown")
+            call_id = tc.get("id", f"call_{tool_name}")
+
             try:
-                args = json.loads(tc["function"]["arguments"])
+                args = json.loads(tc.get("function", {}).get("arguments", "{}"))
             except json.JSONDecodeError:
-                args = {}
+                results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                        "content": f"Invalid JSON arguments for tool '{tool_name}'.",
+                        "success": False,
+                        "metadata": {},
+                    }
+                )
+                continue
 
             result = await self.execute(tool_name, **args)
-
-            # 获取真实的 tool_call_id（来自 LLM 响应）
-            call_id = tc.get("id", f"call_{tool_name}")
 
             results.append(
                 {

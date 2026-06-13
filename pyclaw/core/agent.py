@@ -263,8 +263,8 @@ class Agent:
             user_id=message.channel_user_id,
         )
 
-        # 检查是否是 /new 指令
-        if message.content.strip().lower() == "/new":
+        # 检查是否是 /new 或 /reset 指令
+        if message.content.strip().lower() in {"/new", "/reset"}:
             await self.sessions.clear_session(session)
             return Message(
                 id=f"response-{message.id}",
@@ -376,6 +376,7 @@ class Agent:
 
             # 获取历史消息
             messages = session.get_history()
+            messages = self._add_current_task_boundary(session, messages)
 
             # 判断是否是最后几次迭代，强制禁用工具
             is_final_iteration = i >= max_iterations - 2
@@ -465,14 +466,22 @@ class Agent:
                 )
                 await self.sessions.save_message(session, assistant_msg)
 
-                # 2. 执行工具调用
+                # 2. 执行工具调用。工具框架异常也转为 Observation，避免直接中断 Agent loop。
                 try:
                     tool_results = await self.tools.execute_tool_calls(
                         json.dumps(result)
                     )
                 except Exception as e:
-                    error_msg = f"⚠️  工具执行出错: {str(e)}"
-                    return "\n\n".join(all_responses + [error_msg]), []
+                    tool_results = [
+                        {
+                            "role": "tool",
+                            "tool_call_id": f"tool-execution-error-{i}",
+                            "name": "tool_executor",
+                            "content": f"Tool execution framework error: {type(e).__name__}: {e}",
+                            "success": False,
+                            "metadata": {},
+                        }
+                    ]
 
                 # 3. 将结果作为 Observation 添加到会话
                 any_failure = False
@@ -735,6 +744,46 @@ class Agent:
                 if marker in line:
                     return True
         return False
+
+    def _add_current_task_boundary(
+        self,
+        session: Session,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Mark the latest user message as the only active task for this turn.
+
+        History summaries and semantic memories are useful background, but they can
+        accidentally look like pending work. This lightweight boundary makes the
+        recency contract explicit right before the model call.
+        """
+        get_latest_user_message = getattr(session, "get_latest_user_message", None)
+        if callable(get_latest_user_message):
+            latest_user_msg = get_latest_user_message()
+        else:
+            latest_user_msg = None
+
+        if not isinstance(latest_user_msg, Message):
+            latest_user_msg = None
+            for msg in reversed(session.messages):
+                if msg.role == MessageRole.USER and not msg.id.startswith("reflection-"):
+                    latest_user_msg = msg
+                    break
+
+        if not latest_user_msg:
+            return messages
+
+        boundary_msg = {
+            "role": "system",
+            "content": (
+                "<current_task_boundary>\n"
+                "Only the latest user message below defines the current task. "
+                "Do not continue or execute any task mentioned only in summaries, "
+                "memories, or older turns unless this latest message explicitly asks for it.\n\n"
+                f"LATEST_USER_MESSAGE:\n{latest_user_msg.content}\n"
+                "</current_task_boundary>"
+            ),
+        }
+        return messages + [boundary_msg]
 
     def _summarize_final(self, session: Session) -> str:
         """达到最大迭代次数时，强制总结已有的信息"""

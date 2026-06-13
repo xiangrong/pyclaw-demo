@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from typing import Optional
@@ -120,19 +121,52 @@ class TelegramChannel(BaseChannel):
             return
 
         text = update.message.text or ""
-        if text == "/start":
+        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+
+        if command == "/start":
             await update.message.reply_text(
                 "👋 欢迎使用 PyClaw AI Agent！\n"
                 "有什么我可以帮你的吗？\n\n"
                 "我可以帮你执行命令、读写文件等任务。",
             )
-        elif text == "/help":
+        elif command == "/help":
             await update.message.reply_text(
                 "📖 可用命令：\n"
                 "/start - 开始使用\n"
                 "/help - 显示帮助\n"
-                "/clear - 清空会话历史",
+                "/new - 清空会话历史\n"
+                "/reset - 清空会话历史\n"
             )
+        elif command in {"/new", "/reset"}:
+            await self._handle_text_command(update, command)
+        else:
+            # Let the core Agent handle commands such as /new. Text messages that
+            # start with "/" are excluded from _on_message by ~filters.COMMAND,
+            # so without this fallback they are silently dropped here.
+            await self._on_message(update, context)
+
+    async def _handle_text_command(self, update: Update, command: str) -> None:
+        """将 Telegram 命令按文本消息转发给 Agent。"""
+        if not update.message or not update.effective_user:
+            return
+
+        user_id = update.effective_user.id
+        if self.allowed_user_ids and user_id not in self.allowed_user_ids:
+            await update.message.reply_text("❌ 你没有权限使用此Bot")
+            return
+
+        msg = Message(
+            id=str(uuid.uuid4()),
+            channel="telegram",
+            channel_user_id=str(user_id),
+            user_id=str(user_id),
+            session_id=f"telegram:{user_id}",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=command,
+        )
+
+        await self._handle_message(msg)
 
     async def send_message(self, message: Message) -> None:
         """发送消息到Telegram"""
@@ -140,7 +174,8 @@ class TelegramChannel(BaseChannel):
             return
 
         chat_id = int(message.channel_user_id)
-        formatted_text = self._format_markdown(message.content)
+        readable_text = self._format_telegram_readable(message.content)
+        formatted_text = self._format_markdown(readable_text)
 
         # 长消息分块发送，尽量在换行处切割
         chunks = self._split_message(formatted_text, 4000)
@@ -157,9 +192,45 @@ class TelegramChannel(BaseChannel):
                 # 回退方案：如果 HTML 解析失败，发送纯文本
                 await self._app.bot.send_message(
                     chat_id=chat_id,
-                    text=message.content[:4000],
+                    text=self._html_to_plain_text(chunk)[:4000],
                     parse_mode=None,
                 )
+
+    def _format_telegram_readable(self, text: str) -> str:
+        """压缩为更适合 Telegram 手机端阅读的 Markdown 文本。"""
+        import re
+
+        # Telegram 对长篇思维过程不友好，最终消息中隐藏内部 thought。
+        text = re.sub(r"<thought>.*?</thought>\s*", "", text, flags=re.DOTALL)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        def compact_code_block(match):
+            language = match.group(1) or ""
+            code = match.group(2).strip("\n")
+            lines = code.splitlines()
+            non_empty_lines = [line.strip() for line in lines if line.strip()]
+
+            # 单行命令/短文本用行内代码，避免 Telegram 上出现大片代码框。
+            if len(non_empty_lines) == 1 and len(non_empty_lines[0]) <= 160:
+                return f"`{non_empty_lines[0]}`"
+
+            max_lines = 12
+            if len(lines) > max_lines:
+                omitted = len(lines) - max_lines
+                code = "\n".join(lines[:max_lines]) + f"\n... 省略 {omitted} 行 ..."
+
+            language_suffix = language if language else ""
+            return f"```{language_suffix}\n{code}\n```"
+
+        text = re.sub(r"```(?:([\w+-]+)\n)?(.*?)```", compact_code_block, text, flags=re.DOTALL)
+
+        # 常见验证结果短语压缩成移动端更醒目的形式。
+        text = re.sub(r"结果[：:]?\s*通过[。.!]?", "结果：✅ 通过", text)
+        text = re.sub(r"语法检查[：:]?\s*✅?\s*通过", "语法检查：✅ 通过", text)
+
+        # 最多保留一个空行，减少 Telegram 内垂直滚动。
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     def _format_markdown(self, text: str) -> str:
         """将 Markdown 转换为 Telegram 兼容的 HTML 格式"""
@@ -175,7 +246,7 @@ class TelegramChannel(BaseChannel):
         code_blocks = []
         def save_code_block(match):
             code_blocks.append(match.group(1))
-            return f"___CODE_BLOCK_{len(code_blocks)-1}___"
+            return f"PYCLAWCODEBLOCK{len(code_blocks)-1}TOKEN"
         
         # 匹配 ```code```
         text = re.sub(r"```(?:\w+)?\n?(.*?)\n?```", save_code_block, text, flags=re.DOTALL)
@@ -184,7 +255,7 @@ class TelegramChannel(BaseChannel):
         inline_codes = []
         def save_inline_code(match):
             inline_codes.append(match.group(1))
-            return f"___INLINE_CODE_{len(inline_codes)-1}___"
+            return f"PYCLAWINLINECODE{len(inline_codes)-1}TOKEN"
         
         text = re.sub(r"`(.*?)`", save_inline_code, text)
 
@@ -194,17 +265,26 @@ class TelegramChannel(BaseChannel):
         text = re.sub(r"__(.*?)__", r"<b>\1</b>", text)
         # 斜体
         text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
-        text = re.sub(r"_(.*?)_", r"<i>\1</i>", text)
+        # 不处理 _italic_，避免误伤文件名、变量名和路径中的下划线。
         # 链接
         text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2">\1</a>', text)
 
         # 6. 还原代码块和行内代码
         for i, code in enumerate(inline_codes):
-            text = text.replace(f"___INLINE_CODE_{i}___", f"<code>{code}</code>")
+            text = text.replace(f"PYCLAWINLINECODE{i}TOKEN", f"<code>{code}</code>")
         for i, code in enumerate(code_blocks):
-            text = text.replace(f"___CODE_BLOCK_{i}___", f"<pre>{code}</pre>")
+            text = text.replace(f"PYCLAWCODEBLOCK{i}TOKEN", f"<pre>{code}</pre>")
 
         return text
+
+    def _html_to_plain_text(self, text: str) -> str:
+        """HTML 发送失败时降级为尽量干净的纯文本。"""
+        import html
+        import re
+
+        text = re.sub(r"<a\s+href=\"(.*?)\">(.*?)</a>", r"\2 (\1)", text)
+        text = re.sub(r"</?(?:b|i|code|pre|blockquote)>", "", text)
+        return html.unescape(text)
 
     def _split_message(self, text: str, max_len: int = 4000) -> list[str]:
         """将消息安全地切分为块，尽量不破坏 HTML 标签"""

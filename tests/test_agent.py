@@ -164,6 +164,115 @@ async def test_agent_max_iterations():
     assert model.chat.call_count == 5
     assert "达到最大思考深度" in response.content or "⚠️  思考超时" in response.content
 
+
+@pytest.mark.asyncio
+async def test_agent_converts_tool_executor_exception_to_observation():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock(side_effect=RuntimeError("executor down"))
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    first_resp = {
+        "content": "Need a tool",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "call1",
+            "function": {"name": "terminal", "arguments": '{"command": "pwd"}'}
+        }]
+    }
+    second_resp = {"content": "Recovered after tool executor failure."}
+    model.chat.side_effect = [first_resp, second_resp]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-tool-error"
+    session.channel = "t"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions)
+    user_msg = Message(
+        id="m-tool-error", channel="t", channel_user_id="u1", session_id="s-tool-error",
+        type=MessageType.TEXT, role=MessageRole.USER, content="Run pwd"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert model.chat.call_count == 2
+    second_call_messages = model.chat.call_args_list[1][1]["messages"]
+    tool_msg = next(m for m in second_call_messages if m["role"] == "tool")
+    assert "Tool execution framework error: RuntimeError: executor down" in tool_msg["content"]
+    assert response.content == "Recovered after tool executor failure."
+
+
+@pytest.mark.asyncio
+async def test_agent_adds_current_task_boundary_after_history_summary():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-boundary"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {"history_summary": "Previous pending task: implement /reset."}
+    session.get_history.side_effect = lambda limit=10: [
+        {"role": "system", "content": "I am PyClaw"},
+        {
+            "role": "system",
+            "content": (
+                "<read_only_conversation_summary>\n"
+                "Previous pending task: implement /reset.\n"
+                "</read_only_conversation_summary>"
+            ),
+        },
+        *[m.to_llm_format() for m in session.messages],
+    ]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+    model.chat.return_value = {"content": "这是在回答当前问题。"}
+
+    agent = Agent(model, tools, sessions)
+    user_msg = Message(
+        id="m-boundary", channel="telegram", channel_user_id="u1", session_id="s-boundary",
+        type=MessageType.TEXT, role=MessageRole.USER, content="这个问题又是为啥呢？"
+    )
+
+    await agent.process_message(user_msg)
+
+    first_call_messages = model.chat.call_args_list[0][1]["messages"]
+    boundary = first_call_messages[-1]
+    assert boundary["role"] == "system"
+    assert "<current_task_boundary>" in boundary["content"]
+    assert "Only the latest user message below defines the current task" in boundary["content"]
+    assert "这个问题又是为啥呢？" in boundary["content"]
+    assert "implement /reset" not in boundary["content"]
+
 @pytest.mark.asyncio
 async def test_agent_clear_session_on_new_command():
     model = AsyncMock()
@@ -199,3 +308,153 @@ async def test_agent_clear_session_on_new_command():
     
     # We should get a reset confirmation reply
     assert "会话已重置" in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_clear_session_on_reset_command():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.skills_dirs = []
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-reset"
+    session.channel = "t"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions)
+    user_msg = Message(
+        id="m-reset", channel="t", channel_user_id="u1", session_id="s-reset",
+        type=MessageType.TEXT, role=MessageRole.USER, content="/reset"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    sessions.clear_session.assert_called_once_with(session)
+    model.chat.assert_not_called()
+    assert "会话已重置" in response.content
+
+
+@pytest.mark.asyncio
+async def test_telegram_new_command_is_forwarded_to_agent():
+    from pyclaw.channels.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+    handled_messages = []
+
+    async def handle_message(message):
+        handled_messages.append(message)
+
+    channel.on_message(handle_message)
+
+    update = MagicMock()
+    update.message.text = "/new"
+    update.message.document = None
+    update.message.caption = None
+    update.effective_user.id = 12345
+    context = MagicMock()
+
+    await channel._on_command(update, context)
+
+    assert len(handled_messages) == 1
+    assert handled_messages[0].channel == "telegram"
+    assert handled_messages[0].channel_user_id == "12345"
+    assert handled_messages[0].session_id == "telegram:12345"
+    assert handled_messages[0].content == "/new"
+    update.message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_telegram_bot_qualified_new_command_is_forwarded_to_agent():
+    from pyclaw.channels.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+    handled_messages = []
+
+    async def handle_message(message):
+        handled_messages.append(message)
+
+    channel.on_message(handle_message)
+
+    update = MagicMock()
+    update.message.text = "/new@PyClawBot"
+    update.message.document = None
+    update.message.caption = None
+    update.effective_user.id = 12345
+    context = MagicMock()
+
+    await channel._on_command(update, context)
+
+    assert len(handled_messages) == 1
+    assert handled_messages[0].content == "/new"
+    update.message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_telegram_reset_command_is_forwarded_to_agent():
+    from pyclaw.channels.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+    handled_messages = []
+
+    async def handle_message(message):
+        handled_messages.append(message)
+
+    channel.on_message(handle_message)
+
+    update = MagicMock()
+    update.message.text = "/reset@PyClawBot"
+    update.message.document = None
+    update.message.caption = None
+    update.effective_user.id = 12345
+    context = MagicMock()
+
+    await channel._on_command(update, context)
+
+    assert len(handled_messages) == 1
+    assert handled_messages[0].content == "/reset"
+    update.message.reply_text.assert_not_called()
+
+
+def test_telegram_readable_formatter_compacts_single_line_code_blocks():
+    from pyclaw.channels.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+    source = """我也已经执行过语法检查：
+
+```bash
+python3 -m py_compile pyclaw/core/agent.py pyclaw/channels/telegram.py
+```
+
+结果通过。
+
+现在重启 Bot / 服务后，发送：
+
+```text
+/reset
+```
+"""
+
+    readable = channel._format_telegram_readable(source)
+
+    assert "```" not in readable
+    assert "`python3 -m py_compile pyclaw/core/agent.py pyclaw/channels/telegram.py`" in readable
+    assert "`/reset`" in readable
+    assert "结果：✅ 通过" in readable
+
+
+def test_telegram_markdown_does_not_italicize_underscores():
+    from pyclaw.channels.telegram import TelegramChannel
+
+    channel = TelegramChannel(token="test-token")
+
+    formatted = channel._format_markdown("检查 foo_bar_baz 和 `inline_code`。")
+
+    assert "foo_bar_baz" in formatted
+    assert "<i>" not in formatted
+    assert "<code>inline_code</code>" in formatted

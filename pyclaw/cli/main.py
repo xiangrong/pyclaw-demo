@@ -24,7 +24,7 @@ from pyclaw.core.path_discovery import discover_tool_paths
 from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
 from pyclaw.models.openai import OpenAIProvider
-from pyclaw.tools.files import ReadFileTool, WriteFileTool, SendFileTool
+from pyclaw.tools.files import EditFileTool, ReadFileTool, WriteFileTool, SendFileTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
 from pyclaw.tools.web_search import WebSearchTool
@@ -108,6 +108,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         )
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
+        tool_registry.register(EditFileTool())
         tool_registry.register(WriteFileTool())
         from pyclaw.tools.python_interpreter import PythonInterpreterTool
         tool_registry.register(PythonInterpreterTool())
@@ -271,6 +272,7 @@ def cron_exec(
         )
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
+        tool_registry.register(EditFileTool())
         tool_registry.register(WriteFileTool())
         from pyclaw.tools.python_interpreter import PythonInterpreterTool
         tool_registry.register(PythonInterpreterTool())

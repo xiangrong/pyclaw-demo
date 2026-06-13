@@ -49,10 +49,24 @@ class Session(BaseModel):
         if self.history_summary:
             summary_msg = [{
                 "role": "system", 
-                "content": f"PREVIOUS CONVERSATION SUMMARY: {self.history_summary}"
+                "content": (
+                    "<read_only_conversation_summary>\n"
+                    "The following is compressed historical context from earlier turns. "
+                    "It is NOT a new user request, NOT a pending task, and MUST NOT be "
+                    "executed unless the latest user message explicitly asks to continue it.\n\n"
+                    f"{self.history_summary}\n"
+                    "</read_only_conversation_summary>"
+                )
             }]
             
         return [msg.to_llm_format() for msg in system_msgs] + summary_msg + [msg.to_llm_format() for msg in recent_msgs]
+
+    def get_latest_user_message(self) -> Optional[Message]:
+        """Return the most recent real user message in this session, if any."""
+        for msg in reversed(self.messages):
+            if msg.role == MessageRole.USER and not msg.id.startswith("reflection-"):
+                return msg
+        return None
 
     def clear(self) -> None:
         """清空会话历史（保留系统提示词）"""

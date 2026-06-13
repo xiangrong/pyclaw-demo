@@ -37,3 +37,63 @@ def test_registry_gradual_exposure():
     names = [s["name"] for s in specs]
     assert "static_tool" in names
     assert "dynamic_skill" in names
+
+class RequiredArgs(BaseModel):
+    value: int
+
+class RequiredTool(BaseTool):
+    name = "required"
+    description = "Requires an integer value"
+    args_schema = RequiredArgs
+
+    async def execute(self, **kwargs):
+        return ToolResult(success=True, content=f"value={kwargs['value']}")
+
+class ExplodingTool(BaseTool):
+    name = "explode"
+    description = "Raises from execute"
+    args_schema = DummyArgs
+
+    async def execute(self, **kwargs):
+        raise RuntimeError("boom")
+
+@pytest.mark.asyncio
+async def test_registry_validates_tool_arguments():
+    registry = ToolRegistry()
+    registry.register(RequiredTool())
+
+    result = await registry.execute("required", description="unexpected")
+
+    assert result.success is False
+    assert "Invalid arguments for tool 'required'" in result.content
+
+@pytest.mark.asyncio
+async def test_registry_wraps_tool_exceptions_as_failed_results():
+    registry = ToolRegistry()
+    registry.register(ExplodingTool())
+
+    result = await registry.execute("explode")
+
+    assert result.success is False
+    assert "Tool 'explode' raised an exception" in result.content
+    assert "RuntimeError: boom" in result.content
+
+@pytest.mark.asyncio
+async def test_execute_tool_calls_reports_invalid_json_arguments():
+    registry = ToolRegistry()
+    registry.register(RequiredTool())
+
+    results = await registry.execute_tool_calls(
+        '{"tool_calls":[{"id":"call1","function":{"name":"required","arguments":"{"}}]}'
+    )
+
+    assert results == [
+        {
+            "role": "tool",
+            "tool_call_id": "call1",
+            "name": "required",
+            "content": "Invalid JSON arguments for tool 'required'.",
+            "success": False,
+            "metadata": {},
+        }
+    ]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import difflib
 from typing import Any
+
 from pydantic import BaseModel, Field
 
 from .base import BaseTool, ToolResult
@@ -70,6 +72,82 @@ class WriteFileTool(BaseTool):
             return ToolResult(success=False, content=str(e))
         except Exception as e:
             return ToolResult(success=False, content=f"Error writing file: {str(e)}")
+
+
+class EditFileArgs(BaseModel):
+    path: str = Field(description="Path to the file to edit")
+    old: str = Field(description="Exact text to replace")
+    new: str = Field(description="Replacement text")
+    expected_replacements: int = Field(
+        default=1,
+        ge=1,
+        description="Expected number of replacements; the edit is aborted if the count differs",
+    )
+
+
+class EditFileTool(BaseTool):
+    """安全地对文件做局部文本替换。"""
+
+    name = "edit_file"
+    description = (
+        "Safely edit a file by replacing an exact text snippet. Prefer this over "
+        "write_file for code changes. The edit is applied only when the old text "
+        "appears exactly expected_replacements times, and the result includes a diff."
+    )
+    args_schema = EditFileArgs
+
+    async def execute(self, **kwargs: str) -> ToolResult:
+        path = kwargs.get("path", "")
+        old = kwargs.get("old", "")
+        new = kwargs.get("new", "")
+        expected_replacements = int(kwargs.get("expected_replacements", 1))
+
+        if not old:
+            return ToolResult(success=False, content="Error editing file: 'old' must not be empty")
+
+        try:
+            safe_path = self.validate_path(path)
+            with open(safe_path, "r", encoding="utf-8", errors="replace") as f:
+                original = f.read()
+
+            actual_replacements = original.count(old)
+            if actual_replacements != expected_replacements:
+                return ToolResult(
+                    success=False,
+                    content=(
+                        "Error editing file: expected "
+                        f"{expected_replacements} replacement(s), found {actual_replacements}. "
+                        "No changes were made. Provide a more specific 'old' snippet or "
+                        "adjust expected_replacements."
+                    ),
+                )
+
+            edited = original.replace(old, new, expected_replacements)
+            with open(safe_path, "w", encoding="utf-8") as f:
+                f.write(edited)
+
+            diff = "".join(
+                difflib.unified_diff(
+                    original.splitlines(keepends=True),
+                    edited.splitlines(keepends=True),
+                    fromfile=f"{path} (before)",
+                    tofile=f"{path} (after)",
+                )
+            )
+            if len(diff) > 8000:
+                diff = diff[:8000] + "\n... diff truncated ..."
+
+            return ToolResult(
+                success=True,
+                content=f"File edited: {path}\nReplacements: {actual_replacements}\n\n{diff}",
+            )
+
+        except PermissionError as e:
+            return ToolResult(success=False, content=str(e))
+        except FileNotFoundError:
+            return ToolResult(success=False, content=f"File not found: {path}")
+        except Exception as e:
+            return ToolResult(success=False, content=f"Error editing file: {str(e)}")
 
 
 class SendFileArgs(BaseModel):
