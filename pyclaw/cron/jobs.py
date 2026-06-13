@@ -332,7 +332,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     due = []
 
     for job in load_jobs():
-        if not job.get("enabled", True):
+        if not job.get("enabled", True) and not job.get("manual_trigger", False):
             continue
 
         if job.get("state") == "running":
@@ -400,12 +400,17 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None):
     if not job:
         return
 
-    updates = {
+    updates: Dict[str, Any] = {
         "last_run_at": _now().isoformat(),
         "last_status": "success" if success else "failed",
         "last_error": error,
         "state": "scheduled",
+        "manual_trigger": False,
     }
+
+    if job.get("manual_trigger") and "restore_enabled" in job:
+        updates["enabled"] = bool(job.get("restore_enabled"))
+        updates["restore_enabled"] = None
 
     # 更新完成计数
     repeat = job.get("repeat") or {}
@@ -473,10 +478,16 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     if job.get("state") == "running":
         return job
 
-    return update_job(job_id, {
+    updates: Dict[str, Any] = {
         "next_run_at": _now().isoformat(),
         "state": "scheduled",
-    })
+        "manual_trigger": True,
+    }
+
+    if not job.get("enabled", True):
+        updates["restore_enabled"] = False
+
+    return update_job(job_id, updates)
 
 
 def save_job_output(job_id: str, output: str) -> str:
