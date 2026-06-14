@@ -848,6 +848,17 @@ class Agent:
             }:
                 return None
             job_id = str(args.get("job_id", "")) if isinstance(args, dict) else ""
+            if action == "create" and isinstance(args, dict):
+                name = str(args.get("name", "")).strip()
+                schedule = str(args.get("schedule", "")).strip()
+                prompt = str(args.get("prompt", "")).strip()
+                create_fingerprint = json.dumps(
+                    {"name": name, "schedule": schedule, "prompt": prompt},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                digest = hashlib.sha256(create_fingerprint.encode("utf-8")).hexdigest()[:12]
+                return f"cronjob:create:{digest}"
             return f"cronjob:{action}:{job_id or '<no-job-id>'}"
         if normalized == "terminal":
             return self._terminal_side_effect_call_key(arguments)

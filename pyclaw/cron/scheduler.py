@@ -184,6 +184,7 @@ async def run_job_with_agent(
         job_id = job["id"]
         prompt = job["prompt"]
         origin = job.get("origin", {})
+        platform = str(origin.get("platform", "")).lower()
 
         # 创建任务专用的独立会话（不要用户普通会话的历史上下文）
         # 避免会话历史干扰，让Agent专注于执行当前任务prompt。
@@ -198,6 +199,7 @@ async def run_job_with_agent(
             "硬性限制：最多进行少量必要查询；优先使用 2-3 个可靠来源；不要反复读取同一类网页；"
             "terminal、cronjob、发邮件、发消息、写文件等有副作用工具在本任务中最多执行一次。"
             "如果信息不足，请基于已获取内容输出简短结论，而不是继续无限搜索。\n\n"
+            f"{_delivery_style_instruction(platform)}\n\n"
             f"{prompt}"
         )
 
@@ -249,6 +251,20 @@ async def run_job_with_agent(
 def _is_incomplete_agent_response(content: str) -> bool:
     """Return True when an Agent response is a guardrail/timeout notice."""
     return any(marker in content for marker in CRON_STOP_MARKERS)
+
+
+def _delivery_style_instruction(platform: str) -> str:
+    """Return platform-specific final answer style guidance for cron delivery."""
+    if platform not in {"feishu", "lark"}:
+        return ""
+
+    return (
+        "飞书投递格式要求：最终回复必须像一条工作 IM 通知，短而可扫读。"
+        "不要输出“已触发/正在执行/我搜了”等过程说明；不要使用 Markdown 表格；"
+        "控制在 900 字以内；最多两级标题；最多 4 条核心要点；只保留 1 个主链接，"
+        "可选补充阅读最多 3 条；除非任务明确要求，不要承诺明日/下次推送时间。"
+        "推荐结构：标题行 → 今日精选 → 一句话价值 → 核心要点 → 对用户的启发 → 阅读全文。"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -505,6 +505,19 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     jobs = load_jobs()
     for i, job in enumerate(jobs):
         if job["id"] == job_id:
+            updates = dict(updates)
+            if "schedule" in updates:
+                raw_schedule = updates["schedule"]
+                parsed_schedule = parse_schedule(str(raw_schedule))
+                updates["schedule"] = parsed_schedule
+                updates["schedule_display"] = parsed_schedule.get("display", str(raw_schedule))
+                updates["next_run_at"] = compute_next_run(parsed_schedule)
+            if "repeat" in updates and not isinstance(updates["repeat"], dict):
+                current_repeat = job.get("repeat") or {}
+                updates["repeat"] = {
+                    "times": updates["repeat"],
+                    "completed": current_repeat.get("completed", 0),
+                }
             jobs[i].update(updates)
             save_jobs(jobs)
             return jobs[i]

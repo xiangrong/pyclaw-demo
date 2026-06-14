@@ -899,6 +899,86 @@ async def test_agent_stops_retriggering_same_cron_job():
 
 
 @pytest.mark.asyncio
+async def test_agent_distinguishes_distinct_cron_create_payloads():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "创建第一个任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "create1",
+                "function": {
+                    "name": "cronjob",
+                    "arguments": json.dumps({
+                        "action": "create",
+                        "name": "daily codex push",
+                        "schedule": "0 8 * * *",
+                        "prompt": "Push one Codex article.",
+                    }),
+                },
+            }],
+        },
+        {
+            "content": "创建另一个任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "create2",
+                "function": {
+                    "name": "cronjob",
+                    "arguments": json.dumps({
+                        "action": "create",
+                        "name": "daily agent lesson",
+                        "schedule": "0 9 * * *",
+                        "prompt": "Push one AI agent lesson.",
+                    }),
+                },
+            }],
+        },
+        {"content": "两个任务已创建。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {"role": "tool", "tool_call_id": "create", "name": "cronjob", "content": "created", "success": True, "metadata": {}},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-create-distinct"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-create-distinct", channel="telegram", channel_user_id="u1", session_id="s-cron-create-distinct",
+        type=MessageType.TEXT, role=MessageRole.USER, content="创建两个不同任务"
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "两个任务已创建。"
+    assert "cronjob:create:<no-job-id>" not in response.content
+    assert "副作用工具重复调用" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_agent_converts_tool_executor_exception_to_observation():
     model = AsyncMock()
     tools = MagicMock()

@@ -15,6 +15,7 @@ from pyclaw.cron.jobs import (
     resume_job,
     trigger_job,
     parse_schedule,
+    update_job,
 )
 from pyclaw.tools.base import BaseTool, ToolResult
 
@@ -102,7 +103,7 @@ def _format_job_list(job: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 class CronJobArgs(BaseModel):
-    action: str = Field(description="操作: create, list, remove, pause, resume, trigger")
+    action: str = Field(description="操作: create, list, update, remove, pause, resume, trigger")
     job_id: Optional[str] = Field(default=None, description="任务ID")
     prompt: Optional[str] = Field(default=None, description="要执行的任务描述（create需要）")
     schedule: Optional[str] = Field(default=None, description="调度表达式（create需要）")
@@ -113,7 +114,11 @@ class CronJobArgs(BaseModel):
 
 class CronJobTool(BaseTool):
     """
-    定时任务管理工具。可以创建、查看、删除、暂停、恢复定时任务。
+    定时任务管理工具。可以创建、查看、更新、删除、暂停、恢复定时任务。
+
+    重要：当用户要求“纳入/修改/调整/更新”已有每日推送、提醒或自动化任务时，
+    必须先 list 找到目标任务，然后优先使用 update 修改原任务；不要通过
+    create + remove 重建任务，避免短时间内创建重复任务或误删新任务。
 
     自然语言自动化 (Natural Language Heartbeat):
     当用户使用自然语言请求创建定时任务（例如：“每天早上8点检查邮件” 或 “每两小时总结一次新闻”）时，
@@ -202,6 +207,55 @@ class CronJobTool(BaseTool):
                 return ToolResult(success=True, content="\n".join(lines).strip())
 
             # -------------------------------------------------------------------
+            # 更新任务
+            # -------------------------------------------------------------------
+            elif action == "update":
+                if not job_id:
+                    return ToolResult(success=False, content="❌ 错误: update操作必须提供job_id参数")
+
+                job = get_job(str(job_id))
+                if not job:
+                    return ToolResult(success=False, content=f"❌ 未找到任务: {job_id}")
+
+                updates: Dict[str, Any] = {}
+
+                if prompt is not None:
+                    scan_error = _scan_prompt(str(prompt))
+                    if scan_error:
+                        return ToolResult(success=False, content=f"❌ 安全检查失败: {scan_error}")
+                    updates["prompt"] = str(prompt)
+
+                if schedule is not None:
+                    try:
+                        parse_schedule(str(schedule))
+                    except ValueError as e:
+                        return ToolResult(success=False, content=f"❌ 调度格式错误: {e}")
+                    updates["schedule"] = str(schedule)
+
+                if name is not None:
+                    updates["name"] = str(name)
+
+                if repeat is not None:
+                    updates["repeat"] = int(repeat)
+
+                if not updates:
+                    return ToolResult(success=False, content="❌ 错误: update操作至少需要提供prompt、schedule、name或repeat之一")
+
+                updated = update_job(str(job_id), updates)
+                if not updated:
+                    return ToolResult(success=False, content=f"❌ 更新失败: {job_id}")
+
+                result = (
+                    f"✅ 定时任务已更新！\n\n"
+                    f"任务ID: {updated['id']}\n"
+                    f"名称: {updated.get('name', 'Unnamed')}\n"
+                    f"调度: {updated.get('schedule_display')}\n"
+                    f"下次执行: {updated.get('next_run_at', 'N/A')}\n"
+                    f"任务内容: {updated.get('prompt', '')[:80]}{'...' if len(updated.get('prompt', '')) > 80 else ''}"
+                )
+                return ToolResult(success=True, content=result)
+
+            # -------------------------------------------------------------------
             # 删除任务
             # -------------------------------------------------------------------
             elif action == "remove":
@@ -270,7 +324,7 @@ class CronJobTool(BaseTool):
             else:
                 return ToolResult(
                     success=False,
-                    content=f"❌ 未知操作: {action}\n支持的操作: create, list, remove, pause, resume, trigger"
+                    content=f"❌ 未知操作: {action}\n支持的操作: create, list, update, remove, pause, resume, trigger"
                 )
 
         except Exception as e:

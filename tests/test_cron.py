@@ -1,5 +1,6 @@
 from pyclaw.cron import jobs as cron_jobs
 from datetime import datetime, timezone
+import pytest
 
 
 def test_running_jobs_are_not_due(monkeypatch, tmp_path):
@@ -75,6 +76,71 @@ def test_trigger_disabled_job_runs_once_and_restores_disabled(monkeypatch, tmp_p
     assert updated["manual_trigger"] is False
 
 
+def test_update_job_recomputes_schedule_display_and_next_run(monkeypatch, tmp_path):
+    jobs_file = tmp_path / "jobs.json"
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path)
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", jobs_file)
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", output_dir)
+
+    fixed_now = datetime(2026, 6, 13, 10, 0, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(cron_jobs, "_now", lambda: fixed_now)
+
+    job = cron_jobs.create_job(
+        prompt="Old prompt",
+        schedule="0 8 * * *",
+        name="daily push",
+    )
+
+    updated = cron_jobs.update_job(job["id"], {
+        "prompt": "New prompt",
+        "schedule": "0 9 * * *",
+        "repeat": 3,
+    })
+
+    assert updated is not None
+    assert updated["prompt"] == "New prompt"
+    assert updated["schedule_display"] == "0 9 * * *"
+    assert updated["next_run_at"] == "2026-06-14T09:00:00+00:00"
+    assert updated["repeat"] == {"times": 3, "completed": 0}
+
+
+@pytest.mark.asyncio
+async def test_cronjob_tool_update_modifies_existing_job(monkeypatch, tmp_path):
+    from pyclaw.cron.tools import CronJobTool
+
+    jobs_file = tmp_path / "jobs.json"
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path)
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", jobs_file)
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", output_dir)
+
+    fixed_now = datetime(2026, 6, 13, 10, 0, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(cron_jobs, "_now", lambda: fixed_now)
+
+    job = cron_jobs.create_job(
+        prompt="Old prompt",
+        schedule="0 8 * * *",
+        name="daily push",
+    )
+
+    tool = CronJobTool()
+    result = await tool.execute(
+        action="update",
+        job_id=job["id"],
+        prompt="New prompt with AI Agents From Zero",
+        schedule="0 8 * * *",
+        name="每日08点推送Codex高质量用法文章",
+    )
+
+    assert result.success
+    assert "定时任务已更新" in result.content
+    jobs = cron_jobs.list_jobs(include_disabled=True)
+    assert len(jobs) == 1
+    assert jobs[0]["prompt"] == "New prompt with AI Agents From Zero"
+    assert jobs[0]["name"] == "每日08点推送Codex高质量用法文章"
+
+
 def test_mark_job_run_resets_running_state(monkeypatch, tmp_path):
     jobs_file = tmp_path / "jobs.json"
     output_dir = tmp_path / "output"
@@ -103,6 +169,18 @@ def test_incomplete_agent_response_is_not_success():
     assert _is_incomplete_agent_response("⚠️  检测到工具重复调用过多（web_read），我已停止继续执行。")
     assert _is_incomplete_agent_response("⚠️  达到最大思考深度，我已停止继续调用工具，避免刷屏。")
     assert not _is_incomplete_agent_response("# 今日早报\n\n这里是完整结果。")
+
+
+def test_feishu_delivery_style_instruction_is_concise_and_channel_specific():
+    from pyclaw.cron.scheduler import _delivery_style_instruction
+
+    feishu_instruction = _delivery_style_instruction("feishu")
+
+    assert "飞书投递格式要求" in feishu_instruction
+    assert "不要使用 Markdown 表格" in feishu_instruction
+    assert "900 字以内" in feishu_instruction
+    assert "不要承诺明日/下次推送时间" in feishu_instruction
+    assert _delivery_style_instruction("telegram") == ""
 
 
 def test_tick_records_readable_timeout_error(monkeypatch, tmp_path):
