@@ -47,7 +47,7 @@ class Agent:
         work_dir: Optional[str] = None,
         config_dir: Optional[str] = None,
         memory: Optional[SemanticMemory] = None,
-        max_iterations: int = 30,
+        max_iterations: int = 90,
         max_consecutive_failures: int = 8,
     ) -> None:
         self.model = model_provider
@@ -85,6 +85,28 @@ class Agent:
             "Always explain your reasoning and actions to the user in Chinese.\n\n"
         )
         self.base_system_prompt = self.system_prompt # save base
+        self._activity_seq = 0
+        self._last_activity_at = time.time()
+        self._last_activity_event = "initialized"
+        self._last_activity_session_id = ""
+
+    def _touch_activity(self, event: str, session: Optional[Session] = None) -> None:
+        """Record agent progress for cron inactivity monitoring."""
+        self._activity_seq += 1
+        self._last_activity_at = time.time()
+        self._last_activity_event = event
+        if session is not None:
+            self._last_activity_session_id = session.session_id
+
+    def get_activity_summary(self) -> dict[str, Any]:
+        """Return lightweight progress information for schedulers/observers."""
+        return {
+            "activity_seq": self._activity_seq,
+            "last_activity_at": self._last_activity_at,
+            "last_event": self._last_activity_event,
+            "session_id": self._last_activity_session_id,
+            "max_iterations": self.max_iterations,
+        }
 
     async def _get_semantic_memories(self, session: Session) -> tuple[str, str]:
         """获取语义记忆 (Semantic Memory / RAG)"""
@@ -276,11 +298,13 @@ class Agent:
 
     async def process_message(self, message: Message) -> Message:
         """处理用户消息并生成回复"""
+        self._touch_activity("process_message_start")
         # 获取或创建会话
         session = await self.sessions.get_or_create(
             channel=message.channel,
             user_id=message.channel_user_id,
         )
+        self._touch_activity("session_ready", session)
 
         # 检查是否是 /new 或 /reset 指令
         if message.content.strip().lower() in {"/new", "/reset"}:
@@ -324,6 +348,7 @@ class Agent:
 
         # 添加用户消息到会话
         await self.sessions.save_message(session, message)
+        self._touch_activity("user_message_saved", session)
 
         # 执行 Agent 循环
         response_content, pending_files = await self._agent_loop(session)
@@ -376,9 +401,10 @@ class Agent:
     async def _agent_loop(self, session: Session) -> tuple[str, list[dict[str, Any]]]:
         """Agent主循环：调用LLM -> 执行工具 -> 重复直到完成"""
         is_cron_session = session.channel == "cron"
-        max_iterations = min(self.max_iterations, 10) if is_cron_session else self.max_iterations
-        max_tool_calls = 12 if is_cron_session else 20
-        repeated_tool_limit = 4 if is_cron_session else 8
+        configured_max_iterations = self._get_session_int(session, "max_iterations", self.max_iterations)
+        max_iterations = configured_max_iterations if is_cron_session else self.max_iterations
+        max_tool_calls = self._get_session_int(session, "max_tool_calls", 36) if is_cron_session else 20
+        repeated_tool_limit = self._get_session_int(session, "repeated_tool_limit", 8) if is_cron_session else 8
         side_effect_tool_limit = 1
         started_at = time.monotonic()
         soft_deadline_seconds = session.metadata.get("soft_deadline_seconds") if is_cron_session else None
@@ -393,6 +419,7 @@ class Agent:
         soft_deadline_reached = False
 
         for i in range(max_iterations):
+            self._touch_activity(f"loop_iteration_{i + 1}", session)
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
 
             if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
@@ -430,6 +457,7 @@ class Agent:
                     tools=tools,
                     stream=False,
                 )
+                self._touch_activity("llm_response", session)
             except Exception as e:
                 print(f"  ❌ LLM 调用出错: {e}")
                 error_msg = f"⚠️  LLM 调用出错: {str(e)}"
@@ -567,6 +595,7 @@ class Agent:
                 # 打印工具调用信息
                 for tc in tool_calls:
                     print(f"  🛠️  [Tool Call] {tc['function']['name']}({tc['function']['arguments']})")
+                self._touch_activity("tool_calls_requested", session)
 
                 # 1. 添加助手消息
                 assistant_msg = Message(
@@ -597,7 +626,9 @@ class Agent:
                     tool_results = await self.tools.execute_tool_calls(
                         json.dumps(result)
                     )
+                    self._touch_activity("tool_results_received", session)
                 except Exception as e:
+                    self._touch_activity("tool_execution_error", session)
                     tool_results = [
                         {
                             "role": "tool",
@@ -675,6 +706,7 @@ class Agent:
                         },
                     )
                     await self.sessions.save_message(session, tool_msg)
+                    self._touch_activity(f"tool_observation_saved:{tr['name']}", session)
 
                 # 更新连续失败计数
                 if any_failure:
@@ -696,7 +728,21 @@ class Agent:
                 continue
 
             # 没有工具调用，返回最终汇总结果
-            final_content = "\n\n".join(all_responses)
+            if self._should_require_source_extraction_before_final(
+                session=session,
+                tool_name_counts=tool_name_counts,
+                is_final_iteration=is_final_iteration,
+                force_final_answer=force_final_answer,
+                soft_deadline_reached=soft_deadline_reached,
+                active_skills=active_skills,
+            ):
+                if content.strip() and all_responses and all_responses[-1] == content:
+                    all_responses.pop()
+                await self._request_source_extraction_before_final(session)
+                continue
+
+            final_content = self._sanitize_user_facing_content("\n\n".join(all_responses))
+            self._touch_activity("final_answer", session)
             if not final_content.strip():
                 # 如果所有周期都没有内容，且没有工具调用，说明模型可能返回了空响应
                 # 这种情况下尝试返回原始结果或给予提示
@@ -710,6 +756,101 @@ class Agent:
 
         return self._with_stop_notice(all_responses, self._summarize_final(session)), pending_files
 
+    def _get_session_int(self, session: Session, key: str, default: int) -> int:
+        """Read a positive integer from session metadata with fallback."""
+        try:
+            value = int(session.metadata.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _should_require_source_extraction_before_final(
+        self,
+        session: Session,
+        tool_name_counts: dict[str, int],
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+        active_skills: Optional[list[str]] = None,
+    ) -> bool:
+        """Require source extraction for current-events research before final answer.
+
+        Search snippets alone are often too shallow or stale for live/news/sports
+        questions. If the model searched the web and then tries to answer a
+        current-events task without extracting at least one source page, give it
+        one more turn with web_extract/web_read available. This mirrors the
+        Hermes-style pattern: discover candidates first, then read authoritative
+        sources before synthesis.
+        """
+        if is_final_iteration or force_final_answer or soft_deadline_reached:
+            return False
+        if tool_name_counts.get("web_search", 0) <= 0:
+            return False
+        if tool_name_counts.get("web_extract", 0) > 0 or tool_name_counts.get("web_read", 0) > 0:
+            return False
+        if not self._tool_available("web_extract", active_skills=active_skills) and not self._tool_available(
+            "web_read", active_skills=active_skills
+        ):
+            return False
+        return self._requires_source_extraction(self._latest_external_user_text(session))
+
+    def _tool_available(self, tool_name: str, active_skills: Optional[list[str]] = None) -> bool:
+        """Return True if a tool spec is available in the current registry."""
+        try:
+            specs = self.tools.get_all_specs(active_skills=active_skills)
+        except TypeError:
+            specs = self.tools.get_all_specs()
+        except Exception:
+            return False
+        return any(str(spec.get("name", "")) == tool_name for spec in specs or [])
+
+    def _latest_external_user_text(self, session: Session) -> str:
+        """Return the latest real user request, ignoring internal NOTICE turns."""
+        for msg in reversed(session.messages):
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if not content:
+                continue
+            if content.startswith("NOTICE:"):
+                continue
+            return content
+        return ""
+
+    def _requires_source_extraction(self, text: str) -> bool:
+        """Heuristic for tasks where search-only synthesis is not enough."""
+        if not text:
+            return False
+        normalized = text.lower()
+        keywords = (
+            "最新", "现在", "当前", "今日", "今天", "昨天", "明天", "实时", "刚刚", "最近",
+            "新闻", "消息", "动态", "赛程", "赛果", "比分", "比赛", "战报", "早报", "晚报",
+            "世界杯", "网球", "足球", "篮球", "nba", "wta", "atp", "fifa", "world cup",
+            "latest", "current", "today", "yesterday", "tomorrow", "live", "breaking",
+            "news", "schedule", "fixture", "result", "score", "scores", "standings",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    async def _request_source_extraction_before_final(self, session: Session) -> None:
+        """Ask the model to read source pages before answering a current task."""
+        reminder = Message(
+            id=f"extract-before-final-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: You used web_search for a current/news/sports research task, "
+                "but have not extracted any source page yet. Before the final answer, "
+                "call web_extract on 1-3 authoritative URLs from the search results "
+                "(prefer official sites or reputable data providers). Use web_extract "
+                "rather than another web_search unless no URL is available. Then synthesize "
+                "the final answer. Do not mention this notice to the user."
+            ),
+        )
+        await self.sessions.save_message(session, reminder)
+
     def _with_stop_notice(self, responses: list[str], notice: str) -> str:
         """Combine partial user-facing responses with a concise stop notice.
 
@@ -717,10 +858,48 @@ class Agent:
         logs/history, but sending them to chat channels makes failures extremely
         noisy and hard to read.
         """
-        cleaned_responses = [r for r in responses if r and r.strip()]
+        cleaned_responses = [
+            self._sanitize_user_facing_content(r)
+            for r in responses
+            if r and r.strip()
+        ]
+        cleaned_responses = [r for r in cleaned_responses if r and r.strip()]
         if cleaned_responses:
             return "\n\n".join(cleaned_responses + [notice])
         return notice
+
+    def _sanitize_user_facing_content(self, content: str) -> str:
+        """Remove internal guardrail/deadline phrasing from user-facing text.
+
+        The model sometimes follows an internal wrap-up notice too literally and
+        starts the final answer with phrases such as "工具调用已达到执行时限".
+        Those are execution details, not useful task output. Keep any useful
+        synthesis that follows, but strip the leaked preamble.
+        """
+        if not content:
+            return content
+
+        cleaned = content.strip()
+        internal_prefix_patterns = (
+            r"^(?:⚠️\s*)?工具调用已达到执行时限[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?工具预算或时间预算已用完[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?检测到只读/查询类工具重复调用过多[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?由于[^。\n]*工具调用[^。\n]*停止[^。\n]*(?:。|\n)+\s*",
+        )
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            for pattern in internal_prefix_patterns:
+                cleaned = re.sub(pattern, "", cleaned, count=1)
+
+        # Operational delivery failures should be logged separately from the
+        # business report body, especially for cron pushes.
+        cleaned = re.sub(
+            r"(?m)^\s*>?\s*📨\s*邮件发送[:：].*?(?:执行时限|工具调用|未能发送).*\n?",
+            "",
+            cleaned,
+        ).strip()
+        return cleaned
 
     async def _request_final_answer_without_tools(self, session: Session, reason: str) -> None:
         """Ask the model to produce a final answer using existing observations.
@@ -739,8 +918,10 @@ class Agent:
             role=MessageRole.USER,
             content=(
                 "NOTICE: Tool usage must stop now. "
-                f"Reason: {reason}\n"
-                "Do not call any more tools. Produce the final answer now."
+                f"Internal reason (do not mention verbatim to the user): {reason}\n"
+                "Do not call any more tools. Produce the final answer now. "
+                "Do not mention tool limits, execution time limits, budgets, guardrails, or internal errors. "
+                "If the available information is incomplete, say what is confirmed so far and mark uncertain details as pending confirmation."
             ),
         )
         await self.sessions.save_message(session, final_request)
@@ -762,9 +943,10 @@ class Agent:
             role=MessageRole.USER,
             content=(
                 "NOTICE: The cron research budget is exhausted. "
-                "Do not call web_search, web_read, python, terminal, cronjob, file, or other research tools. "
+                "Do not call web_search, web_extract, web_read, python, terminal, cronjob, file, or other research tools. "
                 "If the task explicitly requires final delivery by email or message, call exactly one delivery tool now. "
-                "Otherwise, produce the final answer immediately from existing observations."
+                "Otherwise, produce the final answer immediately from existing observations. "
+                "Do not mention tool limits, execution time limits, budgets, guardrails, or internal errors in the final user-facing answer."
             ),
         )
         await self.sessions.save_message(session, final_request)
@@ -800,7 +982,7 @@ class Agent:
     def _is_delivery_tool_name(self, tool_name: str) -> bool:
         """Return True for email/message tools that can complete task delivery."""
         normalized = tool_name.lower()
-        if normalized in {"terminal", "cronjob", "web_read", "web_search", "python_interpreter"}:
+        if normalized in {"terminal", "cronjob", "web_extract", "web_read", "web_search", "python_interpreter"}:
             return False
         if any(keyword in normalized for keyword in ("read", "search", "list", "get_recent", "test", "connection")):
             return False

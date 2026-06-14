@@ -20,3 +20,5 @@ web_search:
 
     assert cfg.web_search.tavily_api_key == "tavily-key"
     assert cfg.web_search.brave_api_key == "brave-key"
+    assert cfg.max_iterations == 90
+    assert cfg.effective_max_iterations == 90

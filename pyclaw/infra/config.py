@@ -64,8 +64,13 @@ class Config(BaseModel):
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
     config_dir: Optional[str] = None
     allowed_paths: list[str] = Field(default_factory=list)
-    max_iterations: int = 30
+    max_iterations: int = 90
     max_consecutive_failures: int = 8
+
+    @property
+    def effective_max_iterations(self) -> int:
+        """Resolved global agent loop budget after applying defaults."""
+        return self.max_iterations
 
 
 def load_config(config_path: Optional[str] = None) -> Config:

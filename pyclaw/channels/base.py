@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+import hashlib
+import re
 import time
 from typing import Any, AsyncGenerator, Callable, Optional
 
@@ -16,6 +18,7 @@ class BaseChannel(ABC):
     def __init__(self) -> None:
         self._message_handler: Optional[Callable[[Message], Any]] = None
         self._recent_source_message_ids: OrderedDict[str, float] = OrderedDict()
+        self._recent_message_fingerprints: OrderedDict[str, float] = OrderedDict()
 
     @abstractmethod
     async def start(self) -> None:
@@ -99,3 +102,46 @@ class BaseChannel(ABC):
         while len(self._recent_source_message_ids) > max_entries:
             self._recent_source_message_ids.popitem(last=False)
         return True
+
+    def _remember_message_fingerprint(
+        self,
+        *parts: str,
+        ttl_seconds: int = 45,
+        max_entries: int = 1024,
+    ) -> bool:
+        """Record a short-lived content fingerprint and report whether it is new.
+
+        Some channels, especially websocket/event gateways, may redeliver the
+        same user-visible message with a different upstream message id. The
+        source-id guard cannot catch that case, so channels can add this second
+        layer keyed by sender + type + normalized content. The TTL is short so
+        an intentional repeated user command is only suppressed when it arrives
+        immediately like an upstream retry.
+        """
+        normalized_parts = [_normalize_fingerprint_part(part) for part in parts]
+        if not any(normalized_parts):
+            return True
+
+        raw = "\x1f".join(normalized_parts)
+        fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+        now = time.monotonic()
+        cutoff = now - ttl_seconds
+        while self._recent_message_fingerprints:
+            _, seen_at = next(iter(self._recent_message_fingerprints.items()))
+            if seen_at >= cutoff:
+                break
+            self._recent_message_fingerprints.popitem(last=False)
+
+        if fingerprint in self._recent_message_fingerprints:
+            self._recent_message_fingerprints.move_to_end(fingerprint)
+            return False
+
+        self._recent_message_fingerprints[fingerprint] = now
+        while len(self._recent_message_fingerprints) > max_entries:
+            self._recent_message_fingerprints.popitem(last=False)
+        return True
+
+
+def _normalize_fingerprint_part(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()

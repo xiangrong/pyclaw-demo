@@ -26,6 +26,21 @@ def test_source_message_id_dedupe_returns_false_for_duplicate():
     assert channel._remember_source_message_id("msg-2") is True
 
 
+def test_message_fingerprint_dedupe_catches_same_content_with_different_ids():
+    channel = DummyChannel()
+
+    assert channel._remember_message_fingerprint("user-1", "text", " 世界杯最新赛事 ") is True
+    assert channel._remember_message_fingerprint("user-1", "text", "世界杯最新赛事") is False
+    assert channel._remember_message_fingerprint("user-1", "text", "世界杯最新赛程") is True
+
+
+def test_message_fingerprint_dedupe_is_scoped_by_sender():
+    channel = DummyChannel()
+
+    assert channel._remember_message_fingerprint("user-1", "text", "hello") is True
+    assert channel._remember_message_fingerprint("user-2", "text", "hello") is True
+
+
 @pytest.mark.asyncio
 async def test_wechat_duplicate_msg_id_is_ignored():
     channel = WechatChannel(bot_token="token", bot_id="bot")

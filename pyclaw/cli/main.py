@@ -28,6 +28,7 @@ from pyclaw.tools.files import EditFileTool, ReadFileTool, WriteFileTool, SendFi
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
 from pyclaw.tools.web_search import WebSearchTool
+from pyclaw.tools.web_extract import WebExtractTool
 from pyclaw.tools.web_read import WebReadTool
 from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
 from pyclaw.tools.save_skill import SaveSkillTool
@@ -116,7 +117,8 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             tavily_api_key=cfg.web_search.tavily_api_key,
             brave_api_key=cfg.web_search.brave_api_key,
         ))
-        tool_registry.register(WebReadTool())
+        tool_registry.register(WebExtractTool(tavily_api_key=cfg.web_search.tavily_api_key))
+        tool_registry.register(WebReadTool(tavily_api_key=cfg.web_search.tavily_api_key))
         tool_registry.register(CronJobTool())
         tool_registry.register(ActivateSkillTool())
         tool_registry.register(ListSkillsTool())
@@ -283,7 +285,8 @@ def cron_exec(
             tavily_api_key=cfg.web_search.tavily_api_key,
             brave_api_key=cfg.web_search.brave_api_key,
         ))
-        tool_registry.register(WebReadTool())
+        tool_registry.register(WebExtractTool(tavily_api_key=cfg.web_search.tavily_api_key))
+        tool_registry.register(WebReadTool(tavily_api_key=cfg.web_search.tavily_api_key))
         tool_registry.register(ActivateSkillTool())
         tool_registry.register(ListSkillsTool())
         tool_registry.register(InstallSkillTool())
@@ -440,8 +443,8 @@ allowed_paths:
   - "~/.config/pyclaw"
   - "~/Downloads"
 
-# 最大思考深度 (Agent 循环执行工具的最大次数，默认 30)
-max_iterations: 30
+# 最大思考深度 (Agent 循环执行工具的最大次数，默认 90；对齐 Hermes Agent 长任务预算)
+max_iterations: 90
 
 # 连续工具调用失败的最大次数 (触发自我保护停止迭代，默认 8)
 max_consecutive_failures: 8

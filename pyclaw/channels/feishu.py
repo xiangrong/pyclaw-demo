@@ -109,6 +109,12 @@ class FeishuChannel(BaseChannel):
                     print(f"🚫 用户 {open_id} 不在白名单中")
                     return
 
+                # 飞书偶发会将同一条用户可见消息以不同 message_id 重投。
+                # message_id 幂等挡不住这种情况，因此再用“发送者+类型+正文”做短窗口去重。
+                if not self._remember_message_fingerprint(open_id, msg_type, text):
+                    print(f"↩️ [飞书] 忽略疑似重复内容: message_id={message_id}, user={open_id}, text={text[:40]!r}")
+                    return
+
                 # 给用户消息添加 OK 反应标签 - 表示已收到并处理
                 self._add_ok_reaction_sync(message_id)
 

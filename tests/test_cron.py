@@ -168,19 +168,81 @@ def test_incomplete_agent_response_is_not_success():
 
     assert _is_incomplete_agent_response("⚠️  检测到工具重复调用过多（web_read），我已停止继续执行。")
     assert _is_incomplete_agent_response("⚠️  达到最大思考深度，我已停止继续调用工具，避免刷屏。")
+    assert _is_incomplete_agent_response("工具调用已达到执行时限，不再继续搜索。")
     assert not _is_incomplete_agent_response("# 今日早报\n\n这里是完整结果。")
+
+
+def test_sanitize_cron_final_response_removes_internal_notices():
+    from pyclaw.cron.scheduler import _sanitize_cron_final_response
+
+    content = (
+        "工具调用已达到执行时限，不再继续搜索。基于已有数据整理晚报如下：\n"
+        "🏆 赛事晚报\n"
+        "> 📨 邮件发送：因执行时限工具调用已停止，邮件未能发送至 xrseu@example.com。\n"
+        "- 已确认赛程 A vs B"
+    )
+
+    sanitized = _sanitize_cron_final_response(content, "telegram")
+
+    assert "工具调用已达到执行时限" not in sanitized
+    assert "不再继续搜索" not in sanitized
+    assert "邮件发送" not in sanitized
+    assert sanitized.startswith("基于已有数据整理晚报如下")
+    assert "已确认赛程" in sanitized
 
 
 def test_feishu_delivery_style_instruction_is_concise_and_channel_specific():
     from pyclaw.cron.scheduler import _delivery_style_instruction
 
     feishu_instruction = _delivery_style_instruction("feishu")
+    telegram_instruction = _delivery_style_instruction("telegram")
 
     assert "飞书投递格式要求" in feishu_instruction
     assert "不要使用 Markdown 表格" in feishu_instruction
     assert "900 字以内" in feishu_instruction
     assert "不要承诺明日/下次推送时间" in feishu_instruction
-    assert _delivery_style_instruction("telegram") == ""
+    assert "Telegram投递格式要求" in telegram_instruction
+    assert "避免 Markdown 表格" in telegram_instruction
+    assert "工具调用达到执行时限" in telegram_instruction
+    assert "未确认的比分、进球、黄牌、换人" in telegram_instruction
+    assert _delivery_style_instruction("wechat") == ""
+
+
+def test_run_time_instruction_contains_current_date(monkeypatch):
+    from pyclaw.cron import scheduler
+
+    fixed_now = datetime(2026, 6, 14, 18, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(scheduler, "_now", lambda: fixed_now)
+
+    instruction = scheduler._run_time_instruction()
+
+    assert "2026-06-14 18:00:00" in instruction
+    assert "今天/昨天/明天" in instruction
+    assert "不要沿用历史会话中的日期" in instruction
+
+
+def test_research_policy_uses_generic_live_source_strategy():
+    from pyclaw.cron.scheduler import _research_policy_instruction
+
+    instruction = _research_policy_instruction("请整理2026世界杯今日赛果和明日赛程")
+
+    assert "实时/新闻/赛事研究策略" in instruction
+    assert "不要只依赖泛化关键词搜索" in instruction
+    assert "赛事用官方赛程/比分页和主流体育数据页交叉核对" in instruction
+    assert "至少双源核验" in instruction
+    assert "不要编造" in instruction
+    assert "fifa.com" not in instruction
+    assert "espn.com" not in instruction
+
+
+def test_research_policy_for_non_live_task_is_generic():
+    from pyclaw.cron.scheduler import _research_policy_instruction
+
+    instruction = _research_policy_instruction("推送 Codex 高质量文章")
+
+    assert "通用研究策略" in instruction
+    assert "官方文档" in instruction
+    assert "权威媒体" in instruction
 
 
 def test_tick_records_readable_timeout_error(monkeypatch, tmp_path):
@@ -210,6 +272,11 @@ def test_tick_records_readable_timeout_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(scheduler, "_global_agent", object())
     monkeypatch.setattr(scheduler, "_global_loop", object())
+    monkeypatch.setattr(scheduler, "CRON_TOTAL_TIMEOUT_SECONDS", 100)
+    monkeypatch.setattr(scheduler, "CRON_INACTIVITY_TIMEOUT_SECONDS", 1)
+    times = iter([0, 2])
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: next(times))
+
     def fake_run_coroutine_threadsafe(coro, loop):
         coro.close()
         return DummyFuture()
@@ -225,7 +292,44 @@ def test_tick_records_readable_timeout_error(monkeypatch, tmp_path):
     updated = cron_jobs.get_job(job["id"])
     assert updated is not None
     assert updated["last_status"] == "failed"
-    assert updated["last_error"] == "Cron job timed out after 120 seconds"
+    assert updated["last_error"] == "Cron job inactive for 1 seconds"
+
+
+def test_wait_for_cron_future_resets_inactivity_on_agent_activity(monkeypatch):
+    from pyclaw.cron import scheduler
+
+    class DummyAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def get_activity_summary(self):
+            self.calls += 1
+            return {"activity_seq": self.calls, "last_event": "progress"}
+
+    class DummyFuture:
+        def __init__(self):
+            self.calls = 0
+            self.cancelled = False
+
+        def result(self, timeout=None):
+            self.calls += 1
+            if self.calls < 4:
+                raise scheduler.FutureTimeoutError()
+            return True, "output", "final", None
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(scheduler, "CRON_TOTAL_TIMEOUT_SECONDS", 100)
+    monkeypatch.setattr(scheduler, "CRON_INACTIVITY_TIMEOUT_SECONDS", 2)
+    times = iter([0, 1, 2, 3])
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: next(times))
+
+    future = DummyFuture()
+    result = scheduler._wait_for_cron_future(future, DummyAgent())
+
+    assert result == (True, "output", "final", None)
+    assert future.cancelled is False
 
 
 def test_cron_due_checks_day_month_and_weekday():

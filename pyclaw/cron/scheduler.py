@@ -31,14 +31,18 @@ logger = logging.getLogger(__name__)
 
 # 静默标记
 SILENT_MARKER = "[SILENT]"
-CRON_HARD_TIMEOUT_SECONDS = 120
-CRON_SOFT_DEADLINE_SECONDS = 80
+CRON_TOTAL_TIMEOUT_SECONDS = int(os.getenv("PYCLAW_CRON_TOTAL_TIMEOUT_SECONDS", "600"))
+CRON_INACTIVITY_TIMEOUT_SECONDS = int(os.getenv("PYCLAW_CRON_INACTIVITY_TIMEOUT_SECONDS", "120"))
+CRON_SOFT_DEADLINE_SECONDS = int(os.getenv("PYCLAW_CRON_SOFT_DEADLINE_SECONDS", "480"))
+CRON_MAX_ITERATIONS = int(os.getenv("PYCLAW_CRON_MAX_ITERATIONS", "90"))
 CRON_STOP_MARKERS = (
     "工具调用次数过多",
     "工具重复调用过多",
     "达到最大思考深度",
     "思考超时",
     "连续多次工具调用失败",
+    "工具调用已达到执行时限",
+    "工具预算或时间预算已用完",
 )
 
 # 全局Agent引用（由Gateway设置）
@@ -194,11 +198,18 @@ async def run_job_with_agent(
 
         # 创建消息（用独立的cron会话，干净的上下文）
         # 在prompt前加强制前缀，明确告诉Agent这是定时任务执行
+        run_time_instruction = _run_time_instruction()
+        research_instruction = _research_policy_instruction(prompt)
         cron_prompt = (
             "【定时任务执行 - 请只执行以下任务，不要创建新任务，不要回复关于任务本身的说明】\n"
-            "硬性限制：最多进行少量必要查询；优先使用 2-3 个可靠来源；不要反复读取同一类网页；"
+            f"{run_time_instruction}"
+            "硬性限制：优先使用少量高可信来源；先找权威来源，再抽取正文或结构化数据，最后交叉核对；"
+            "多页面读取优先用 web_extract 一次读取，避免反复调用 web_read；"
             "terminal、cronjob、发邮件、发消息、写文件等有副作用工具在本任务中最多执行一次。"
-            "如果信息不足，请基于已获取内容输出简短结论，而不是继续无限搜索。\n\n"
+            "如果信息不足，请明确标注待确认，不要编造，也不要继续无限搜索。"
+            "最终回复不得提及工具调用、执行时限、预算、超时、guardrail、内部错误或邮件发送失败；"
+            "实时新闻/体育赛事只能输出已确认信息，未确认的比分、进球、黄牌、换人不要编造。\n\n"
+            f"{research_instruction}\n"
             f"{_delivery_style_instruction(platform)}\n\n"
             f"{prompt}"
         )
@@ -213,7 +224,9 @@ async def run_job_with_agent(
             content=cron_prompt,
             metadata={
                 "soft_deadline_seconds": CRON_SOFT_DEADLINE_SECONDS,
-                "hard_timeout_seconds": CRON_HARD_TIMEOUT_SECONDS,
+                "total_timeout_seconds": CRON_TOTAL_TIMEOUT_SECONDS,
+                "inactivity_timeout_seconds": CRON_INACTIVITY_TIMEOUT_SECONDS,
+                "max_iterations": CRON_MAX_ITERATIONS,
             },
         )
 
@@ -223,7 +236,9 @@ async def run_job_with_agent(
             user_id=message.channel_user_id,
         )
         session.metadata["soft_deadline_seconds"] = CRON_SOFT_DEADLINE_SECONDS
-        session.metadata["hard_timeout_seconds"] = CRON_HARD_TIMEOUT_SECONDS
+        session.metadata["total_timeout_seconds"] = CRON_TOTAL_TIMEOUT_SECONDS
+        session.metadata["inactivity_timeout_seconds"] = CRON_INACTIVITY_TIMEOUT_SECONDS
+        session.metadata["max_iterations"] = max(int(session.metadata.get("max_iterations", 0) or 0), CRON_MAX_ITERATIONS)
         session.metadata["cron_job_id"] = job_id
 
         response = await agent.process_message(message)
@@ -234,6 +249,7 @@ async def run_job_with_agent(
         else:
             final_response = str(response)
 
+        final_response = _sanitize_cron_final_response(final_response, platform)
         full_output = f"# Cron Job Execution: {job_id}\n\nPrompt: {prompt}\n\nResponse: {final_response}"
         error = None
         success = True
@@ -253,8 +269,136 @@ def _is_incomplete_agent_response(content: str) -> bool:
     return any(marker in content for marker in CRON_STOP_MARKERS)
 
 
+def _sanitize_cron_final_response(content: str, platform: str = "") -> str:
+    """Strip leaked internal execution notices from cron delivery content."""
+    if not content:
+        return content
+
+    import re
+
+    cleaned = content.strip()
+    internal_prefix_patterns = (
+        r"^(?:⚠️\s*)?工具调用已达到执行时限[^。\n]*(?:。|\n)+\s*",
+        r"^(?:⚠️\s*)?工具预算或时间预算已用完[^。\n]*(?:。|\n)+\s*",
+        r"^(?:⚠️\s*)?检测到只读/查询类工具重复调用过多[^。\n]*(?:。|\n)+\s*",
+        r"^(?:⚠️\s*)?由于[^。\n]*工具调用[^。\n]*停止[^。\n]*(?:。|\n)+\s*",
+    )
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        for pattern in internal_prefix_patterns:
+            cleaned = re.sub(pattern, "", cleaned, count=1)
+
+    cleaned = re.sub(
+        r"(?m)^\s*>?\s*📨\s*邮件发送[:：].*?(?:执行时限|工具调用|未能发送).*\n?",
+        "",
+        cleaned,
+    ).strip()
+    return cleaned
+
+
+def _run_time_instruction() -> str:
+    """Return an explicit timestamp instruction for cron jobs."""
+    now = _now()
+    return (
+        f"当前执行时间：{now.strftime('%Y-%m-%d %H:%M:%S %Z%z')}。"
+        "所有“今天/昨天/明天/当前/今晚/早上/晚上”必须严格以这个时间为准；"
+        "不要沿用历史会话中的日期。\n"
+    )
+
+
+def _research_policy_instruction(prompt: str) -> str:
+    """Return generic retrieval guidance without hardcoding individual topics."""
+    lower_prompt = prompt.lower()
+    live_keywords = (
+        "最新", "今日", "今天", "昨天", "明天", "赛程", "赛果", "比分", "结果",
+        "latest", "today", "yesterday", "tomorrow", "schedule", "result", "score",
+        "news", "新闻", "实时", "current",
+    )
+    if not any(keyword in lower_prompt for keyword in live_keywords):
+        return (
+            "通用研究策略：先识别任务类型和需要的证据；优先使用官方文档、原始公告、论文、代码仓库、"
+            "权威媒体等一手或高可信来源；只抽取与任务直接相关的页面；输出时区分已确认事实和推断。"
+        )
+
+    return (
+        "实时/新闻/赛事研究策略：不要只依赖泛化关键词搜索。先识别最权威的数据源类别："
+        "赛事用官方赛程/比分页和主流体育数据页交叉核对；财经用交易所/公司公告/权威财经源；"
+        "软件与开源项目用官方文档、GitHub、release notes；新闻用多家权威媒体并按发布时间核对。"
+        "流程：1) 搜索或直达权威来源；2) 用 web_extract 抽取不超过 3-5 个关键页面；"
+        "3) 对关键事实至少双源核验；"
+        "4) 无法核验的比分、时间、金额、人物、进球/黄牌等细节写待确认或省略，不要编造；"
+        "5) 最终只输出业务结果和数据源，不暴露搜索过程。"
+    )
+
+
+def _domain_specific_instruction(prompt: str) -> str:
+    """Backward-compatible wrapper for older tests/imports."""
+    return _research_policy_instruction(prompt)
+
+
+def _wait_for_cron_future(future: Any, agent: Any) -> Tuple[bool, str, str, Optional[str]]:
+    """Wait for a cron job using total and inactivity timeouts.
+
+    A fixed 120s wall-clock timeout kills healthy research jobs while they are
+    still making progress. Poll the future and reset the inactivity window when
+    the agent reports fresh activity.
+    """
+    started_at = time.monotonic()
+    last_activity_seen = started_at
+    last_activity_value: Any = None
+
+    while True:
+        try:
+            return future.result(timeout=1)
+        except FutureTimeoutError:
+            now = time.monotonic()
+            activity_value = _agent_activity_value(agent)
+            if activity_value is not None and activity_value != last_activity_value:
+                last_activity_value = activity_value
+                last_activity_seen = now
+
+            if CRON_TOTAL_TIMEOUT_SECONDS > 0 and now - started_at >= CRON_TOTAL_TIMEOUT_SECONDS:
+                future.cancel()
+                raise TimeoutError(f"Cron job exceeded total timeout of {CRON_TOTAL_TIMEOUT_SECONDS} seconds")
+
+            if CRON_INACTIVITY_TIMEOUT_SECONDS > 0 and now - last_activity_seen >= CRON_INACTIVITY_TIMEOUT_SECONDS:
+                future.cancel()
+                raise TimeoutError(
+                    f"Cron job inactive for {CRON_INACTIVITY_TIMEOUT_SECONDS} seconds"
+                )
+        except Exception:
+            future.cancel()
+            raise
+
+
+def _agent_activity_value(agent: Any) -> Any:
+    """Return a comparable activity marker from an agent, if available."""
+    if not hasattr(agent, "get_activity_summary"):
+        return None
+    try:
+        summary = agent.get_activity_summary()
+    except Exception:
+        return None
+    if not isinstance(summary, dict):
+        return None
+    return (
+        summary.get("activity_seq"),
+        summary.get("last_activity_at"),
+        summary.get("last_event"),
+    )
+
+
 def _delivery_style_instruction(platform: str) -> str:
     """Return platform-specific final answer style guidance for cron delivery."""
+    if platform == "telegram":
+        return (
+            "Telegram投递格式要求：最终回复要适合手机阅读，优先短段落和项目符号，避免 Markdown 表格；"
+            "不要输出“已触发/正在执行/工具调用达到执行时限/不再继续搜索/邮件未发送”等过程或内部状态；"
+            "新闻、体育、实时数据只写已确认信息，未确认的比分、进球、黄牌、换人必须标注待确认或省略；"
+            "业务内容和系统投递错误分离，不要把邮件/工具失败写进正文。"
+        )
+
     if platform not in {"feishu", "lark"}:
         return ""
 
@@ -310,15 +454,10 @@ def tick(
                 if _global_agent is not None and _global_loop is not None:
                     coro = run_job_with_agent(job, _global_agent)
                     future = asyncio.run_coroutine_threadsafe(coro, _global_loop)
-                    timeout_seconds = CRON_HARD_TIMEOUT_SECONDS
-                    try:
-                        success, full_output, final_response, error = future.result(timeout=timeout_seconds)
-                    except FutureTimeoutError as e:
-                        future.cancel()
-                        raise TimeoutError(f"Cron job timed out after {timeout_seconds} seconds") from e
-                    except Exception:
-                        future.cancel()
-                        raise
+                    success, full_output, final_response, error = _wait_for_cron_future(
+                        future,
+                        _global_agent,
+                    )
                 else:
                     # 测试模式：简单回显
                     prompt = job["prompt"]

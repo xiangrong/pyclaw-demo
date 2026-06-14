@@ -57,6 +57,17 @@ class ExplodingTool(BaseTool):
     async def execute(self, **kwargs):
         raise RuntimeError("boom")
 
+class SlowWebArgs(BaseModel):
+    timeout: int | None = None
+
+class SlowWebExtractTool(BaseTool):
+    name = "web_extract"
+    description = "slow web extract"
+    args_schema = SlowWebArgs
+
+    async def execute(self, **kwargs):
+        return ToolResult(success=True, content=f"timeout={kwargs.get('timeout')}")
+
 @pytest.mark.asyncio
 async def test_registry_validates_tool_arguments():
     registry = ToolRegistry()
@@ -97,3 +108,15 @@ async def test_execute_tool_calls_reports_invalid_json_arguments():
             "metadata": {},
         }
     ]
+
+@pytest.mark.asyncio
+async def test_execute_tool_calls_applies_web_extract_default_timeout():
+    registry = ToolRegistry()
+    registry.register(SlowWebExtractTool())
+
+    results = await registry.execute_tool_calls(
+        '{"tool_calls":[{"id":"call1","function":{"name":"web_extract","arguments":"{}"}}]}'
+    )
+
+    assert results[0]["success"] is True
+    assert results[0]["content"] == "timeout=15"

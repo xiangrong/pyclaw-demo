@@ -1,63 +1,59 @@
 from __future__ import annotations
 
-import asyncio
+from typing import Any
+
 from pydantic import BaseModel, Field
-import trafilatura
 
 from .base import BaseTool, ToolResult
+from .web_extract import ExtractProvider, WebExtractTool
 
 
 class WebReadArgs(BaseModel):
     url: str = Field(description="The URL of the web page to read")
     include_tables: bool = Field(default=True, description="Whether to include tables in the output")
     timeout: int = Field(default=20, ge=1, le=60, description="Timeout in seconds")
+    provider: str = Field(default="auto", description="Extraction provider: auto, tavily, or trafilatura")
+    max_chars_per_url: int = Field(default=12_000, ge=500, le=50_000, description="Maximum extracted characters")
 
 
 class WebReadTool(BaseTool):
-    """使用 trafilatura 提取网页正文内容"""
+    """Compatibility wrapper around provider-based web extraction."""
 
     name = "web_read"
-    description = "Extract the main content from a web page URL. Useful for reading articles, blogs, and documentation."
+    description = (
+        "Extract the main content from one public web page URL. "
+        "For multiple URLs, prefer web_extract to read them in one call."
+    )
     args_schema = WebReadArgs
 
-    async def execute(self, **kwargs) -> ToolResult:
-        url = kwargs.get("url", "")
-        include_tables = kwargs.get("include_tables", True)
-        timeout = int(kwargs.get("timeout", 20))
+    def __init__(
+        self,
+        providers: list[ExtractProvider] | None = None,
+        tavily_api_key: str | None = None,
+    ) -> None:
+        self._extract_tool = WebExtractTool(providers=providers, tavily_api_key=tavily_api_key)
 
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        url = str(kwargs.get("url", "")).strip()
         if not url:
             return ToolResult(success=False, content="URL is required.")
 
-        try:
-            def _fetch_and_extract():
-                downloaded = trafilatura.fetch_url(url)
-                if downloaded is None:
-                    return None
-                # output_format="markdown" requires additional dependencies like courlan/htmldate in some versions
-                # but trafilatura's extract usually handles basic text/formatting well.
-                return trafilatura.extract(
-                    downloaded, 
-                    include_tables=include_tables,
-                    include_links=True,
-                    include_images=False
-                )
+        result = await self._extract_tool.execute(
+            url=url,
+            include_tables=bool(kwargs.get("include_tables", True)),
+            timeout=int(kwargs.get("timeout", 20)),
+            provider=str(kwargs.get("provider", "auto")),
+            max_urls=1,
+            max_chars_per_url=int(kwargs.get("max_chars_per_url", 12_000)),
+        )
+        if not result.success:
+            return result
 
-            loop = asyncio.get_event_loop()
-            content = await asyncio.wait_for(
-                loop.run_in_executor(None, _fetch_and_extract),
-                timeout=timeout,
-            )
+        content = result.content
+        marker = "Content:\n"
+        if content.startswith("Extracted 1:") and marker in content:
+            content = content.split(marker, 1)[1]
 
-            if content is None:
-                return ToolResult(success=False, content=f"Failed to download or extract content from: {url}")
-
-            return ToolResult(
-                success=True,
-                content=content,
-                metadata={"url": url}
-            )
-
-        except Exception as e:
-            if isinstance(e, asyncio.TimeoutError):
-                return ToolResult(success=False, content=f"Web read timed out after {timeout} seconds: {url}")
-            return ToolResult(success=False, content=f"Error reading web page: {str(e)}")
+        metadata = dict(result.metadata)
+        metadata["url"] = url
+        return ToolResult(success=True, content=content, metadata=metadata)

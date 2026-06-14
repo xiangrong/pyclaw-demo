@@ -407,6 +407,104 @@ async def test_cron_soft_deadline_blocks_more_research_tools(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_sanitizes_internal_timeout_preamble_from_final_answer():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.return_value = {
+        "content": (
+            "工具调用已达到执行时限，不再继续搜索。基于已有数据整理如下：\n"
+            "🏆 今日赛程\n"
+            "- A vs B：待官方确认"
+        ),
+        "__tool_calls__": False,
+    }
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-timeout-preamble"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-timeout-preamble", channel="cron", channel_user_id="job_1", session_id="s-timeout-preamble",
+        type=MessageType.TEXT, role=MessageRole.USER, content="整理赛事消息",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "工具调用已达到执行时限" not in response.content
+    assert "不再继续搜索" not in response.content
+    assert response.content.startswith("基于已有数据整理如下")
+
+
+@pytest.mark.asyncio
+async def test_cron_agent_uses_session_iteration_budget_and_reports_activity():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    responses = [
+        {"content": f"第{i}轮", "__tool_calls__": False}
+        for i in range(12)
+    ]
+    model.chat.side_effect = responses
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-budget"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {"max_iterations": 12}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-budget", channel="cron", channel_user_id="job_1", session_id="s-cron-budget",
+        type=MessageType.TEXT, role=MessageRole.USER, content="执行需要较多轮的任务",
+    )
+
+    response = await agent.process_message(user_msg)
+    activity = agent.get_activity_summary()
+
+    assert response.content == "第0轮"
+    assert model.chat.call_count == 1
+    assert activity["activity_seq"] > 0
+    assert activity["session_id"] == "s-cron-budget"
+    assert activity["last_event"] == "final_answer"
+
+
+@pytest.mark.asyncio
 async def test_agent_stops_before_repeating_side_effect_tool():
     model = AsyncMock()
     tools = MagicMock()
@@ -700,6 +798,161 @@ async def test_agent_allows_repeated_read_only_cronjob_list():
 
     assert tools.execute_tool_calls.call_count == 2
     assert response.content == "任务状态已确认。"
+
+
+@pytest.mark.asyncio
+async def test_agent_requires_extract_after_search_for_current_events():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_search", "description": "search", "parameters": {}},
+        {"name": "web_extract", "description": "extract", "parameters": {}},
+    ]
+
+    model.chat.side_effect = [
+        {
+            "content": "先搜索最新赛果。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search1",
+                "function": {"name": "web_search", "arguments": '{"query":"世界杯最新赛果"}'},
+            }],
+        },
+        {"content": "搜索结果显示 A 队赢了。", "__tool_calls__": False},
+        {
+            "content": "需要读取来源确认。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "extract1",
+                "function": {"name": "web_extract", "arguments": '{"urls":["https://example.com/match"]}'},
+            }],
+        },
+        {"content": "基于权威来源确认：A 队获胜。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "search1",
+                "name": "web_search",
+                "content": "https://example.com/match",
+                "success": True,
+                "metadata": {},
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "extract1",
+                "name": "web_extract",
+                "content": "官方赛果：A 队获胜。",
+                "success": True,
+                "metadata": {},
+            }
+        ],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-current-extract"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-current-extract", channel="feishu", channel_user_id="u1", session_id="s-current-extract",
+        type=MessageType.TEXT, role=MessageRole.USER, content="世界杯最新赛事",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "基于权威来源确认：A 队获胜。"
+    executed_names = []
+    for call in tools.execute_tool_calls.await_args_list:
+        payload = json.loads(call.args[0])
+        executed_names.extend(tc["function"]["name"] for tc in payload["tool_calls"])
+    assert executed_names == ["web_search", "web_extract"]
+    assert any("have not extracted any source page" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_require_extract_for_non_current_search_task():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_search", "description": "search", "parameters": {}},
+        {"name": "web_extract", "description": "extract", "parameters": {}},
+    ]
+
+    model.chat.side_effect = [
+        {
+            "content": "搜索概念资料。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search1",
+                "function": {"name": "web_search", "arguments": '{"query":"ReAct paper"}'},
+            }],
+        },
+        {"content": "ReAct 是一种推理与行动交替的方法。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "search1",
+            "name": "web_search",
+            "content": "ReAct paper search result",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-non-current-search"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-non-current-search", channel="feishu", channel_user_id="u1", session_id="s-non-current-search",
+        type=MessageType.TEXT, role=MessageRole.USER, content="解释 ReAct agent 是什么",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "ReAct 是一种推理与行动交替的方法。"
+    assert model.chat.call_count == 2
+    assert not any("have not extracted any source page" in m.content for m in session.messages)
 
 
 @pytest.mark.asyncio

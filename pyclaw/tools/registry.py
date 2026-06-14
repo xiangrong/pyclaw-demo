@@ -166,7 +166,7 @@ class ToolRegistry:
                 )
                 continue
 
-            if tool_name in {"web_read", "web_search"}:
+            if tool_name in {"web_read", "web_search", "web_extract"}:
                 if "timeout" not in args:
                     args["timeout"] = 10 if tool_name == "web_search" else 15
                 try:

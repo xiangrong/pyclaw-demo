@@ -61,7 +61,9 @@ class Gateway:
 
     async def _on_message(self, message: Message) -> None:
         """处理收到的消息"""
-        print(f"\n📥 [{message.channel}] {message.channel_user_id}: {message.content[:50]}...")
+        source_message_id = message.metadata.get("source_message_id") if message.metadata else None
+        source_suffix = f" source={source_message_id}" if source_message_id else ""
+        print(f"\n📥 [{message.channel}] {message.channel_user_id}{source_suffix}: {message.content[:50]}...")
 
         try:
             # 设置 Cron 工具的会话上下文
