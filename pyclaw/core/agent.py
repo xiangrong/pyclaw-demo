@@ -486,13 +486,27 @@ class Agent:
 
                 tool_call_count += len(tool_calls)
 
+                pending_side_effect_keys_by_call_id: dict[str, str] = {}
+                pending_side_effect_key_queue: list[str] = []
+                pending_side_effect_counts: dict[str, int] = {}
+                repeated_side_effect_calls: list[str] = []
+
                 for tc in tool_calls:
                     tool_name = tc.get("function", {}).get("name", "unknown")
                     tool_arguments = tc.get("function", {}).get("arguments", "")
                     tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
                     side_effect_key = self._side_effect_call_key(tool_name, tool_arguments)
                     if side_effect_key:
-                        side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
+                        already_executed = side_effect_call_counts.get(side_effect_key, 0)
+                        already_pending = pending_side_effect_counts.get(side_effect_key, 0)
+                        if already_executed + already_pending >= side_effect_tool_limit:
+                            repeated_side_effect_calls.append(side_effect_key)
+                        else:
+                            pending_side_effect_counts[side_effect_key] = already_pending + 1
+                            pending_side_effect_key_queue.append(side_effect_key)
+                            tool_call_id = str(tc.get("id", ""))
+                            if tool_call_id:
+                                pending_side_effect_keys_by_call_id[tool_call_id] = side_effect_key
 
                 if tool_call_count > max_tool_calls:
                     await self._request_final_answer_without_tools(
@@ -502,11 +516,6 @@ class Agent:
                     force_final_answer = True
                     continue
 
-                repeated_side_effect_calls = [
-                    key
-                    for key, count in side_effect_call_counts.items()
-                    if count > side_effect_tool_limit
-                ]
                 if repeated_side_effect_calls:
                     return self._with_stop_notice(
                         all_responses,
@@ -602,7 +611,16 @@ class Agent:
 
                 # 3. 将结果作为 Observation 添加到会话
                 any_failure = False
-                for tr in tool_results:
+                for result_index, tr in enumerate(tool_results):
+                    if tr.get("success"):
+                        side_effect_key = pending_side_effect_keys_by_call_id.get(
+                            str(tr.get("tool_call_id", ""))
+                        )
+                        if side_effect_key is None and result_index < len(pending_side_effect_key_queue):
+                            side_effect_key = pending_side_effect_key_queue[result_index]
+                        if side_effect_key:
+                            side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
+
                     # 检查是否包含待发送文件
                     if tr.get("metadata", {}).get("is_file_transfer"):
                         pending_files.append({

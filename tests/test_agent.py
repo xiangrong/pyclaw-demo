@@ -545,6 +545,95 @@ async def test_agent_allows_distinct_terminal_commands_without_repeat_guard():
 
 
 @pytest.mark.asyncio
+async def test_agent_allows_corrected_retry_after_failed_side_effect_attempt():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    command = 'mkdir -p "$HOME/.pyclaw/cron_history" && osascript -e "display notification \\"ok\\""'
+    model.chat.side_effect = [
+        {
+            "content": "先执行通知命令...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "notify1",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": command, "timeout": 10}),
+                },
+            }],
+        },
+        {
+            "content": "修正 approval 后重试...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "notify2",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": command, "timeout": 10, "approved": True}),
+                },
+            }],
+        },
+        {"content": "通知已完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "notify1",
+                "name": "terminal",
+                "content": "⚠️ 检测到有副作用的指令，请设置 approved=True 后重试。",
+                "success": False,
+                "metadata": {},
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "notify2",
+                "name": "terminal",
+                "content": "notification sent",
+                "success": True,
+                "metadata": {},
+            }
+        ],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-side-effect-retry"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-side-effect-retry", channel="cron", channel_user_id="job_1", session_id="s-side-effect-retry",
+        type=MessageType.TEXT, role=MessageRole.USER, content="发送一次通知",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "通知已完成。"
+    assert "副作用工具重复调用" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_agent_allows_repeated_read_only_cronjob_list():
     model = AsyncMock()
     tools = MagicMock()
