@@ -167,8 +167,11 @@ def test_incomplete_agent_response_is_not_success():
     from pyclaw.cron.scheduler import _is_incomplete_agent_response
 
     assert _is_incomplete_agent_response("⚠️  检测到工具重复调用过多（web_read），我已停止继续执行。")
+    assert _is_incomplete_agent_response("⚠️  检测到副作用工具重复调用（terminal:91bbe17896ca），我已停止继续执行。")
     assert _is_incomplete_agent_response("⚠️  达到最大思考深度，我已停止继续调用工具，避免刷屏。")
     assert _is_incomplete_agent_response("工具调用已达到执行时限，不再继续搜索。")
+    assert _is_incomplete_agent_response("⚠️ LLM 调用出错: Request timed out.")
+    assert _is_incomplete_agent_response("⚠️ LLM 调用出错：模型请求连续超时，定时任务本次未生成有效内容。")
     assert not _is_incomplete_agent_response("# 今日早报\n\n这里是完整结果。")
 
 

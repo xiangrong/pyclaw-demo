@@ -38,11 +38,15 @@ CRON_MAX_ITERATIONS = int(os.getenv("PYCLAW_CRON_MAX_ITERATIONS", "90"))
 CRON_STOP_MARKERS = (
     "工具调用次数过多",
     "工具重复调用过多",
+    "副作用工具重复调用",
     "达到最大思考深度",
     "思考超时",
     "连续多次工具调用失败",
     "工具调用已达到执行时限",
     "工具预算或时间预算已用完",
+    "LLM 调用出错",
+    "模型请求连续超时",
+    "模型请求超时",
 )
 
 # 全局Agent引用（由Gateway设置）
@@ -282,6 +286,7 @@ def _sanitize_cron_final_response(content: str, platform: str = "") -> str:
         r"^(?:⚠️\s*)?工具预算或时间预算已用完[^。\n]*(?:。|\n)+\s*",
         r"^(?:⚠️\s*)?检测到只读/查询类工具重复调用过多[^。\n]*(?:。|\n)+\s*",
         r"^(?:⚠️\s*)?由于[^。\n]*工具调用[^。\n]*停止[^。\n]*(?:。|\n)+\s*",
+        r"^(?:⚠️\s*)?(?:LLM 调用出错|模型请求(?:连续)?超时)[^。\n]*(?:。|\n)+\s*",
     )
     previous = None
     while previous != cleaned:

@@ -505,7 +505,90 @@ async def test_cron_agent_uses_session_iteration_budget_and_reports_activity():
 
 
 @pytest.mark.asyncio
-async def test_agent_stops_before_repeating_side_effect_tool():
+async def test_agent_retries_transient_llm_timeout_before_success(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [TimeoutError("Request timed out."), {"content": "重试后成功。", "__tool_calls__": False}]
+    monkeypatch.setattr("pyclaw.core.agent.asyncio.sleep", AsyncMock())
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-llm-retry"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-llm-retry", channel="feishu", channel_user_id="u1", session_id="s-llm-retry",
+        type=MessageType.TEXT, role=MessageRole.USER, content="查一下最新消息",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "重试后成功。"
+    assert model.chat.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cron_llm_timeout_returns_non_provider_error_after_retries(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = TimeoutError("Request timed out.")
+    monkeypatch.setattr("pyclaw.core.agent.asyncio.sleep", AsyncMock())
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-llm-timeout"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {"llm_retry_attempts": 2}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-cron-llm-timeout", channel="cron", channel_user_id="job_1", session_id="s-cron-llm-timeout",
+        type=MessageType.TEXT, role=MessageRole.USER, content="执行早报",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "模型请求连续超时" in response.content
+    assert "Request timed out" not in response.content
+    assert model.chat.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_forces_final_answer_after_successful_side_effect_tool():
     model = AsyncMock()
     tools = MagicMock()
     tools.execute_tool_calls = AsyncMock()
@@ -514,14 +597,20 @@ async def test_agent_stops_before_repeating_side_effect_tool():
     tools.skills_dirs = []
     tools.get_all_specs.return_value = []
 
-    model.chat.return_value = {
-        "content": "继续执行通知命令...",
-        "__tool_calls__": True,
-        "tool_calls": [{
-            "id": "notify",
-            "function": {"name": "terminal", "arguments": '{"command": "notify"}'}
-        }]
-    }
+    model.chat.side_effect = [
+        {
+            "content": "执行通知命令...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "notify",
+                "function": {"name": "terminal", "arguments": '{"command": "notify"}'}
+            }]
+        },
+        {
+            "content": "通知已完成。",
+            "__tool_calls__": False,
+        },
+    ]
     tools.execute_tool_calls.return_value = [
         {
             "role": "tool",
@@ -559,8 +648,11 @@ async def test_agent_stops_before_repeating_side_effect_tool():
     response = await agent.process_message(user_msg)
 
     assert tools.execute_tool_calls.call_count == 1
-    assert "副作用工具重复调用" in response.content
+    assert response.content == "通知已完成。"
     assert "notification sent" not in response.content
+    assert "副作用工具重复调用" not in response.content
+    assert model.chat.await_args_list[-1].kwargs["tools"] is None
+    assert any("副作用工具已经成功执行" in m.content for m in session.messages)
 
 
 @pytest.mark.asyncio

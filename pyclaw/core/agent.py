@@ -451,16 +451,18 @@ class Agent:
                 tools = self.tools.get_all_specs(active_skills=active_skills)
 
             try:
-                # 调用 LLM
-                result = await self.model.chat(
+                # 调用 LLM。网络抖动/上游超时属于瞬时故障，先短暂重试，
+                # 避免 cron 任务把一次 Request timed out 直接投递给用户。
+                result = await self._chat_with_retries(
                     messages=messages,
                     tools=tools,
                     stream=False,
+                    session=session,
                 )
                 self._touch_activity("llm_response", session)
             except Exception as e:
                 print(f"  ❌ LLM 调用出错: {e}")
-                error_msg = f"⚠️  LLM 调用出错: {str(e)}"
+                error_msg = self._format_llm_error_for_user(e, session)
                 return "\n\n".join(all_responses + [error_msg]), []
 
             content = result.get("content", "") if isinstance(result, dict) else str(result)
@@ -642,6 +644,7 @@ class Agent:
 
                 # 3. 将结果作为 Observation 添加到会话
                 any_failure = False
+                successful_side_effect_calls: list[str] = []
                 for result_index, tr in enumerate(tool_results):
                     if tr.get("success"):
                         side_effect_key = pending_side_effect_keys_by_call_id.get(
@@ -651,6 +654,7 @@ class Agent:
                             side_effect_key = pending_side_effect_key_queue[result_index]
                         if side_effect_key:
                             side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
+                            successful_side_effect_calls.append(side_effect_key)
 
                     # 检查是否包含待发送文件
                     if tr.get("metadata", {}).get("is_file_transfer"):
@@ -718,7 +722,18 @@ class Agent:
                 else:
                     consecutive_failures = 0 # 重置计数
 
-                if soft_deadline_reached:
+                if is_cron_session and successful_side_effect_calls:
+                    await self._request_final_answer_without_tools(
+                        session,
+                        (
+                            "定时任务收尾交付动作已执行；副作用工具已经成功执行："
+                            f"{', '.join(successful_side_effect_calls)}。"
+                            "不要再次调用 terminal、cronjob、发送消息、写文件或其他副作用工具；"
+                            "请直接用一句话确认任务已完成。"
+                        ),
+                    )
+                    force_final_answer = True
+                elif soft_deadline_reached:
                     await self._request_final_answer_without_tools(
                         session,
                         "定时任务收尾交付动作已执行或尝试执行。请不要再调用工具，直接输出最终答复。",
@@ -763,6 +778,64 @@ class Agent:
         except (TypeError, ValueError):
             return default
         return value if value > 0 else default
+
+    async def _chat_with_retries(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]],
+        stream: bool,
+        session: Session,
+    ) -> Any:
+        """Call the model with small retries for transient upstream failures."""
+        attempts = self._get_session_int(session, "llm_retry_attempts", 3)
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                return await self.model.chat(
+                    messages=messages,
+                    tools=tools,
+                    stream=stream,
+                )
+            except Exception as e:
+                last_error = e
+                if not self._is_transient_llm_error(e) or attempt >= attempts - 1:
+                    raise
+                delay = min(2.0, 0.5 * (attempt + 1))
+                print(
+                    f"  ⚠️  LLM transient error, retrying "
+                    f"{attempt + 1}/{attempts - 1}: {type(e).__name__}: {e}"
+                )
+                self._touch_activity("llm_retry", session)
+                await asyncio.sleep(delay)
+        if last_error:
+            raise last_error
+        raise RuntimeError("LLM call failed without an exception")
+
+    def _is_transient_llm_error(self, error: Exception) -> bool:
+        """Return True for temporary model/API failures worth retrying."""
+        error_text = f"{type(error).__name__}: {error}".lower()
+        transient_markers = (
+            "timeout",
+            "timed out",
+            "request timed out",
+            "rate limit",
+            "temporarily unavailable",
+            "connection",
+            "server error",
+            "502",
+            "503",
+            "504",
+        )
+        return any(marker in error_text for marker in transient_markers)
+
+    def _format_llm_error_for_user(self, error: Exception, session: Session) -> str:
+        """Format final LLM errors without leaking raw provider text to chat channels."""
+        if session.channel == "cron":
+            return (
+                "⚠️ LLM 调用出错：模型请求连续超时，定时任务本次未生成有效内容。"
+                "系统已记录失败状态，避免投递不完整结果。"
+            )
+        return "⚠️ 模型请求超时，刚才这次没有完成。请稍后重试，我不会继续重复执行副作用操作。"
 
     def _should_require_source_extraction_before_final(
         self,
