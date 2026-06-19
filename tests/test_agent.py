@@ -735,6 +735,72 @@ async def test_agent_allows_distinct_terminal_commands_without_repeat_guard():
 
 
 @pytest.mark.asyncio
+async def test_agent_filters_duplicate_terminal_calls_in_same_batch():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    terminal_args = json.dumps({"command": "osascript -e 'display notification \"ok\"'", "timeout": 10})
+    model.chat.side_effect = [
+        {
+            "content": "执行一次桌面通知...",
+            "__tool_calls__": True,
+            "tool_calls": [
+                {"id": "notify1", "function": {"name": "terminal", "arguments": terminal_args}},
+                {"id": "notify2", "function": {"name": "terminal", "arguments": terminal_args}},
+            ],
+        },
+        {"content": "通知已完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "notify1",
+            "name": "terminal",
+            "content": "notification sent",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-same-batch"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-same-batch", channel="telegram", channel_user_id="u1", session_id="s-terminal-same-batch",
+        type=MessageType.TEXT, role=MessageRole.USER, content="发送一次通知",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    executed_payload = json.loads(tools.execute_tool_calls.await_args.args[0])
+    assert [tc["id"] for tc in executed_payload["tool_calls"]] == ["notify1"]
+    assert response.content == "通知已完成。"
+    assert "副作用工具重复调用" not in response.content
+    assert any("已跳过重复项" in m.content and "terminal:" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
 async def test_agent_allows_corrected_retry_after_failed_side_effect_attempt():
     model = AsyncMock()
     tools = MagicMock()
@@ -983,6 +1049,169 @@ async def test_agent_requires_extract_after_search_for_current_events():
 
 
 @pytest.mark.asyncio
+async def test_agent_quality_gate_repairs_unresolved_requested_facts():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_search", "description": "search", "parameters": {}},
+        {"name": "web_extract", "description": "extract", "parameters": {}},
+    ]
+
+    pending_draft = """
+🏆 世界杯晚报
+🇵🇹 葡萄牙 vs 🇨🇩 刚果（金） — K组
+⏰ 01:00 CST 已完赛 | ⚠️ 比分待确认
+""".strip()
+    model.chat.side_effect = [
+        {
+            "content": "先搜索赛果。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search1",
+                "function": {"name": "web_search", "arguments": '{"query":"世界杯今日赛果"}'},
+            }],
+        },
+        {
+            "content": "读取权威来源。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "extract1",
+                "function": {"name": "web_extract", "arguments": '{"urls":["https://example.com/scores"]}'},
+            }],
+        },
+        {"content": pending_draft, "__tool_calls__": False},
+        {
+            "content": "定向查询缺失比分。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search2",
+                "function": {"name": "web_search", "arguments": '{"query":"Portugal vs DR Congo final score"}'},
+            }],
+        },
+        {"content": "确认：葡萄牙 2-0 刚果（金）。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "search1", "name": "web_search", "content": "https://example.com/scores", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "extract1", "name": "web_extract", "content": "赛程页缺少比分", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "search2", "name": "web_search", "content": "Portugal 2-0 DR Congo FT", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-sports-pending"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-sports-pending", channel="telegram", channel_user_id="u1", session_id="s-sports-pending",
+        type=MessageType.TEXT, role=MessageRole.USER, content="世界杯晚报，给我今日赛果",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "确认：葡萄牙 2-0 刚果（金）。"
+    executed_names = []
+    for call in tools.execute_tool_calls.await_args_list:
+        payload = json.loads(call.args[0])
+        executed_names.extend(tc["function"]["name"] for tc in payload["tool_calls"])
+    assert executed_names == ["web_search", "web_extract", "web_search"]
+    assert any("unresolved_requested_facts" in m.content for m in session.messages)
+    assert any("targeted lookups/extractions" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_quality_gate_is_not_sports_specific():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_search", "description": "search", "parameters": {}},
+        {"name": "web_extract", "description": "extract", "parameters": {}},
+    ]
+
+    model.chat.side_effect = [
+        {
+            "content": "先查价格。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search-price",
+                "function": {"name": "web_search", "arguments": '{"query":"产品 X 今日价格"}'},
+            }],
+        },
+        {
+            "content": "读取来源。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "extract-price",
+                "function": {"name": "web_extract", "arguments": '{"urls":["https://example.com/price"]}'},
+            }],
+        },
+        {"content": "产品 X 今日价格：暂未获取到完整报价。", "__tool_calls__": False},
+        {
+            "content": "定向查缺失报价。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search-price-2",
+                "function": {"name": "web_search", "arguments": '{"query":"产品 X 官方价格 今日"}'},
+            }],
+        },
+        {"content": "产品 X 今日官方价格确认：199 元。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "search-price", "name": "web_search", "content": "https://example.com/price", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "extract-price", "name": "web_extract", "content": "页面缺少报价", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "search-price-2", "name": "web_search", "content": "官方价格 199 元", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-price-pending"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-price-pending", channel="telegram", channel_user_id="u1", session_id="s-price-pending",
+        type=MessageType.TEXT, role=MessageRole.USER, content="查一下产品 X 今日价格",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "产品 X 今日官方价格确认：199 元。"
+    assert any("unresolved_requested_facts" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
 async def test_agent_does_not_require_extract_for_non_current_search_task():
     model = AsyncMock()
     tools = MagicMock()
@@ -1192,7 +1421,7 @@ async def test_agent_allows_triggering_multiple_distinct_cron_jobs_once():
 
 
 @pytest.mark.asyncio
-async def test_agent_stops_retriggering_same_cron_job():
+async def test_agent_synthesizes_after_repeated_executed_cron_side_effect():
     model = AsyncMock()
     tools = MagicMock()
     tools.execute_tool_calls = AsyncMock()
@@ -1201,14 +1430,25 @@ async def test_agent_stops_retriggering_same_cron_job():
     tools.skills_dirs = []
     tools.get_all_specs.return_value = []
 
-    model.chat.return_value = {
-        "content": "重复触发同一任务...",
-        "__tool_calls__": True,
-        "tool_calls": [{
-            "id": "trigger",
-            "function": {"name": "cronjob", "arguments": '{"action": "trigger", "job_id": "job-a"}'},
-        }],
-    }
+    model.chat.side_effect = [
+        {
+            "content": "触发任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "trigger",
+                "function": {"name": "cronjob", "arguments": '{"action": "trigger", "job_id": "job-a"}'},
+            }],
+        },
+        {
+            "content": "重复触发同一任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "trigger-again",
+                "function": {"name": "cronjob", "arguments": '{"action": "trigger", "job_id": "job-a"}'},
+            }],
+        },
+        {"content": "任务已触发完成。", "__tool_calls__": False},
+    ]
     tools.execute_tool_calls.return_value = [
         {"role": "tool", "tool_call_id": "trigger", "name": "cronjob", "content": "job-a triggered", "success": True, "metadata": {}},
     ]
@@ -1239,8 +1479,75 @@ async def test_agent_stops_retriggering_same_cron_job():
     response = await agent.process_message(user_msg)
 
     assert tools.execute_tool_calls.call_count == 1
-    assert "副作用工具重复调用" in response.content
-    assert "cronjob:trigger:job-a" in response.content
+    assert response.content == "任务已触发完成。"
+    assert "副作用工具重复调用" not in response.content
+    assert model.chat.await_args_list[-1].kwargs["tools"] is None
+    assert any("试图重复执行" in m.content and "cronjob:trigger:job-a" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_synthesizes_after_repeated_executed_cron_update():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    update_args = json.dumps({"action": "update", "job_id": "90e15343", "prompt": "new prompt"})
+    model.chat.side_effect = [
+        {
+            "content": "更新任务...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "update1",
+                "function": {"name": "cronjob", "arguments": update_args},
+            }],
+        },
+        {
+            "content": "再次确认更新...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "update2",
+                "function": {"name": "cronjob", "arguments": update_args},
+            }],
+        },
+        {"content": "任务已更新完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {"role": "tool", "tool_call_id": "update1", "name": "cronjob", "content": "job updated", "success": True, "metadata": {}},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-cron-update-repeat"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-cron-update-repeat", channel="feishu", channel_user_id="u1", session_id="s-cron-update-repeat",
+        type=MessageType.TEXT, role=MessageRole.USER, content="更新这个定时任务",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "任务已更新完成。"
+    assert "副作用工具重复调用" not in response.content
+    assert "cronjob:update:90e15343" not in response.content
 
 
 @pytest.mark.asyncio

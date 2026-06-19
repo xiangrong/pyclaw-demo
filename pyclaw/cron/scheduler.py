@@ -26,6 +26,7 @@ from pyclaw.cron.jobs import (
     get_job,
 )
 from pyclaw.core.message import Message, MessageRole, MessageType
+from pyclaw.core.answer_quality import AnswerQualityGate
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ CRON_STOP_MARKERS = (
     "模型请求连续超时",
     "模型请求超时",
 )
+ANSWER_QUALITY_GATE = AnswerQualityGate()
 
 # 全局Agent引用（由Gateway设置）
 _global_agent = None
@@ -257,7 +259,7 @@ async def run_job_with_agent(
         full_output = f"# Cron Job Execution: {job_id}\n\nPrompt: {prompt}\n\nResponse: {final_response}"
         error = None
         success = True
-        if _is_incomplete_agent_response(final_response):
+        if _is_incomplete_agent_response(final_response, prompt):
             success = False
             error = "Agent stopped before producing a complete cron result"
         return success, full_output, final_response, error
@@ -268,9 +270,12 @@ async def run_job_with_agent(
         return False, error, error, error
 
 
-def _is_incomplete_agent_response(content: str) -> bool:
-    """Return True when an Agent response is a guardrail/timeout notice."""
-    return any(marker in content for marker in CRON_STOP_MARKERS)
+def _is_incomplete_agent_response(content: str, task_text: str = "") -> bool:
+    """Return True when an Agent response should not count as a complete cron result."""
+    return any(marker in content for marker in CRON_STOP_MARKERS) or ANSWER_QUALITY_GATE.is_incomplete_final(
+        content,
+        task_text=task_text,
+    )
 
 
 def _sanitize_cron_final_response(content: str, platform: str = "") -> str:
@@ -332,8 +337,11 @@ def _research_policy_instruction(prompt: str) -> str:
         "软件与开源项目用官方文档、GitHub、release notes；新闻用多家权威媒体并按发布时间核对。"
         "流程：1) 搜索或直达权威来源；2) 用 web_extract 抽取不超过 3-5 个关键页面；"
         "3) 对关键事实至少双源核验；"
-        "4) 无法核验的比分、时间、金额、人物、进球/黄牌等细节写待确认或省略，不要编造；"
-        "5) 最终只输出业务结果和数据源，不暴露搜索过程。"
+        "4) 如果最终草稿里还有用户要求的关键事实待确认（例如比分、价格、版本、日期、链接、状态、数量），"
+        "必须围绕缺失事实做定向检索并抽取权威结果页；"
+        "5) 不要把缺失关键事实的条目放在已确认/结果区，仍无法核验时应移入待核验区或省略；"
+        "6) 无法核验的时间、金额、人物、进球/黄牌等细节写待确认或省略，不要编造；"
+        "7) 最终只输出业务结果和数据源，不暴露搜索过程。"
     )
 
 

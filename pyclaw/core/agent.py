@@ -17,6 +17,7 @@ from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.core.system_prompt.manager import SystemPromptManager
 from pyclaw.core.system_prompt.models import LayerContext
+from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
 
 
 class Agent:
@@ -89,6 +90,7 @@ class Agent:
         self._last_activity_at = time.time()
         self._last_activity_event = "initialized"
         self._last_activity_session_id = ""
+        self.answer_quality_gate = AnswerQualityGate()
 
     def _touch_activity(self, event: str, session: Optional[Session] = None) -> None:
         """Record agent progress for cron inactivity monitoring."""
@@ -417,6 +419,7 @@ class Agent:
         side_effect_call_counts: dict[str, int] = {}
         force_final_answer = False
         soft_deadline_reached = False
+        answer_quality_repair_requested = False
 
         for i in range(max_iterations):
             self._touch_activity(f"loop_iteration_{i + 1}", session)
@@ -547,14 +550,52 @@ class Agent:
                     continue
 
                 if repeated_side_effect_calls:
-                    return self._with_stop_notice(
-                        all_responses,
+                    already_executed_repeats = [
+                        key for key in repeated_side_effect_calls
+                        if side_effect_call_counts.get(key, 0) > 0
+                    ]
+                    if already_executed_repeats:
+                        await self._request_final_answer_without_tools(
+                            session,
+                            (
+                                "副作用工具此前已经成功执行，本轮检测到模型试图重复执行："
+                                f"{', '.join(already_executed_repeats)}。"
+                                "不要再次调用 terminal、cronjob、发送消息、写文件或其他副作用工具；"
+                                "请基于已有工具结果直接确认任务已完成。"
+                            ),
+                        )
+                        force_final_answer = True
+                        continue
+
+                    filtered_tool_calls, skipped_side_effect_calls = self._filter_duplicate_side_effect_tool_calls(
+                        tool_calls,
+                        executed_counts=side_effect_call_counts,
+                        limit=side_effect_tool_limit,
+                    )
+                    if not filtered_tool_calls:
+                        await self._request_final_answer_without_tools(
+                            session,
+                            (
+                                "本轮只有重复的副作用工具调用，已全部拦截："
+                                f"{', '.join(skipped_side_effect_calls or repeated_side_effect_calls)}。"
+                                "不要把拦截原因发给用户；请基于已有上下文直接给出简洁最终答复。"
+                            ),
+                        )
+                        force_final_answer = True
+                        continue
+
+                    result["tool_calls"] = filtered_tool_calls
+                    tool_calls = filtered_tool_calls
+                    await self._request_final_answer_without_tools(
+                        session,
                         (
-                            "⚠️  检测到副作用工具重复调用"
-                            f"（{', '.join(repeated_side_effect_calls)}），我已停止继续执行，"
-                            "避免重复触发任务、重复发消息或重复写入。"
+                            "本轮模型生成了重复的副作用工具调用；系统只会执行每个唯一副作用一次，"
+                            f"已跳过重复项：{', '.join(skipped_side_effect_calls or repeated_side_effect_calls)}。"
+                            "后续不要再次调用 terminal、cronjob、发送消息、写文件或其他副作用工具；"
+                            "工具返回后请直接总结任务结果，不要向用户暴露本条内部提示。"
                         ),
-                    ), pending_files
+                    )
+                    force_final_answer = True
 
                 repeated_tools = [name for name, count in tool_name_counts.items() if count > repeated_tool_limit]
                 if repeated_tools:
@@ -756,6 +797,24 @@ class Agent:
                 await self._request_source_extraction_before_final(session)
                 continue
 
+            quality_decision = self._should_run_answer_quality_gate(
+                session=session,
+                task_text=self._latest_external_user_text(session),
+                draft=content,
+                used_research_tools=self._used_research_tools(tool_name_counts),
+                already_repaired=answer_quality_repair_requested,
+                is_final_iteration=is_final_iteration,
+                force_final_answer=force_final_answer,
+                soft_deadline_reached=soft_deadline_reached,
+                active_skills=active_skills,
+            )
+            if quality_decision.needs_repair:
+                if content.strip() and all_responses and all_responses[-1] == content:
+                    all_responses.pop()
+                await self._request_answer_quality_repair(session, quality_decision.to_repair_notice())
+                answer_quality_repair_requested = True
+                continue
+
             final_content = self._sanitize_user_facing_content("\n\n".join(all_responses))
             self._touch_activity("final_answer", session)
             if not final_content.strip():
@@ -921,6 +980,75 @@ class Agent:
                 "rather than another web_search unless no URL is available. Then synthesize "
                 "the final answer. Do not mention this notice to the user."
             ),
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _used_research_tools(self, tool_name_counts: dict[str, int]) -> bool:
+        """Return True when the turn used retrieval/research tools."""
+        research_tools = {"web_search", "web_extract", "web_read"}
+        return any(tool_name_counts.get(name, 0) > 0 for name in research_tools)
+
+    def _should_run_answer_quality_gate(
+        self,
+        session: Session,
+        task_text: str,
+        draft: str,
+        used_research_tools: bool,
+        already_repaired: bool,
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+        active_skills: Optional[list[str]] = None,
+    ) -> AnswerQualityDecision:
+        """Evaluate a final draft using a pure, Hermes-style quality gate.
+
+        This is intentionally domain-independent.  The gate looks for the
+        general failure mode where a draft leaves requested concrete facts
+        unresolved after research (for example: scores, prices, dates, versions,
+        links, statuses).  Callers turn a repair decision into one extra model
+        turn with targeted guidance.
+        """
+        if already_repaired or is_final_iteration or force_final_answer or soft_deadline_reached:
+            return self.answer_quality_gate.evaluate(
+                task_text=task_text,
+                draft=draft,
+                used_research_tools=used_research_tools,
+                already_repaired=True,
+            )
+        if not draft:
+            return self.answer_quality_gate.evaluate(
+                task_text=task_text,
+                draft=draft,
+                used_research_tools=used_research_tools,
+                already_repaired=True,
+            )
+        can_research = self._tool_available("web_search", active_skills=active_skills) or self._tool_available(
+            "web_extract", active_skills=active_skills
+        )
+        if not can_research:
+            return self.answer_quality_gate.evaluate(
+                task_text=task_text,
+                draft=draft,
+                used_research_tools=used_research_tools,
+                already_repaired=True,
+            )
+        return self.answer_quality_gate.evaluate(
+            task_text=task_text,
+            draft=draft,
+            used_research_tools=used_research_tools,
+            already_repaired=False,
+        )
+
+    async def _request_answer_quality_repair(self, session: Session, notice: str) -> None:
+        """Ask the model for one targeted repair turn before final delivery."""
+        reminder = Message(
+            id=f"answer-quality-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=notice,
         )
         await self.sessions.save_message(session, reminder)
 
@@ -1120,6 +1248,43 @@ class Agent:
         if self._is_side_effect_tool(tool_name):
             return normalized
         return None
+
+    def _filter_duplicate_side_effect_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        executed_counts: dict[str, int],
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Drop duplicate side-effect calls without aborting the whole turn.
+
+        This mirrors Hermes' separation between a pure guardrail decision and
+        runtime handling: repeated mutating calls are skipped internally, while
+        non-duplicate calls in the same batch are still allowed to run.  The
+        user should receive the synthesized task result, not a raw guardrail
+        string such as "副作用工具重复调用".
+        """
+        filtered: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        pending_counts: dict[str, int] = {}
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            tool_name = str(function.get("name", "unknown"))
+            arguments = function.get("arguments", "")
+            side_effect_key = self._side_effect_call_key(tool_name, arguments)
+            if not side_effect_key:
+                filtered.append(tool_call)
+                continue
+
+            already_used = executed_counts.get(side_effect_key, 0) + pending_counts.get(side_effect_key, 0)
+            if already_used >= limit:
+                skipped.append(side_effect_key)
+                continue
+
+            pending_counts[side_effect_key] = pending_counts.get(side_effect_key, 0) + 1
+            filtered.append(tool_call)
+
+        return filtered, skipped
 
     def _terminal_side_effect_call_key(self, arguments: Any) -> Optional[str]:
         """Return a repeat key for terminal calls, or None for safe reads."""

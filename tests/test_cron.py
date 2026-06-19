@@ -233,9 +233,25 @@ def test_research_policy_uses_generic_live_source_strategy():
     assert "不要只依赖泛化关键词搜索" in instruction
     assert "赛事用官方赛程/比分页和主流体育数据页交叉核对" in instruction
     assert "至少双源核验" in instruction
+    assert "比分、价格、版本、日期、链接、状态、数量" in instruction
+    assert "定向检索" in instruction
     assert "不要编造" in instruction
     assert "fifa.com" not in instruction
     assert "espn.com" not in instruction
+
+
+def test_cron_treats_unresolved_requested_facts_as_incomplete():
+    from pyclaw.cron.scheduler import _is_incomplete_agent_response
+
+    content = """
+🏆 2026世界杯赛事晚报
+🇵🇹 葡萄牙 vs 🇨🇩 刚果（金） — K组
+⏰ 01:00 CST 已完赛 | ⚠️ 比分待确认
+""".strip()
+
+    assert _is_incomplete_agent_response(content, "请整理2026世界杯今日赛果和比分")
+    assert not _is_incomplete_agent_response("🏆 世界杯赛果：葡萄牙 2-0 刚果（金）")
+    assert _is_incomplete_agent_response("产品 X 今日价格：暂未获取到完整报价。", "查一下产品 X 今日价格")
 
 
 def test_research_policy_for_non_live_task_is_generic():
