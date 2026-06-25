@@ -10,26 +10,74 @@ from .base import BaseTool, ToolResult
 
 class ReadFileArgs(BaseModel):
     path: str = Field(description="Path to the file to read")
+    start_line: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional 1-based first line to read. Use with end_line for large files.",
+    )
+    end_line: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional 1-based last line to read, inclusive.",
+    )
+    max_chars: int = Field(
+        default=8000,
+        ge=500,
+        le=50000,
+        description="Maximum characters to return. Larger files are truncated with guidance.",
+    )
 
 
 class ReadFileTool(BaseTool):
     """读取文件内容"""
 
     name = "read_file"
-    description = "Read content from a file"
+    description = (
+        "Read content from a file. For source-code navigation, prefer grep_code, "
+        "read_lines, list_symbols, find_refs, and goto_def instead of whole-file reads."
+    )
     args_schema = ReadFileArgs
 
     async def execute(self, **kwargs: str) -> ToolResult:
         path = kwargs.get("path", "")
+        start_line = kwargs.get("start_line")
+        end_line = kwargs.get("end_line")
+        max_chars = int(kwargs.get("max_chars", 8000))
 
         try:
             safe_path = self.validate_path(path)
             with open(safe_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
+                lines = f.readlines()
+
+            total_lines = len(lines)
+            if start_line is not None or end_line is not None:
+                start = int(start_line or 1)
+                end = int(end_line or total_lines)
+                if end < start:
+                    return ToolResult(
+                        success=False,
+                        content="Error reading file: end_line must be greater than or equal to start_line",
+                    )
+                selected_lines = lines[start - 1:end]
+                line_prefix = f" lines {start}-{min(end, total_lines)} of {total_lines}"
+            else:
+                selected_lines = lines
+                line_prefix = f" ({total_lines} lines)"
+
+            content = "".join(selected_lines)
+            truncated = len(content) > max_chars
+            if truncated:
+                content = content[:max_chars]
+                content += (
+                    "\n\n... content truncated ...\n"
+                    "Use start_line/end_line only for non-code documents or tiny targeted snippets. "
+                    "For source code, use grep_code/read_lines/list_symbols/find_refs/goto_def "
+                    "to inspect targeted ranges instead of reading the whole file."
+                )
 
             return ToolResult(
                 success=True,
-                content=f"File: {path}\n\n{content[:8000]}",
+                content=f"File: {path}{line_prefix}\n\n{content}",
             )
 
         except PermissionError as e:

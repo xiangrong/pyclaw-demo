@@ -116,7 +116,7 @@ class TerminalTool(BaseTool):
             stderr = stderr_bytes.decode("utf-8", errors="replace")
             exit_code = proc.returncode or 0
 
-            output = f"Exit code: {exit_code}\n"
+            output = f"Command: {command}\nExit code: {exit_code}\n"
             if stdout:
                 output += f"\nSTDOUT:\n{stdout}\n"
             if stderr:

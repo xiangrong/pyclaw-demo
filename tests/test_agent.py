@@ -1136,6 +1136,86 @@ async def test_agent_quality_gate_repairs_unresolved_requested_facts():
 
 
 @pytest.mark.asyncio
+async def test_agent_quality_gate_repairs_stale_cutoff_for_live_tasks():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [
+        {"name": "web_search", "description": "search", "parameters": {}},
+    ]
+
+    stale_draft = """
+## 最新赛事汇总
+
+## ✅ 已完赛比分（截至6月18日）
+| 组别 | 比分 |
+|---|---|
+| A组 | A 1-0 B |
+""".strip()
+    model.chat.side_effect = [
+        {
+            "content": "先查最新数据。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search1",
+                "function": {"name": "web_search", "arguments": '{"query":"today latest scores"}'},
+            }],
+        },
+        {"content": stale_draft, "__tool_calls__": False},
+        {
+            "content": "按当前日期定向修复。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "search2",
+                "function": {"name": "web_search", "arguments": '{"query":"2026-06-22 final scores"}'},
+            }],
+        },
+        {"content": "确认：6月22日最新赛果已更新。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "search1", "name": "web_search", "content": "old page as of Jun 18", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "search2", "name": "web_search", "content": "fresh Jun 22 results", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-stale-cutoff"
+    session.channel = "cron"
+    session.channel_user_id = "job_1"
+    session.user_id = "job_1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-stale-cutoff", channel="cron", channel_user_id="job_1", session_id="s-stale-cutoff",
+        type=MessageType.TEXT, role=MessageRole.USER,
+        content="当前执行时间：2026-06-22 18:00:00 CST+0800。请整理今日最新赛果和明日赛程。",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "确认：6月22日最新赛果已更新。"
+    executed_names = []
+    for call in tools.execute_tool_calls.await_args_list:
+        payload = json.loads(call.args[0])
+        executed_names.extend(tc["function"]["name"] for tc in payload["tool_calls"])
+    assert executed_names == ["web_search", "web_search"]
+    assert any("stale_cutoff_date" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
 async def test_agent_quality_gate_is_not_sports_specific():
     model = AsyncMock()
     tools = MagicMock()
@@ -1957,3 +2037,329 @@ provider.name = "brave"
     assert "type(e).<b>name</b>" not in formatted
     assert "##" not in formatted
     assert "###" not in formatted
+
+
+@pytest.mark.asyncio
+async def test_patch_first_gate_rejects_implementation_without_diff():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {"content": "方案：需要修改文件。", "__tool_calls__": False},
+        {"content": "已修改并完成。", "__tool_calls__": False},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-patch-first"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-patch-first", channel="feishu", channel_user_id="u1", session_id="s-patch-first",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请帮我实现这个功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "已修改并完成。"
+    assert any("Patch-first quality gate failed" in m.content for m in session.messages)
+    assert "方案：需要修改文件。" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_verification_gate_requires_validation_after_code_change():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {
+            "content": "修改文件。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "edit1",
+                "function": {"name": "edit_file", "arguments": '{"path":"app.py","old":"a","new":"b"}'},
+            }],
+        },
+        {"content": "已完成修改。", "__tool_calls__": False},
+        {
+            "content": "运行测试。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "test1",
+                "function": {"name": "terminal", "arguments": '{"command":"pytest tests/test_app.py -q"}'},
+            }],
+        },
+        {"content": "已完成修改。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: app.py\n--- diff", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "test1", "name": "terminal", "content": "Command: pytest tests/test_app.py -q\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-verification"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=8)
+    user_msg = Message(
+        id="m-verification", channel="feishu", channel_user_id="u1", session_id="s-verification",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请实现功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert any("Verification gate failed" in m.content for m in session.messages)
+    assert "验证结果：PASS: pytest tests/test_app.py -q" in response.content
+
+@pytest.mark.asyncio
+async def test_agent_uses_larger_read_file_repeat_budget_for_coding_tasks():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    repeated_read = {
+        "content": "继续读取代码...",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "read-code",
+            "function": {"name": "read_file", "arguments": '{"path":"MainActivity.java"}'},
+        }],
+    }
+    model.chat.side_effect = [repeated_read] * 10 + [
+        {"content": "已完成实现。", "__tool_calls__": False}
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "read-code",
+            "name": "read_file",
+            "content": "code chunk",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-coding-repeat-budget"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=20)
+    user_msg = Message(
+        id="m-coding-repeat-budget", channel="feishu", channel_user_id="u1", session_id="s-coding-repeat-budget",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请分析这个代码问题并读取代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    # Exact duplicate calls still trigger the existing reflection guard every other turn.
+    # The important regression check is that the read_file name-budget no longer stops
+    # an interactive coding task after the historical limit of 8 total read_file calls.
+    assert tools.execute_tool_calls.call_count == 5
+    assert response.content == "已完成实现。"
+    assert not any("只读/查询类工具重复调用过多" in m.content for m in session.messages)
+    assert not any("工具调用次数已达到上限" in m.content for m in session.messages)
+    assert not any("Patch-first quality gate failed" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_patch_first_repair_points_to_full_code_navigation_toolchain():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {"content": "方案：需要修改代码。", "__tool_calls__": False},
+        {"content": "这次没有完成代码修改：当前没有产生任何文件 diff。", "__tool_calls__": False},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-code-nav-repair"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-code-nav-repair", channel="feishu", channel_user_id="u1", session_id="s-code-nav-repair",
+        type=MessageType.TEXT, role=MessageRole.USER, content="给我实现：把代码导航从 read_file 迁到 grep_code/read_lines/list_symbols/find_refs/goto_def",
+    )
+
+    await agent.process_message(user_msg)
+
+    repair_messages = [m.content for m in session.messages if "Patch-first quality gate failed" in m.content]
+    assert repair_messages
+    assert "grep_code/read_lines/list_symbols/find_refs/goto_def" in repair_messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_coding_turn_gets_larger_tool_budget_than_regular_chat():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "继续定位代码...",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": f"read-{i}",
+                "function": {"name": "read_lines", "arguments": f'{{"path":"big.py","start_line":{i},"end_line":{i+1}}}'},
+            } for i in range(21)],
+        },
+        {"content": "需要我继续完成代码修改吗？", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": f"read-{i}",
+            "name": "read_lines",
+            "content": "code",
+            "success": True,
+            "metadata": {},
+        } for i in range(21)
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-coding-tool-budget"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=6)
+    user_msg = Message(
+        id="m-coding-tool-budget", channel="feishu", channel_user_id="u1", session_id="s-coding-tool-budget",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请帮我实现这个功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert any("Patch-first quality gate failed" in m.content for m in session.messages)
+    assert not any("工具调用次数已达到上限" in m.content for m in session.messages)
+    assert "请确认" not in response.content
+    assert "需要我继续" not in response.content
+    assert "没有完成代码修改" in response.content
+
+
+@pytest.mark.asyncio
+async def test_unfinished_implementation_confirmation_is_rewritten():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {"content": "方案：需要修改文件。", "__tool_calls__": False},
+        {"content": "需要我继续完成这两处文件的代码修改吗？如果确认，我会继续。", "__tool_calls__": False},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-confirm-rewrite"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-confirm-rewrite", channel="feishu", channel_user_id="u1", session_id="s-confirm-rewrite",
+        type=MessageType.TEXT, role=MessageRole.USER, content="你尝试帮我修改完成这个代码功能",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "没有完成代码修改" in response.content
+    assert "需要我继续" not in response.content
+    assert "如果确认" not in response.content

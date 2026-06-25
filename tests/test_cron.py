@@ -254,6 +254,31 @@ def test_cron_treats_unresolved_requested_facts_as_incomplete():
     assert _is_incomplete_agent_response("产品 X 今日价格：暂未获取到完整报价。", "查一下产品 X 今日价格")
 
 
+def test_cron_treats_stale_cutoff_as_incomplete_for_live_tasks():
+    from pyclaw.cron.scheduler import _is_incomplete_agent_response
+
+    task_text = "当前执行时间：2026-06-22 18:00:00 CST+0800。请整理今日最新赛果和明日赛程。"
+    content = """
+## 最新赛事汇总
+
+## ✅ 已完赛比分（截至6月18日）
+| 组别 | 比分 |
+|---|---|
+| A组 | A 1-0 B |
+""".strip()
+
+    assert _is_incomplete_agent_response(content, task_text)
+
+
+def test_cron_allows_explicit_historical_cutoff_scope():
+    from pyclaw.cron.scheduler import _is_incomplete_agent_response
+
+    task_text = "当前执行时间：2026-06-22 18:00:00 CST+0800。请复盘截至6月18日的历史赛果。"
+    content = "## 已完赛比分（截至6月18日）\nA 1-0 B"
+
+    assert not _is_incomplete_agent_response(content, task_text)
+
+
 def test_research_policy_for_non_live_task_is_generic():
     from pyclaw.cron.scheduler import _research_policy_instruction
 

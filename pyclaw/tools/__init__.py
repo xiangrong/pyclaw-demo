@@ -1,5 +1,6 @@
 from .base import BaseTool, ToolResult
 from .files import ReadFileTool, WriteFileTool
+from .code_search import FindRefsTool, GotoDefTool, GrepCodeTool, ListSymbolsTool, ReadLinesTool
 from .registry import ToolRegistry
 from .skill_activation import ActivateSkillTool
 from .terminal import TerminalTool
@@ -13,6 +14,11 @@ __all__ = [
     "ToolResult",
     "ReadFileTool",
     "WriteFileTool",
+    "GrepCodeTool",
+    "FindRefsTool",
+    "GotoDefTool",
+    "ListSymbolsTool",
+    "ReadLinesTool",
     "ToolRegistry",
     "ActivateSkillTool",
     "TerminalTool",

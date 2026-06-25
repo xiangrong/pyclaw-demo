@@ -259,7 +259,7 @@ async def run_job_with_agent(
         full_output = f"# Cron Job Execution: {job_id}\n\nPrompt: {prompt}\n\nResponse: {final_response}"
         error = None
         success = True
-        if _is_incomplete_agent_response(final_response, prompt):
+        if _is_incomplete_agent_response(final_response, cron_prompt):
             success = False
             error = "Agent stopped before producing a complete cron result"
         return success, full_output, final_response, error

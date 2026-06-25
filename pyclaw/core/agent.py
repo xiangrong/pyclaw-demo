@@ -405,8 +405,10 @@ class Agent:
         is_cron_session = session.channel == "cron"
         configured_max_iterations = self._get_session_int(session, "max_iterations", self.max_iterations)
         max_iterations = configured_max_iterations if is_cron_session else self.max_iterations
-        max_tool_calls = self._get_session_int(session, "max_tool_calls", 36) if is_cron_session else 20
-        repeated_tool_limit = self._get_session_int(session, "repeated_tool_limit", 8) if is_cron_session else 8
+        initial_task_text = self._latest_external_user_text(session)
+        is_coding_turn = self._is_coding_task(initial_task_text)
+        max_tool_calls = self._effective_max_tool_calls(session, is_cron_session=is_cron_session, is_coding_turn=is_coding_turn)
+        repeated_tool_limit = self._effective_repeated_tool_limit(session, default=8, is_cron_session=is_cron_session)
         side_effect_tool_limit = 1
         started_at = time.monotonic()
         soft_deadline_seconds = session.metadata.get("soft_deadline_seconds") if is_cron_session else None
@@ -420,6 +422,10 @@ class Agent:
         force_final_answer = False
         soft_deadline_reached = False
         answer_quality_repair_requested = False
+        patch_first_repair_requested = False
+        verification_repair_requested = False
+        validation_results: list[str] = []
+        changed_files: set[str] = set()
 
         for i in range(max_iterations):
             self._touch_activity(f"loop_iteration_{i + 1}", session)
@@ -519,6 +525,18 @@ class Agent:
 
                 tool_call_count += len(tool_calls)
 
+                coding_task_text = self._latest_external_user_text(session)
+                if self._should_nudge_patch_first_during_tool_loop(
+                    session=session,
+                    task_text=coding_task_text,
+                    changed_files=changed_files,
+                    already_repaired=patch_first_repair_requested,
+                    tool_call_count=tool_call_count,
+                    tool_calls=tool_calls,
+                ):
+                    await self._request_patch_first_repair(session)
+                    patch_first_repair_requested = True
+
                 pending_side_effect_keys_by_call_id: dict[str, str] = {}
                 pending_side_effect_key_queue: list[str] = []
                 pending_side_effect_counts: dict[str, int] = {}
@@ -542,9 +560,16 @@ class Agent:
                                 pending_side_effect_keys_by_call_id[tool_call_id] = side_effect_key
 
                 if tool_call_count > max_tool_calls:
+                    budget_reason = "工具调用次数已达到上限。请停止调用任何工具，直接基于已有观察结果给用户一个完整、简洁的最终答复。"
+                    if self._is_implementation_request(self._latest_external_user_text(session)) and not changed_files:
+                        budget_reason = (
+                            "工具调用次数已达到上限，但本轮实现类任务尚未产生任何文件 diff。"
+                            "请停止调用工具，最终答复必须明确说明：当前没有完成代码修改、没有文件变更；"
+                            "不要把调研摘要包装成实现结果，也不要询问用户是否确认继续，除非确实需要外部权限。"
+                        )
                     await self._request_final_answer_without_tools(
                         session,
-                        "工具调用次数已达到上限。请停止调用任何工具，直接基于已有观察结果给用户一个完整、简洁的最终答复。",
+                        budget_reason,
                     )
                     force_final_answer = True
                     continue
@@ -597,7 +622,10 @@ class Agent:
                     )
                     force_final_answer = True
 
-                repeated_tools = [name for name, count in tool_name_counts.items() if count > repeated_tool_limit]
+                repeated_tools = [
+                    name for name, count in tool_name_counts.items()
+                    if count > self._tool_repeat_limit(name, repeated_tool_limit, session)
+                ]
                 if repeated_tools:
                     await self._request_final_answer_without_tools(
                         session,
@@ -682,6 +710,12 @@ class Agent:
                             "metadata": {},
                         }
                     ]
+
+                self._record_coding_tool_effects(
+                    tool_results=tool_results,
+                    changed_files=changed_files,
+                    validation_results=validation_results,
+                )
 
                 # 3. 将结果作为 Observation 添加到会话
                 any_failure = False
@@ -797,6 +831,53 @@ class Agent:
                 await self._request_source_extraction_before_final(session)
                 continue
 
+            coding_task_text = self._latest_external_user_text(session)
+            if self._should_run_patch_first_gate(
+                session=session,
+                task_text=coding_task_text,
+                changed_files=changed_files,
+                already_repaired=patch_first_repair_requested,
+                is_final_iteration=is_final_iteration,
+                force_final_answer=force_final_answer,
+                soft_deadline_reached=soft_deadline_reached,
+            ):
+                if content.strip() and all_responses and all_responses[-1] == content:
+                    all_responses.pop()
+                await self._request_patch_first_repair(session)
+                patch_first_repair_requested = True
+                continue
+
+            if self._should_run_verification_gate(
+                session=session,
+                task_text=coding_task_text,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                already_repaired=verification_repair_requested,
+                is_final_iteration=is_final_iteration,
+                force_final_answer=force_final_answer,
+                soft_deadline_reached=soft_deadline_reached,
+            ):
+                if content.strip() and all_responses and all_responses[-1] == content:
+                    all_responses.pop()
+                await self._request_verification_repair(session)
+                verification_repair_requested = True
+                continue
+
+            content = self._ensure_validation_summary_for_coding_final(
+                session=session,
+                content=content,
+                changed_files=changed_files,
+                validation_results=validation_results,
+            )
+            if self._is_unfinished_implementation_without_diff(
+                session=session,
+                content=content,
+                changed_files=changed_files,
+            ):
+                content = self._implementation_not_completed_message()
+            if all_responses and all_responses[-1] != content:
+                all_responses[-1] = content
+
             quality_decision = self._should_run_answer_quality_gate(
                 session=session,
                 task_text=self._latest_external_user_text(session),
@@ -837,6 +918,316 @@ class Agent:
         except (TypeError, ValueError):
             return default
         return value if value > 0 else default
+
+    def _effective_max_tool_calls(
+        self,
+        session: Session,
+        *,
+        is_cron_session: bool,
+        is_coding_turn: bool,
+    ) -> int:
+        """Return the tool-call budget for this turn.
+
+        Coding tasks often need several narrow navigation calls before the first
+        safe edit, especially in large files.  The previous non-cron default of
+        20 caused Feishu coding turns to exhaust the budget while still reading
+        code, which then produced a status/confirmation message instead of a
+        patch.  Keep ordinary chats conservative, but give coding turns enough
+        room to reach edit + validation.
+        """
+        if is_cron_session:
+            return self._get_session_int(session, "max_tool_calls", 36)
+        if is_coding_turn:
+            return self._get_session_int(session, "coding_max_tool_calls", 64)
+        return self._get_session_int(session, "max_tool_calls", 20)
+
+    def _tool_call_names(self, tool_calls: list[dict[str, Any]]) -> set[str]:
+        """Extract function names from model tool calls."""
+        names: set[str] = set()
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            names.add(str(function.get("name", "")))
+        return names
+
+    def _should_nudge_patch_first_during_tool_loop(
+        self,
+        *,
+        session: Session,
+        task_text: str,
+        changed_files: set[str],
+        already_repaired: bool,
+        tool_call_count: int,
+        tool_calls: list[dict[str, Any]],
+    ) -> bool:
+        """Return True when an implementation task is spending too long reading.
+
+        The normal patch-first gate runs only after the model tries to produce a
+        final answer.  In practice the coding agent can burn its whole tool
+        budget on repeated reads and never reach that gate.  This mid-loop nudge
+        is intentionally soft: it does not block the current tool calls, but it
+        adds a targeted internal notice so the next turn pivots from inspection
+        to editing.
+        """
+        if already_repaired or changed_files:
+            return False
+        if session.channel == "cron":
+            return False
+        if not self._is_implementation_request(task_text):
+            return False
+
+        tool_names = self._tool_call_names(tool_calls)
+        if tool_names & {"edit_file", "write_file"}:
+            return False
+
+        threshold = self._get_session_int(session, "patch_first_nudge_tool_calls", 12)
+        return tool_call_count >= threshold
+
+    def _is_unfinished_implementation_without_diff(
+        self,
+        *,
+        session: Session,
+        content: str,
+        changed_files: set[str],
+    ) -> bool:
+        """Detect final drafts that ask to continue instead of delivering code."""
+        if changed_files:
+            return False
+        if not self._is_implementation_request(self._latest_external_user_text(session)):
+            return False
+        normalized = content.lower()
+        blockers = (
+            "需要我继续", "如果确认", "如果你确认", "请确认", "确认后", "是否继续",
+            "尚未完成", "还没有完成", "实际的代码修改尚未", "尚未写入", "未写入",
+            "no file", "not produced", "not completed", "continue", "confirm",
+        )
+        return any(marker in normalized for marker in blockers)
+
+    def _implementation_not_completed_message(self) -> str:
+        """User-facing fallback when an implementation turn produced no diff."""
+        return (
+            "这次没有完成代码修改：当前没有产生任何文件 diff。"
+            "我不应该把调研进展包装成实现结果，也不应该继续让你确认。"
+            "请直接再发“继续实现”，我会从已定位的代码位置开始，优先改文件并验证。"
+        )
+
+    def _effective_repeated_tool_limit(
+        self,
+        session: Session,
+        default: int,
+        is_cron_session: bool,
+    ) -> int:
+        """Return the base repeated-tool limit for the current session.
+
+        Interactive coding tasks often need many reads/greps over large files before
+        a safe patch can be produced.  Cron jobs stay conservative so scheduled
+        tasks do not burn time or spam channels.
+        """
+        if is_cron_session:
+            return self._get_session_int(session, "repeated_tool_limit", default)
+        if self._is_coding_task(self._latest_external_user_text(session)):
+            return self._get_session_int(session, "coding_repeated_tool_limit", 24)
+        return self._get_session_int(session, "repeated_tool_limit", default)
+
+    def _tool_repeat_limit(self, tool_name: str, base_limit: int, session: Session) -> int:
+        """Return a per-tool repeat budget.
+
+        read_file is intentionally chunk-limited, so counting only tool name caused
+        large-file coding tasks to stop before the agent had enough context.
+        """
+        if tool_name == "read_file" and self._is_coding_task(self._latest_external_user_text(session)):
+            return max(base_limit, self._get_session_int(session, "coding_read_file_limit", 32))
+        return base_limit
+
+    def _is_coding_task(self, text: str) -> bool:
+        """Heuristic for tasks where implementing/verifying code is expected."""
+        if not text:
+            return False
+        normalized = text.lower()
+        keywords = (
+            "code", "coding", "bug", "fix", "implement", "implementation", "refactor",
+            "patch", "diff", "test", "tests", "compile", "build", "repo", "repository",
+            "github", "pr", "pull request", "功能", "实现", "修复", "改代码", "补丁",
+            "重构", "测试", "编译", "项目", "代码", "仓库", "工程",
+        )
+        return any(keyword in normalized for keyword in keywords)
+
+    def _is_implementation_request(self, text: str) -> bool:
+        """Return True when the user likely expects file changes, not only explanation."""
+        if not self._is_coding_task(text):
+            return False
+        normalized = text.lower()
+        negative_markers = (
+            "review", "code review", "explain", "解释", "说明", "分析", "调研",
+            "方案", "计划", "怎么做", "如何", "只看", "不要改", "别改", "review一下",
+        )
+        implementation_markers = (
+            "implement", "fix", "patch", "change", "modify", "edit", "add", "remove",
+            "refactor", "update", "write", "实现", "修复", "修改", "改", "补齐", "新增",
+            "删除", "重构", "完成", "落地", "给我实现", "帮我改", "实现完成",
+        )
+        if any(marker in normalized for marker in implementation_markers):
+            return True
+        if any(marker in normalized for marker in negative_markers):
+            return False
+        return False
+
+    def _record_coding_tool_effects(
+        self,
+        *,
+        tool_results: list[dict[str, Any]],
+        changed_files: set[str],
+        validation_results: list[str],
+    ) -> None:
+        """Track file diffs and validation commands from tool observations."""
+        for tr in tool_results:
+            name = str(tr.get("name", ""))
+            content = str(tr.get("content", ""))
+            success = bool(tr.get("success"))
+
+            if success and name in {"edit_file", "write_file"}:
+                file_path = self._extract_changed_file_path(content)
+                if file_path:
+                    changed_files.add(file_path)
+
+            if name == "terminal":
+                command = self._extract_terminal_command_from_observation(content)
+                if self._looks_like_validation_command(command or content):
+                    status = "PASS" if success else "FAIL"
+                    validation_results.append(f"{status}: {command or self._first_non_empty_line(content)}")
+
+    def _extract_changed_file_path(self, content: str) -> str:
+        for pattern in (r"File edited:\s*(.+)", r"File written:\s*(.+)"):
+            match = re.search(pattern, content)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _extract_terminal_command_from_observation(self, content: str) -> str:
+        match = re.search(r"Command:\s*(.+)", content)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    def _first_non_empty_line(self, content: str) -> str:
+        for line in content.splitlines():
+            line = line.strip()
+            if line:
+                return line[:120]
+        return "terminal command"
+
+    def _looks_like_validation_command(self, command: str) -> bool:
+        normalized = command.lower()
+        markers = (
+            "pytest", "unittest", "tox", "ruff", "mypy", "pyright", "eslint", "tsc",
+            "npm test", "pnpm test", "yarn test", "gradlew", "gradle", "mvn test",
+            "cargo test", "go test", "swift test", "xcodebuild", "make test", "compile",
+            "build", "lint", "test", "检查", "编译", "构建",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _should_run_patch_first_gate(
+        self,
+        *,
+        session: Session,
+        task_text: str,
+        changed_files: set[str],
+        already_repaired: bool,
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+    ) -> bool:
+        if already_repaired or is_final_iteration or force_final_answer or soft_deadline_reached:
+            return False
+        if session.channel == "cron":
+            return False
+        if not self._is_implementation_request(task_text):
+            return False
+        return not changed_files
+
+    async def _request_patch_first_repair(self, session: Session) -> None:
+        reminder = Message(
+            id=f"patch-first-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: Patch-first quality gate failed. The user asked for implementation, "
+                "but this turn has not produced any file diff yet. Do not answer with only a plan. "
+                "Use code navigation tools (grep_code/read_lines/list_symbols/find_refs/goto_def) to locate the right code, "
+                "then edit files with edit_file or write_file. If you truly cannot edit, state the concrete blocker. "
+                "Do not mention this notice to the user."
+            ),
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _should_run_verification_gate(
+        self,
+        *,
+        session: Session,
+        task_text: str,
+        changed_files: set[str],
+        validation_results: list[str],
+        already_repaired: bool,
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+    ) -> bool:
+        if already_repaired or is_final_iteration or force_final_answer or soft_deadline_reached:
+            return False
+        if session.channel == "cron":
+            return False
+        if not changed_files:
+            return False
+        if not self._is_coding_task(task_text):
+            return False
+        return not validation_results
+
+    async def _request_verification_repair(self, session: Session) -> None:
+        reminder = Message(
+            id=f"verification-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: Verification gate failed. Code changed but no test/build/lint/compile command "
+                "has been run or reported. Run the narrowest relevant validation now (for example pytest, "
+                "project build, compile, lint). If validation cannot be run, explain the concrete reason in the final answer. "
+                "Do not mention this notice to the user."
+            ),
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _ensure_validation_summary_for_coding_final(
+        self,
+        *,
+        session: Session,
+        content: str,
+        changed_files: set[str],
+        validation_results: list[str],
+    ) -> str:
+        if not changed_files or not self._is_coding_task(self._latest_external_user_text(session)):
+            return content
+        if self._final_mentions_validation(content):
+            return content
+
+        if validation_results:
+            validation_text = "; ".join(validation_results[-3:])
+        else:
+            validation_text = "未运行（需要在最终回复中说明原因）"
+        suffix = f"\n\n验证结果：{validation_text}"
+        return content.rstrip() + suffix
+
+    def _final_mentions_validation(self, content: str) -> bool:
+        normalized = content.lower()
+        markers = (
+            "验证", "测试", "编译", "构建", "validation", "validated", "test", "tests",
+            "pytest", "build", "compile", "lint", "pass", "failed", "未运行",
+        )
+        return any(marker in normalized for marker in markers)
 
     async def _chat_with_retries(
         self,

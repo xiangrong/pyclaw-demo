@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Iterable, Literal
 
 QualityAction = Literal["allow", "repair"]
@@ -89,6 +90,23 @@ class AnswerQualityGate:
         r"latest|current|today|yesterday|tomorrow|live|news|recent|report|summary|lookup",
         re.IGNORECASE,
     )
+    _TASK_CURRENT_DATE_RES = (
+        re.compile(r"当前执行时间[:：]\s*(\d{4})-(\d{1,2})-(\d{1,2})"),
+        re.compile(r"当前(?:日期|时间)[^\d]{0,8}(\d{4})[年/-](\d{1,2})[月/-](\d{1,2})"),
+        re.compile(r"\b(?:today|current date|current time)\D{0,20}(\d{4})-(\d{1,2})-(\d{1,2})\b", re.IGNORECASE),
+    )
+    _CUTOFF_DATE_RES = (
+        re.compile(
+            r"(?P<label>截至|截止(?:到)?|更新(?:至|到)|数据(?:截至|更新至)|as of|through|updated(?: through| to)?|up to)"
+            r"[^\dA-Za-z]{0,12}(?:(?P<year>20\d{2})[年/-])?(?P<month>\d{1,2})[月/-](?P<day>\d{1,2})(?:日|号)?",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?P<label>截至|截止(?:到)?|更新(?:至|到)|数据(?:截至|更新至)|as of|through|updated(?: through| to)?|up to)"
+            r"[^\dA-Za-z]{0,12}(?P<year>20\d{2})-(?P<month>\d{1,2})-(?P<day>\d{1,2})",
+            re.IGNORECASE,
+        ),
+    )
 
     def evaluate(
         self,
@@ -124,6 +142,18 @@ class AnswerQualityGate:
                         "The draft marks items as completed but still says required facts are pending or unavailable."
                     ),
                     evidence=tuple(completed_without_facts),
+                )
+            )
+
+        stale_cutoffs = self._stale_cutoff_dates(task_text, draft)
+        if stale_cutoffs:
+            issues.append(
+                AnswerQualityIssue(
+                    code="stale_cutoff_date",
+                    message=(
+                        "The draft uses a data cutoff date that is older than the current/live task date."
+                    ),
+                    evidence=tuple(stale_cutoffs),
                 )
             )
 
@@ -190,6 +220,73 @@ class AnswerQualityGate:
     def _matching_lines(self, text: str, pattern: re.Pattern[str]) -> list[str]:
         return _dedupe(_compact(line) for line in _logical_lines(text) if pattern.search(line))
 
+    def _stale_cutoff_dates(self, task_text: str, draft: str) -> list[str]:
+        """Find stale cutoff/update dates in live factual answers.
+
+        This is intentionally topic-agnostic.  A current task should not be
+        delivered as successful when the answer says its underlying data is only
+        current "as of" several days ago.  We allow a one-day lag because daily
+        reports often summarize yesterday's completed data.
+        """
+        if not self._looks_like_live_factual_task(task_text):
+            return []
+        current_date = self._extract_current_date(task_text)
+        if current_date is None:
+            return []
+
+        matches: list[str] = []
+        for line in _logical_lines(draft):
+            cutoff_dates = self._extract_cutoff_dates(line, default_year=current_date.year)
+            for cutoff_date in cutoff_dates:
+                if (current_date - cutoff_date).days <= 1:
+                    continue
+                if self._task_explicitly_requested_cutoff(task_text, cutoff_date):
+                    continue
+                matches.append(f"{_compact(line)} (current task date: {current_date.isoformat()})")
+        return _dedupe(matches)
+
+    def _extract_current_date(self, text: str) -> date | None:
+        for pattern in self._TASK_CURRENT_DATE_RES:
+            match = pattern.search(text or "")
+            if not match:
+                continue
+            parsed = _safe_date(match.group(1), match.group(2), match.group(3))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _extract_cutoff_dates(self, text: str, *, default_year: int) -> list[date]:
+        dates: list[date] = []
+        for pattern in self._CUTOFF_DATE_RES:
+            for match in pattern.finditer(text or ""):
+                parsed = _safe_date(
+                    match.groupdict().get("year") or str(default_year),
+                    match.group("month"),
+                    match.group("day"),
+                )
+                if parsed is not None:
+                    dates.append(parsed)
+        return dates
+
+    def _task_explicitly_requested_cutoff(self, task_text: str, cutoff_date: date) -> bool:
+        """Return True when an old cutoff date is explicitly the requested scope."""
+        compact = _compact(task_text)
+        month_day = f"{cutoff_date.month}月{cutoff_date.day}日"
+        iso_day = cutoff_date.isoformat()
+        slash_day = f"{cutoff_date.month}/{cutoff_date.day}"
+        requested_scope_re = re.compile(
+            r"(?:截至|截止(?:到)?|更新(?:至|到)|历史|回顾|复盘|归档|archive|historical|as of|through)"
+            r".{0,20}(?:"
+            + re.escape(month_day)
+            + r"|"
+            + re.escape(iso_day)
+            + r"|"
+            + re.escape(slash_day)
+            + r")",
+            re.IGNORECASE,
+        )
+        return bool(requested_scope_re.search(compact))
+
     def _looks_like_fact_line(self, line: str) -> bool:
         if not line:
             return False
@@ -219,3 +316,10 @@ def _dedupe(items: Iterable[str]) -> list[str]:
             seen.add(compact)
             result.append(compact)
     return result
+
+
+def _safe_date(year: str, month: str, day: str) -> date | None:
+    try:
+        return date(int(year), int(month), int(day))
+    except (TypeError, ValueError):
+        return None
