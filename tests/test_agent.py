@@ -2110,11 +2110,20 @@ async def test_verification_gate_requires_validation_after_code_change():
                 "function": {"name": "terminal", "arguments": '{"command":"pytest tests/test_app.py -q"}'},
             }],
         },
+        {
+            "content": "运行编译。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "build1",
+                "function": {"name": "terminal", "arguments": '{"command":"python -m py_compile app.py"}'},
+            }],
+        },
         {"content": "已完成修改。", "__tool_calls__": False},
     ]
     tools.execute_tool_calls.side_effect = [
         [{"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: app.py\n--- diff", "success": True, "metadata": {}}],
         [{"role": "tool", "tool_call_id": "test1", "name": "terminal", "content": "Command: pytest tests/test_app.py -q\nExit code: 0", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "build1", "name": "terminal", "content": "Command: python -m py_compile app.py\nExit code: 0", "success": True, "metadata": {}}],
     ]
 
     sessions = AsyncMock()
@@ -2143,7 +2152,154 @@ async def test_verification_gate_requires_validation_after_code_change():
     response = await agent.process_message(user_msg)
 
     assert any("Verification gate failed" in m.content for m in session.messages)
-    assert "验证结果：PASS: pytest tests/test_app.py -q" in response.content
+    assert "验证结果：PASS: pytest tests/test_app.py -q; PASS: python -m py_compile app.py" in response.content
+
+
+
+@pytest.mark.asyncio
+async def test_coding_task_status_is_added_to_final_answer_after_validation():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {
+            "content": "修改文件。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "edit1",
+                "function": {"name": "edit_file", "arguments": '{"path":"app.py","old":"a","new":"b"}'},
+            }],
+        },
+        {
+            "content": "运行测试。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "test1",
+                "function": {"name": "terminal", "arguments": '{"command":"pytest tests/test_app.py -q"}'},
+            }],
+        },
+        {
+            "content": "运行编译。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "build1",
+                "function": {"name": "terminal", "arguments": '{"command":"python -m py_compile app.py"}'},
+            }],
+        },
+        {"content": "已完成修改。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: app.py\n--- diff", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "test1", "name": "terminal", "content": "Command: pytest tests/test_app.py -q\nExit code: 0", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "build1", "name": "terminal", "content": "Command: python -m py_compile app.py\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-task-status"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-task-status", channel="feishu", channel_user_id="u1", session_id="s-task-status",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请实现功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "任务清单：" in response.content
+    assert "[x] 完成代码修改" in response.content
+    assert "[x] 运行最小验证" in response.content
+    assert "[x] 尝试编译/构建" in response.content
+    assert "PASS: python -m py_compile app.py" in response.content
+
+
+@pytest.mark.asyncio
+async def test_build_gate_requires_compile_after_validation_passes():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {
+            "content": "修改文件。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "edit1",
+                "function": {"name": "edit_file", "arguments": '{"path":"app.py","old":"a","new":"b"}'},
+            }],
+        },
+        {
+            "content": "运行测试。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "test1",
+                "function": {"name": "terminal", "arguments": '{"command":"pytest tests/test_app.py -q"}'},
+            }],
+        },
+        {"content": "已完成修改。", "__tool_calls__": False},
+        {
+            "content": "运行编译。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "build1",
+                "function": {"name": "terminal", "arguments": '{"command":"python -m py_compile app.py"}'},
+            }],
+        },
+        {"content": "已完成修改。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: app.py\n--- diff", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "test1", "name": "terminal", "content": "Command: pytest tests/test_app.py -q\nExit code: 0", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "build1", "name": "terminal", "content": "Command: python -m py_compile app.py\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-build-gate"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-build-gate", channel="feishu", channel_user_id="u1", session_id="s-build-gate",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请实现功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert any("Build gate failed" in m.content for m in session.messages)
+    assert "PASS: python -m py_compile app.py" in response.content
 
 @pytest.mark.asyncio
 async def test_agent_uses_larger_read_file_repeat_budget_for_coding_tasks():

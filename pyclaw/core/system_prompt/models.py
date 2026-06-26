@@ -21,6 +21,7 @@ class LayerContext(BaseModel):
     session_id: str = ""
     current_objective: str = ""
     current_plan: str = ""
+    coding_task_status: str = ""
     history_summary: str = ""
     semantic_memory: str = ""
     experience_memory: str = ""

@@ -187,6 +187,9 @@ class Agent:
             context.session_id = session.session_id
             context.current_objective = session.metadata.get("current_objective", "")
             context.current_plan = session.metadata.get("current_plan", "")
+            context.coding_task_status = self._format_coding_task_status_for_prompt(
+                session.metadata.get("coding_task_status", {})
+            )
             
             # 获取语义记忆
             semantic_memory, experience_memory = await self._get_semantic_memories(session)
@@ -195,6 +198,19 @@ class Agent:
 
         # 2. 调用管理器生成
         return await self.system_prompt_manager.generate_prompt(context)
+
+    def _format_coding_task_status_for_prompt(self, status: Any) -> str:
+        if not isinstance(status, dict):
+            return ""
+        tasks = status.get("tasks")
+        if not isinstance(tasks, list):
+            return ""
+        lines = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            lines.append(f"- {task.get('id', 'task')}: {task.get('status', 'pending')} - {task.get('title', '')}")
+        return "\n".join(lines)
 
     def _load_soul_md(self) -> str:
         """加载全局灵魂配置"""
@@ -424,8 +440,13 @@ class Agent:
         answer_quality_repair_requested = False
         patch_first_repair_requested = False
         verification_repair_requested = False
+        build_repair_requested = False
         validation_results: list[str] = []
+        build_results: list[str] = []
         changed_files: set[str] = set()
+        coding_task_status = self._new_coding_task_status(initial_task_text) if is_coding_turn else {}
+        if coding_task_status:
+            await self._persist_coding_task_status(session, coding_task_status)
 
         for i in range(max_iterations):
             self._touch_activity(f"loop_iteration_{i + 1}", session)
@@ -715,7 +736,16 @@ class Agent:
                     tool_results=tool_results,
                     changed_files=changed_files,
                     validation_results=validation_results,
+                    build_results=build_results,
                 )
+                if coding_task_status:
+                    await self._refresh_coding_task_status(
+                        session=session,
+                        status=coding_task_status,
+                        changed_files=changed_files,
+                        validation_results=validation_results,
+                        build_results=build_results,
+                    )
 
                 # 3. 将结果作为 Observation 添加到会话
                 any_failure = False
@@ -863,12 +893,42 @@ class Agent:
                 verification_repair_requested = True
                 continue
 
+            if self._should_run_build_gate(
+                session=session,
+                task_text=coding_task_text,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+                already_repaired=build_repair_requested,
+                is_final_iteration=is_final_iteration,
+                force_final_answer=force_final_answer,
+                soft_deadline_reached=soft_deadline_reached,
+            ):
+                if content.strip() and all_responses and all_responses[-1] == content:
+                    all_responses.pop()
+                await self._request_build_repair(session)
+                build_repair_requested = True
+                continue
+
             content = self._ensure_validation_summary_for_coding_final(
                 session=session,
                 content=content,
                 changed_files=changed_files,
                 validation_results=validation_results,
             )
+
+            if coding_task_status and (changed_files or validation_results or build_results):
+                await self._refresh_coding_task_status(
+                    session=session,
+                    status=coding_task_status,
+                    changed_files=changed_files,
+                    validation_results=validation_results,
+                    build_results=build_results,
+                )
+                content = self._ensure_task_status_summary_for_coding_final(
+                    content=content,
+                    status=coding_task_status,
+                )
             if self._is_unfinished_implementation_without_diff(
                 session=session,
                 content=content,
@@ -1071,12 +1131,127 @@ class Agent:
             return False
         return False
 
+    def _new_coding_task_status(self, task_text: str) -> dict[str, Any]:
+        """Create a lightweight todo/checklist state for a coding turn.
+
+        Mature coding agents keep a task ledger outside the model's prose so
+        the controller can enforce progress.  This intentionally uses stable,
+        generic phases instead of trying to infer every project-specific subtask.
+        The model may still maintain a richer PLAN, but these phases are what
+        PyClaw gates before final delivery.
+        """
+        if not self._is_coding_task(task_text):
+            return {}
+
+        tasks = [
+            {"id": "understand", "title": "理解需求与约束", "status": "pending"},
+            {"id": "locate", "title": "定位相关代码", "status": "pending"},
+        ]
+        if self._is_implementation_request(task_text):
+            tasks.append({"id": "patch", "title": "完成代码修改", "status": "pending"})
+        tasks.append({"id": "validate", "title": "运行最小验证", "status": "pending"})
+        tasks.append({"id": "build", "title": "尝试编译/构建", "status": "pending"})
+        tasks.append({"id": "report", "title": "汇总变更与验证结果", "status": "pending"})
+        return {"kind": "coding_task_status", "task_text": task_text, "tasks": tasks}
+
+    async def _persist_coding_task_status(self, session: Session, status: dict[str, Any]) -> None:
+        """Persist the coding checklist in session metadata for prompt rendering."""
+        if not status:
+            return
+        if session.metadata.get("coding_task_status") == status:
+            return
+        session.metadata["coding_task_status"] = status
+        await self._persist_session_metadata(session)
+
+    async def _refresh_coding_task_status(
+        self,
+        *,
+        session: Session,
+        status: dict[str, Any],
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+    ) -> None:
+        """Update checklist phases from observed tool effects."""
+        if not status:
+            return
+
+        tool_names = [m.metadata.get("tool_name") for m in session.messages if m.role == MessageRole.TOOL]
+        has_code_navigation = any(
+            name in {
+                "grep_code", "read_lines", "list_symbols", "find_refs", "goto_def",
+                "read_file", "terminal",
+            }
+            for name in tool_names
+        )
+        task_map = {task.get("id"): task for task in status.get("tasks", [])}
+
+        def set_status(task_id: str, value: str) -> None:
+            task = task_map.get(task_id)
+            if task is not None:
+                task["status"] = value
+
+        set_status("understand", "completed")
+        if has_code_navigation:
+            set_status("locate", "completed")
+        if changed_files:
+            set_status("patch", "completed")
+        if validation_results:
+            set_status("validate", "completed" if self._latest_result_passed(validation_results) else "failed")
+        if build_results:
+            set_status("build", "completed" if self._latest_result_passed(build_results) else "failed")
+        elif validation_results and not self._task_needs_build_attempt(self._latest_external_user_text(session)):
+            set_status("build", "skipped")
+        set_status("report", "in_progress")
+
+        await self._persist_coding_task_status(session, status)
+
+    async def _persist_session_metadata(self, session: Session) -> None:
+        """Persist session metadata when the backing manager supports DB access."""
+        db_connect = getattr(self.sessions, "db_connect", None)
+        if not callable(db_connect):
+            return
+        if getattr(db_connect, "__module__", "").startswith("unittest.mock"):
+            return
+        async with self.sessions.db_connect() as db:
+            await db.execute(
+                "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+                (json.dumps(session.metadata), session.session_id),
+            )
+            await db.commit()
+
+    def _latest_result_passed(self, results: list[str]) -> bool:
+        if not results:
+            return False
+        return results[-1].upper().startswith("PASS:")
+
+    def _ensure_task_status_summary_for_coding_final(self, *, content: str, status: dict[str, Any]) -> str:
+        """Ensure final coding answers expose the checklist outcome."""
+        if not status or self._final_mentions_task_status(content):
+            return content
+        lines = ["\n\n任务清单："]
+        for task in status.get("tasks", []):
+            state = str(task.get("status", "pending"))
+            mark = {
+                "completed": "[x]",
+                "failed": "[!]",
+                "skipped": "[-]",
+                "in_progress": "[~]",
+            }.get(state, "[ ]")
+            lines.append(f"- {mark} {task.get('title', task.get('id', 'task'))}")
+        return content.rstrip() + "\n".join(lines)
+
+    def _final_mentions_task_status(self, content: str) -> bool:
+        normalized = content.lower()
+        return "任务清单" in normalized or "checklist" in normalized or "todo" in normalized
+
     def _record_coding_tool_effects(
         self,
         *,
         tool_results: list[dict[str, Any]],
         changed_files: set[str],
         validation_results: list[str],
+        build_results: list[str],
     ) -> None:
         """Track file diffs and validation commands from tool observations."""
         for tr in tool_results:
@@ -1093,7 +1268,10 @@ class Agent:
                 command = self._extract_terminal_command_from_observation(content)
                 if self._looks_like_validation_command(command or content):
                     status = "PASS" if success else "FAIL"
-                    validation_results.append(f"{status}: {command or self._first_non_empty_line(content)}")
+                    result_text = f"{status}: {command or self._first_non_empty_line(content)}"
+                    validation_results.append(result_text)
+                    if self._looks_like_build_command(command or content):
+                        build_results.append(result_text)
 
     def _extract_changed_file_path(self, content: str) -> str:
         for pattern in (r"File edited:\s*(.+)", r"File written:\s*(.+)"):
@@ -1124,6 +1302,28 @@ class Agent:
             "build", "lint", "test", "检查", "编译", "构建",
         )
         return any(marker in normalized for marker in markers)
+
+    def _looks_like_build_command(self, command: str) -> bool:
+        normalized = command.lower()
+        markers = (
+            "build", "compile", "assemble", "gradlew", "gradle", "mvn package", "mvn install",
+            "npm run build", "pnpm build", "yarn build", "tsc", "cargo build", "go build",
+            "xcodebuild", "make", "编译", "构建",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _task_needs_build_attempt(self, task_text: str) -> bool:
+        if not self._is_coding_task(task_text):
+            return False
+        normalized = task_text.lower()
+        explicit = (
+            "编译", "构建", "build", "compile", "跑一下", "运行一下", "验证通过", "校验通过",
+        )
+        if any(marker in normalized for marker in explicit):
+            return True
+        # Implementation turns benefit from build attempts, but do not force
+        # build for pure code review/explanation tasks.
+        return self._is_implementation_request(task_text)
 
     def _should_run_patch_first_gate(
         self,
@@ -1201,6 +1401,57 @@ class Agent:
         )
         await self.sessions.save_message(session, reminder)
 
+    def _should_run_build_gate(
+        self,
+        *,
+        session: Session,
+        task_text: str,
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+        already_repaired: bool,
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+    ) -> bool:
+        """Require one compile/build attempt after tests pass when useful.
+
+        This mirrors modern coding-agent behavior: edit -> narrow tests ->
+        broader compile/build when the project exposes one.  It is a soft gate:
+        one repair turn is enough, and the model may report a concrete reason
+        when no build target exists or the sandbox blocks it.
+        """
+        if already_repaired or is_final_iteration or force_final_answer or soft_deadline_reached:
+            return False
+        if session.channel == "cron":
+            return False
+        if not changed_files or not validation_results:
+            return False
+        if build_results:
+            return False
+        if not self._latest_result_passed(validation_results):
+            return False
+        return self._task_needs_build_attempt(task_text)
+
+    async def _request_build_repair(self, session: Session) -> None:
+        reminder = Message(
+            id=f"build-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: Build gate failed. Code changed and narrow validation has passed, "
+                "but no compile/build command has been attempted yet. Inspect project files if needed, "
+                "then run the narrowest relevant build/compile command (for example py_compile, tsc, "
+                "npm run build, ./gradlew compileDebugJavaWithJavac/assembleDebug, mvn test/package, cargo build). "
+                "If no build target exists or the sandbox blocks it, say that concrete reason in the final answer. "
+                "Do not mention this notice to the user."
+            ),
+        )
+        await self.sessions.save_message(session, reminder)
+
     def _ensure_validation_summary_for_coding_final(
         self,
         *,
@@ -1224,7 +1475,7 @@ class Agent:
     def _final_mentions_validation(self, content: str) -> bool:
         normalized = content.lower()
         markers = (
-            "验证", "测试", "编译", "构建", "validation", "validated", "test", "tests",
+            "验证结果", "validation result", "validated", "tests passed", "tests failed",
             "pytest", "build", "compile", "lint", "pass", "failed", "未运行",
         )
         return any(marker in normalized for marker in markers)
