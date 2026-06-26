@@ -567,7 +567,7 @@ class Agent:
                     tool_name = tc.get("function", {}).get("name", "unknown")
                     tool_arguments = tc.get("function", {}).get("arguments", "")
                     tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
-                    side_effect_key = self._side_effect_call_key(tool_name, tool_arguments)
+                    side_effect_key = self._side_effect_call_key(tool_name, tool_arguments, session=session)
                     if side_effect_key:
                         already_executed = side_effect_call_counts.get(side_effect_key, 0)
                         already_pending = pending_side_effect_counts.get(side_effect_key, 0)
@@ -617,6 +617,7 @@ class Agent:
                         tool_calls,
                         executed_counts=side_effect_call_counts,
                         limit=side_effect_tool_limit,
+                        session=session,
                     )
                     if not filtered_tool_calls:
                         await self._request_final_answer_without_tools(
@@ -1843,7 +1844,12 @@ class Agent:
             return True
         return any(keyword in normalized for keyword in self.SIDE_EFFECT_TOOL_KEYWORDS)
 
-    def _side_effect_call_key(self, tool_name: str, arguments: Any) -> Optional[str]:
+    def _side_effect_call_key(
+        self,
+        tool_name: str,
+        arguments: Any,
+        session: Optional[Session] = None,
+    ) -> Optional[str]:
         """Return a repeat-detection key for side-effectful calls.
 
         Multiple distinct cron triggers in one user-requested batch are valid,
@@ -1853,6 +1859,13 @@ class Agent:
         being repeated, but it does not stop legitimate multi-step CLI
         workflows, such as opening an authenticated browser page and then
         inspecting its state. Known read-only terminal commands are exempt.
+
+        File writes are also keyed by their target path and edit intent. A
+        single implementation can legitimately require several edits across
+        source, layout, tests, and build files; treating all edit_file calls as
+        the same side effect prematurely stops the agent and forces the user to
+        send repeated "continue" messages. Exact duplicate edits are still
+        blocked.
         """
         normalized = tool_name.lower()
         if normalized == "cronjob":
@@ -1887,9 +1900,44 @@ class Agent:
             return f"cronjob:{action}:{job_id or '<no-job-id>'}"
         if normalized == "terminal":
             return self._terminal_side_effect_call_key(arguments)
+        if normalized in {"edit_file", "write_file", "delete_file"}:
+            return self._file_side_effect_call_key(normalized, arguments, session=session)
         if self._is_side_effect_tool(tool_name):
             return normalized
         return None
+
+    def _file_side_effect_call_key(
+        self,
+        tool_name: str,
+        arguments: Any,
+        session: Optional[Session] = None,
+    ) -> str:
+        """Return a repeat key for file mutation tools.
+
+        The optional session parameter keeps the signature aligned with other
+        side-effect policies and leaves room for future channel-specific rules.
+        """
+        del session
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (TypeError, json.JSONDecodeError):
+            args = {}
+        if not isinstance(args, dict):
+            return tool_name
+
+        path = str(args.get("path") or args.get("file_path") or args.get("target") or "<unknown>").strip()
+        fingerprint_payload: dict[str, Any] = {"tool": tool_name, "path": path}
+        if tool_name == "edit_file":
+            fingerprint_payload["old"] = str(args.get("old", ""))[:500]
+            fingerprint_payload["new"] = str(args.get("new", ""))[:500]
+        elif tool_name == "write_file":
+            content = str(args.get("content", ""))
+            fingerprint_payload["content_hash"] = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+
+        digest = hashlib.sha256(
+            json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"{tool_name}:{path}:{digest}"
 
     def _filter_duplicate_side_effect_tool_calls(
         self,
@@ -1897,6 +1945,7 @@ class Agent:
         *,
         executed_counts: dict[str, int],
         limit: int,
+        session: Optional[Session] = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Drop duplicate side-effect calls without aborting the whole turn.
 
@@ -1913,7 +1962,7 @@ class Agent:
             function = tool_call.get("function", {})
             tool_name = str(function.get("name", "unknown"))
             arguments = function.get("arguments", "")
-            side_effect_key = self._side_effect_call_key(tool_name, arguments)
+            side_effect_key = self._side_effect_call_key(tool_name, arguments, session=session)
             if not side_effect_key:
                 filtered.append(tool_call)
                 continue

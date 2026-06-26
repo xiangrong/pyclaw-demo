@@ -735,6 +735,75 @@ async def test_agent_allows_distinct_terminal_commands_without_repeat_guard():
 
 
 @pytest.mark.asyncio
+async def test_agent_allows_multiple_distinct_file_edits_in_one_coding_turn():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    first_edit_args = json.dumps({"path": "MainActivity.java", "old": "a", "new": "b"})
+    second_edit_args = json.dumps({"path": "activity_main.xml", "old": "x", "new": "y"})
+    model.chat.side_effect = [
+        {
+            "content": "先改 Java。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "edit1", "function": {"name": "edit_file", "arguments": first_edit_args}}],
+        },
+        {
+            "content": "再改布局。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "edit2", "function": {"name": "edit_file", "arguments": second_edit_args}}],
+        },
+        {
+            "content": "运行验证。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "test1",
+                "function": {"name": "terminal", "arguments": json.dumps({"command": "python -m py_compile MainActivity.java"})},
+            }],
+        },
+        {"content": "已完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: MainActivity.java", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "edit2", "name": "edit_file", "content": "File edited: activity_main.xml", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "test1", "name": "terminal", "content": "Command: python -m py_compile MainActivity.java\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-multiple-file-edits"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-multiple-file-edits", channel="feishu", channel_user_id="u1", session_id="s-multiple-file-edits",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请实现功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 3
+    assert not any("副作用工具此前已经成功执行" in m.content and "edit_file" in m.content for m in session.messages)
+    assert "已完成" in response.content
+    assert "任务清单" in response.content
+
+@pytest.mark.asyncio
 async def test_agent_filters_duplicate_terminal_calls_in_same_batch():
     model = AsyncMock()
     tools = MagicMock()
