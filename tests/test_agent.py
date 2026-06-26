@@ -2370,6 +2370,165 @@ async def test_build_gate_requires_compile_after_validation_passes():
     assert any("Build gate failed" in m.content for m in session.messages)
     assert "PASS: python -m py_compile app.py" in response.content
 
+
+@pytest.mark.asyncio
+async def test_coding_repeated_navigation_pivots_to_edit_instead_of_finalizing():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "继续定位代码 1。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "read1",
+                "function": {"name": "read_lines", "arguments": '{"path":"app.py","start_line":1,"end_line":20}'},
+            }],
+        },
+        {
+            "content": "继续定位代码 2。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "read2",
+                "function": {"name": "read_lines", "arguments": '{"path":"app.py","start_line":21,"end_line":40}'},
+            }],
+        },
+        {
+            "content": "继续定位代码 3。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "read3",
+                "function": {"name": "read_lines", "arguments": '{"path":"app.py","start_line":41,"end_line":60}'},
+            }],
+        },
+        {
+            "content": "开始修改。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "edit1",
+                "function": {"name": "edit_file", "arguments": '{"path":"app.py","old":"a","new":"b"}'},
+            }],
+        },
+        {
+            "content": "运行测试。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "test1",
+                "function": {"name": "terminal", "arguments": '{"command":"pytest tests/test_app.py -q"}'},
+            }],
+        },
+        {
+            "content": "运行编译。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "build1",
+                "function": {"name": "terminal", "arguments": '{"command":"python -m py_compile app.py"}'},
+            }],
+        },
+        {"content": "已完成修改。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "read1", "name": "read_lines", "content": "code 1", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "read2", "name": "read_lines", "content": "code 2", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: app.py\n--- diff", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "test1", "name": "terminal", "content": "Command: pytest tests/test_app.py -q\nExit code: 0", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "build1", "name": "terminal", "content": "Command: python -m py_compile app.py\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-navigation-pivot"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {"coding_repeated_tool_limit": 2}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-navigation-pivot", channel="feishu", channel_user_id="u1", session_id="s-navigation-pivot",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请实现功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert any("Repeated code navigation detected" in m.content for m in session.messages)
+    assert not any("Tool usage must stop now" in m.content and "read_lines" in m.content for m in session.messages)
+    executed_names = [call.args[0] for call in tools.execute_tool_calls.call_args_list]
+    assert any('"name": "edit_file"' in payload for payload in executed_names)
+    assert tools.execute_tool_calls.call_count == 5
+    assert "验证结果：PASS: pytest tests/test_app.py -q; PASS: python -m py_compile app.py" in response.content
+
+
+@pytest.mark.asyncio
+async def test_unverified_coding_final_is_downgraded_after_changed_files():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = [
+        {
+            "content": "修改文件。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "edit1",
+                "function": {"name": "edit_file", "arguments": '{"path":"app.py","old":"a","new":"b"}'},
+            }],
+        },
+        {"content": "全量开发完成，全部完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {"role": "tool", "tool_call_id": "edit1", "name": "edit_file", "content": "File edited: app.py\n--- diff", "success": True, "metadata": {}},
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-unverified-final"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=2)
+    user_msg = Message(
+        id="m-unverified-final", channel="feishu", channel_user_id="u1", session_id="s-unverified-final",
+        type=MessageType.TEXT, role=MessageRole.USER, content="请实现功能并修改代码",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "全量开发完成" not in response.content
+    assert "全部完成" not in response.content
+    assert "验证结果：未运行" in response.content
+    assert "不能视为完整验证通过的交付" in response.content
+    assert "[ ] 运行最小验证" in response.content
+    assert "[ ] 尝试编译/构建" in response.content
+
 @pytest.mark.asyncio
 async def test_agent_uses_larger_read_file_repeat_budget_for_coding_tasks():
     model = AsyncMock()

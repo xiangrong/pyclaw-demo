@@ -441,6 +441,7 @@ class Agent:
         patch_first_repair_requested = False
         verification_repair_requested = False
         build_repair_requested = False
+        navigation_pivot_requested = False
         validation_results: list[str] = []
         build_results: list[str] = []
         changed_files: set[str] = set()
@@ -649,15 +650,38 @@ class Agent:
                     if count > self._tool_repeat_limit(name, repeated_tool_limit, session)
                 ]
                 if repeated_tools:
-                    await self._request_final_answer_without_tools(
-                        session,
-                        (
-                            f"检测到只读/查询类工具重复调用过多（{', '.join(repeated_tools)}）。"
-                            "请不要继续搜索或读取网页，直接基于已经获得的信息给用户一个完整、简洁的最终答复。"
-                        ),
-                    )
-                    force_final_answer = True
-                    continue
+                    current_repeated_tools = [
+                        name for name in repeated_tools
+                        if name in self._tool_call_names(tool_calls)
+                    ]
+                    if not current_repeated_tools:
+                        pass
+                    elif self._should_pivot_repeated_coding_navigation(
+                        session=session,
+                        task_text=self._latest_external_user_text(session),
+                        repeated_tools=current_repeated_tools,
+                        tool_calls=tool_calls,
+                    ):
+                        if not navigation_pivot_requested:
+                            await self._request_coding_navigation_pivot(
+                                session=session,
+                                repeated_tools=current_repeated_tools,
+                                changed_files=changed_files,
+                                validation_results=validation_results,
+                                build_results=build_results,
+                            )
+                            navigation_pivot_requested = True
+                        continue
+                    else:
+                        await self._request_final_answer_without_tools(
+                            session,
+                            (
+                                f"检测到只读/查询类工具重复调用过多（{', '.join(current_repeated_tools)}）。"
+                                "请不要继续搜索或读取网页，直接基于已经获得的信息给用户一个完整、简洁的最终答复。"
+                            ),
+                        )
+                        force_final_answer = True
+                        continue
                 
                 # 循环检测与自我反思 (Self-Reflection)
                 tool_call_signature = str(tool_calls)
@@ -917,6 +941,13 @@ class Agent:
                 changed_files=changed_files,
                 validation_results=validation_results,
             )
+            content = self._downgrade_unverified_coding_completion_claims(
+                session=session,
+                content=content,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+            )
 
             if coding_task_status and (changed_files or validation_results or build_results):
                 await self._refresh_coding_task_status(
@@ -1098,6 +1129,89 @@ class Agent:
         if tool_name == "read_file" and self._is_coding_task(self._latest_external_user_text(session)):
             return max(base_limit, self._get_session_int(session, "coding_read_file_limit", 32))
         return base_limit
+
+    def _is_code_navigation_tool_name(self, tool_name: str) -> bool:
+        """Return True for tools that inspect code without changing it."""
+        return tool_name in {
+            "grep_code",
+            "read_lines",
+            "list_symbols",
+            "find_refs",
+            "goto_def",
+            "read_file",
+        }
+
+    def _should_pivot_repeated_coding_navigation(
+        self,
+        *,
+        session: Session,
+        task_text: str,
+        repeated_tools: list[str],
+        tool_calls: list[dict[str, Any]],
+    ) -> bool:
+        """Use a coding-specific pivot instead of forcing a premature final.
+
+        The generic repeated-tool guard is still right for web/search loops: stop
+        tools and synthesize.  For implementation turns, repeated code navigation
+        usually means the agent has enough context but is hesitating.  The right
+        repair is to tell it to patch or validate, not to emit a user-facing
+        partial answer.
+        """
+        if session.channel == "cron":
+            return False
+        if not self._is_implementation_request(task_text):
+            return False
+        if not repeated_tools:
+            return False
+        if not all(self._is_code_navigation_tool_name(name) for name in repeated_tools):
+            return False
+        tool_names = self._tool_call_names(tool_calls)
+        return bool(tool_names) and all(self._is_code_navigation_tool_name(name) for name in tool_names)
+
+    async def _request_coding_navigation_pivot(
+        self,
+        *,
+        session: Session,
+        repeated_tools: list[str],
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+    ) -> None:
+        """Ask the model to stop over-reading code and move to the next phase."""
+        if not changed_files:
+            next_action = (
+                "Stop reading the same code paths. Use the observations already collected "
+                "to make the smallest safe edit now with edit_file or write_file."
+            )
+        elif not validation_results:
+            next_action = (
+                "Code has already changed. Stop reading and run the narrowest relevant "
+                "validation command now."
+            )
+        elif not build_results and self._task_needs_build_attempt(self._latest_external_user_text(session)):
+            next_action = (
+                "Validation has already run. Stop reading and attempt the narrowest "
+                "compile/build command now, or report the concrete blocker."
+            )
+        else:
+            next_action = "Stop reading and produce the final answer with changed files and validation results."
+
+        reminder = Message(
+            id=f"coding-navigation-pivot-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: Repeated code navigation detected "
+                f"({', '.join(repeated_tools)}). This is an implementation request, so do not finalize yet. "
+                f"{next_action} Do not call grep_code/read_lines/list_symbols/find_refs/goto_def/read_file again "
+                "unless a new error or validation failure creates a specific new question. "
+                "Do not mention this notice to the user."
+            ),
+        )
+        await self.sessions.save_message(session, reminder)
 
     def _is_coding_task(self, text: str) -> bool:
         """Heuristic for tasks where implementing/verifying code is expected."""
@@ -1472,6 +1586,55 @@ class Agent:
             validation_text = "未运行（需要在最终回复中说明原因）"
         suffix = f"\n\n验证结果：{validation_text}"
         return content.rstrip() + suffix
+
+    def _downgrade_unverified_coding_completion_claims(
+        self,
+        *,
+        session: Session,
+        content: str,
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+    ) -> str:
+        """Prevent final answers from overstating unverified coding delivery."""
+        task_text = self._latest_external_user_text(session)
+        if not changed_files or not self._is_coding_task(task_text):
+            return content
+
+        needs_build = self._task_needs_build_attempt(task_text)
+        missing_validation = not validation_results
+        missing_build = needs_build and not build_results
+        if not missing_validation and not missing_build:
+            return content
+
+        downgraded = content
+        replacements = (
+            ("全量开发完成", "代码修改已完成"),
+            ("全部开发完成", "代码修改已完成"),
+            ("全量完成", "代码修改已完成"),
+            ("全部完成", "代码修改已完成"),
+            ("完全完成", "代码修改已完成"),
+            ("已完整完成", "代码修改已完成"),
+            ("完整完成", "代码修改已完成"),
+            ("交付完成", "代码修改已完成"),
+            ("已完成交付", "代码修改已完成"),
+        )
+        for old, new in replacements:
+            downgraded = downgraded.replace(old, new)
+
+        missing_parts: list[str] = []
+        if missing_validation:
+            missing_parts.append("最小验证未运行")
+        if missing_build:
+            missing_parts.append("编译/构建未运行")
+        warning = (
+            "注意：代码已产生修改，但"
+            + "、".join(missing_parts)
+            + "，因此不能视为完整验证通过的交付。"
+        )
+        if warning in downgraded:
+            return downgraded
+        return downgraded.rstrip() + "\n\n" + warning
 
     def _final_mentions_validation(self, content: str) -> bool:
         normalized = content.lower()
