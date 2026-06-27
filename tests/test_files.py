@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from pyclaw.tools.code_search import FindRefsTool, GotoDefTool, GrepCodeTool, ListSymbolsTool, ReadLinesTool
-from pyclaw.tools.files import EditFileTool
+from pyclaw.tools.files import CopyFileTool, EditFileTool
 
 
 @pytest.mark.asyncio
@@ -46,6 +46,38 @@ async def test_edit_file_rejects_ambiguous_replacement(tmp_path: Path):
     assert result.success is False
     assert "expected 1 replacement(s), found 2" in result.content
     assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_copy_file_validates_paths_and_copies(tmp_path: Path):
+    source = tmp_path / "source.txt"
+    target = tmp_path / "nested" / "target.txt"
+    source.write_text("hello", encoding="utf-8")
+
+    tool = CopyFileTool()
+    tool.set_work_dir(str(tmp_path))
+
+    result = await tool.execute(source=str(source), target=str(target))
+
+    assert result.success is True
+    assert target.read_text(encoding="utf-8") == "hello"
+    assert "File copied" in result.content
+
+
+@pytest.mark.asyncio
+async def test_copy_file_rejects_outside_workspace(tmp_path: Path):
+    outside = tmp_path.parent / f"outside-{tmp_path.name}.txt"
+    outside.write_text("outside", encoding="utf-8")
+    target = tmp_path / "target.txt"
+
+    tool = CopyFileTool()
+    tool.set_work_dir(str(tmp_path))
+
+    result = await tool.execute(source=str(outside), target=str(target))
+
+    assert result.success is False
+    assert "Access denied" in result.content
+    assert not target.exists()
 
 @pytest.mark.asyncio
 async def test_read_file_supports_line_ranges_and_truncation_guidance(tmp_path: Path):

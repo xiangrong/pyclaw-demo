@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import difflib
+import os
+import shutil
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -120,6 +122,53 @@ class WriteFileTool(BaseTool):
             return ToolResult(success=False, content=str(e))
         except Exception as e:
             return ToolResult(success=False, content=f"Error writing file: {str(e)}")
+
+
+class CopyFileArgs(BaseModel):
+    source: str = Field(description="Source file path inside the allowed workspace")
+    target: str = Field(description="Target file path inside the allowed workspace")
+    overwrite: bool = Field(default=True, description="Whether to overwrite an existing target file")
+
+
+class CopyFileTool(BaseTool):
+    """Safely copy a file within allowed sandbox paths."""
+
+    name = "copy_file"
+    description = (
+        "Safely copy a file within the allowed workspace. Prefer this over terminal cp; "
+        "both source and target paths are validated with the file-tool sandbox."
+    )
+    args_schema = CopyFileArgs
+
+    async def execute(self, **kwargs: str) -> ToolResult:
+        source = kwargs.get("source", "")
+        target = kwargs.get("target", "")
+        overwrite = bool(kwargs.get("overwrite", True))
+
+        try:
+            safe_source = self.validate_path(source)
+            safe_target = self.validate_path(target)
+
+            if not os.path.exists(safe_source):
+                return ToolResult(success=False, content=f"Source file not found: {source}")
+            if not os.path.isfile(safe_source):
+                return ToolResult(success=False, content=f"Source is not a file: {source}")
+            if os.path.isdir(safe_target):
+                return ToolResult(success=False, content=f"Target is a directory: {target}")
+            if os.path.exists(safe_target) and not overwrite:
+                return ToolResult(success=False, content=f"Target already exists: {target}")
+
+            dirname = os.path.dirname(safe_target)
+            if dirname and not os.path.exists(dirname):
+                os.makedirs(dirname, exist_ok=True)
+
+            shutil.copyfile(safe_source, safe_target)
+            return ToolResult(success=True, content=f"File copied: {source} -> {target}")
+
+        except PermissionError as e:
+            return ToolResult(success=False, content=str(e))
+        except Exception as e:
+            return ToolResult(success=False, content=f"Error copying file: {str(e)}")
 
 
 class EditFileArgs(BaseModel):

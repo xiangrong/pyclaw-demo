@@ -24,7 +24,7 @@ from pyclaw.core.path_discovery import discover_tool_paths
 from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
 from pyclaw.models.openai import OpenAIProvider
-from pyclaw.tools.files import EditFileTool, ReadFileTool, WriteFileTool, SendFileTool
+from pyclaw.tools.files import CopyFileTool, EditFileTool, ReadFileTool, WriteFileTool, SendFileTool
 from pyclaw.tools.code_search import FindRefsTool, GotoDefTool, GrepCodeTool, ListSymbolsTool, ReadLinesTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
@@ -116,6 +116,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         tool_registry.register(FindRefsTool())
         tool_registry.register(GotoDefTool())
         tool_registry.register(EditFileTool())
+        tool_registry.register(CopyFileTool())
         tool_registry.register(WriteFileTool())
         from pyclaw.tools.python_interpreter import PythonInterpreterTool
         tool_registry.register(PythonInterpreterTool())

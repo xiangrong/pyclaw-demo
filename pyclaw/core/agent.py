@@ -29,6 +29,7 @@ class Agent:
         "edit_file",
         "write_file",
         "delete_file",
+        "copy_file",
     }
     SIDE_EFFECT_TOOL_KEYWORDS = (
         "send_email",
@@ -421,8 +422,14 @@ class Agent:
         is_cron_session = session.channel == "cron"
         configured_max_iterations = self._get_session_int(session, "max_iterations", self.max_iterations)
         max_iterations = configured_max_iterations if is_cron_session else self.max_iterations
-        initial_task_text = self._latest_external_user_text(session)
-        is_coding_turn = self._is_coding_task(initial_task_text)
+        raw_task_text = self._latest_external_user_text(session)
+        initial_task_text = raw_task_text
+        has_active_coding_ledger = self._has_active_coding_ledger(session)
+        if has_active_coding_ledger and (self._is_continue_request(raw_task_text) or not self._is_coding_task(raw_task_text)):
+            persisted_task_text = self._persisted_coding_task_text(session)
+            if persisted_task_text:
+                initial_task_text = persisted_task_text
+        is_coding_turn = self._is_coding_task(initial_task_text) or has_active_coding_ledger
         max_tool_calls = self._effective_max_tool_calls(session, is_cron_session=is_cron_session, is_coding_turn=is_coding_turn)
         repeated_tool_limit = self._effective_repeated_tool_limit(session, default=8, is_cron_session=is_cron_session)
         side_effect_tool_limit = 1
@@ -442,10 +449,31 @@ class Agent:
         verification_repair_requested = False
         build_repair_requested = False
         navigation_pivot_requested = False
-        validation_results: list[str] = []
-        build_results: list[str] = []
-        changed_files: set[str] = set()
-        coding_task_status = self._new_coding_task_status(initial_task_text) if is_coding_turn else {}
+        changed_files, validation_results, build_results = self._hydrate_coding_ledger(session) if is_coding_turn else (set(), [], [])
+        existing_coding_task_status = session.metadata.get("coding_task_status") if isinstance(session.metadata, dict) else {}
+        should_reuse_coding_status = (
+            isinstance(existing_coding_task_status, dict)
+            and existing_coding_task_status
+            and (
+                self._is_continue_request(self._latest_raw_external_user_text(session))
+                or not self._is_coding_task(self._latest_raw_external_user_text(session))
+                or existing_coding_task_status.get("task_text") == initial_task_text
+            )
+        )
+        coding_task_status = (
+            existing_coding_task_status
+            if is_coding_turn and should_reuse_coding_status
+            else (self._new_coding_task_status(initial_task_text) if is_coding_turn else {})
+        )
+        if is_coding_turn and not should_reuse_coding_status and self._is_coding_task(initial_task_text):
+            changed_files, validation_results, build_results = set(), [], []
+            await self._persist_coding_ledger(
+                session,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+                next_action="locate",
+            )
         if coding_task_status:
             await self._persist_coding_task_status(session, coding_task_status)
 
@@ -523,9 +551,17 @@ class Agent:
 
             if has_tool_calls:
                 if force_final_answer:
-                    return self._with_stop_notice(
+                    stop_content = self._with_stop_notice(
                         all_responses,
                         "⚠️  工具预算或时间预算已用完，但模型仍尝试继续调用工具；我已停止执行以避免刷屏。",
+                    )
+                    return self._prepare_coding_final_content(
+                        session=session,
+                        content=stop_content,
+                        changed_files=changed_files,
+                        validation_results=validation_results,
+                        build_results=build_results,
+                        coding_task_status=coding_task_status,
                     ), pending_files
 
                 tool_calls = result["tool_calls"]
@@ -547,7 +583,7 @@ class Agent:
 
                 tool_call_count += len(tool_calls)
 
-                coding_task_text = self._latest_external_user_text(session)
+                coding_task_text = self._effective_coding_task_text(session)
                 if self._should_nudge_patch_first_during_tool_loop(
                     session=session,
                     task_text=coding_task_text,
@@ -567,7 +603,8 @@ class Agent:
                 for tc in tool_calls:
                     tool_name = tc.get("function", {}).get("name", "unknown")
                     tool_arguments = tc.get("function", {}).get("arguments", "")
-                    tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
+                    repeat_name = self._tool_repeat_counter_name(tool_name, tool_arguments)
+                    tool_name_counts[repeat_name] = tool_name_counts.get(repeat_name, 0) + 1
                     side_effect_key = self._side_effect_call_key(tool_name, tool_arguments, session=session)
                     if side_effect_key:
                         already_executed = side_effect_call_counts.get(side_effect_key, 0)
@@ -583,7 +620,7 @@ class Agent:
 
                 if tool_call_count > max_tool_calls:
                     budget_reason = "工具调用次数已达到上限。请停止调用任何工具，直接基于已有观察结果给用户一个完整、简洁的最终答复。"
-                    if self._is_implementation_request(self._latest_external_user_text(session)) and not changed_files:
+                    if self._is_effective_implementation_request(session) and not changed_files:
                         budget_reason = (
                             "工具调用次数已达到上限，但本轮实现类任务尚未产生任何文件 diff。"
                             "请停止调用工具，最终答复必须明确说明：当前没有完成代码修改、没有文件变更；"
@@ -652,13 +689,13 @@ class Agent:
                 if repeated_tools:
                     current_repeated_tools = [
                         name for name in repeated_tools
-                        if name in self._tool_call_names(tool_calls)
+                        if name in self._tool_call_repeat_names(tool_calls)
                     ]
                     if not current_repeated_tools:
                         pass
                     elif self._should_pivot_repeated_coding_navigation(
                         session=session,
-                        task_text=self._latest_external_user_text(session),
+                        task_text=self._effective_coding_task_text(session),
                         repeated_tools=current_repeated_tools,
                         tool_calls=tool_calls,
                     ):
@@ -763,6 +800,19 @@ class Agent:
                     validation_results=validation_results,
                     build_results=build_results,
                 )
+                if is_coding_turn:
+                    await self._persist_coding_ledger(
+                        session,
+                        changed_files=changed_files,
+                        validation_results=validation_results,
+                        build_results=build_results,
+                        next_action=self._infer_coding_next_action(
+                            session=session,
+                            changed_files=changed_files,
+                            validation_results=validation_results,
+                            build_results=build_results,
+                        ),
+                    )
                 if coding_task_status:
                     await self._refresh_coding_task_status(
                         session=session,
@@ -886,7 +936,7 @@ class Agent:
                 await self._request_source_extraction_before_final(session)
                 continue
 
-            coding_task_text = self._latest_external_user_text(session)
+            coding_task_text = self._effective_coding_task_text(session)
             if self._should_run_patch_first_gate(
                 session=session,
                 task_text=coding_task_text,
@@ -935,44 +985,20 @@ class Agent:
                 build_repair_requested = True
                 continue
 
-            content = self._ensure_validation_summary_for_coding_final(
-                session=session,
-                content=content,
-                changed_files=changed_files,
-                validation_results=validation_results,
-            )
-            content = self._downgrade_unverified_coding_completion_claims(
+            content = self._prepare_coding_final_content(
                 session=session,
                 content=content,
                 changed_files=changed_files,
                 validation_results=validation_results,
                 build_results=build_results,
+                coding_task_status=coding_task_status,
             )
-
-            if coding_task_status and (changed_files or validation_results or build_results):
-                await self._refresh_coding_task_status(
-                    session=session,
-                    status=coding_task_status,
-                    changed_files=changed_files,
-                    validation_results=validation_results,
-                    build_results=build_results,
-                )
-                content = self._ensure_task_status_summary_for_coding_final(
-                    content=content,
-                    status=coding_task_status,
-                )
-            if self._is_unfinished_implementation_without_diff(
-                session=session,
-                content=content,
-                changed_files=changed_files,
-            ):
-                content = self._implementation_not_completed_message()
             if all_responses and all_responses[-1] != content:
                 all_responses[-1] = content
 
             quality_decision = self._should_run_answer_quality_gate(
                 session=session,
-                task_text=self._latest_external_user_text(session),
+                task_text=self._effective_coding_task_text(session),
                 draft=content,
                 used_research_tools=self._used_research_tools(tool_name_counts),
                 already_repaired=answer_quality_repair_requested,
@@ -989,6 +1015,14 @@ class Agent:
                 continue
 
             final_content = self._sanitize_user_facing_content("\n\n".join(all_responses))
+            final_content = self._prepare_coding_final_content(
+                session=session,
+                content=final_content,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+                coding_task_status=coding_task_status,
+            )
             self._touch_activity("final_answer", session)
             if not final_content.strip():
                 # 如果所有周期都没有内容，且没有工具调用，说明模型可能返回了空响应
@@ -1001,7 +1035,15 @@ class Agent:
                 
             return final_content, pending_files
 
-        return self._with_stop_notice(all_responses, self._summarize_final(session)), pending_files
+        stop_content = self._with_stop_notice(all_responses, self._summarize_final(session))
+        return self._prepare_coding_final_content(
+            session=session,
+            content=stop_content,
+            changed_files=changed_files,
+            validation_results=validation_results,
+            build_results=build_results,
+            coding_task_status=coding_task_status,
+        ), pending_files
 
     def _get_session_int(self, session: Session, key: str, default: int) -> int:
         """Read a positive integer from session metadata with fallback."""
@@ -1039,6 +1081,19 @@ class Agent:
         for tool_call in tool_calls:
             function = tool_call.get("function", {})
             names.add(str(function.get("name", "")))
+        return names
+
+    def _tool_repeat_counter_name(self, tool_name: str, arguments: Any) -> str:
+        """Return the logical repeat bucket for a tool call."""
+        if tool_name == "terminal" and self._terminal_command_semantic_kind(arguments) == "navigation":
+            return "terminal_navigation"
+        return tool_name
+
+    def _tool_call_repeat_names(self, tool_calls: list[dict[str, Any]]) -> set[str]:
+        names: set[str] = set()
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            names.add(self._tool_repeat_counter_name(str(function.get("name", "")), function.get("arguments", "")))
         return names
 
     def _should_nudge_patch_first_during_tool_loop(
@@ -1084,7 +1139,7 @@ class Agent:
         """Detect final drafts that ask to continue instead of delivering code."""
         if changed_files:
             return False
-        if not self._is_implementation_request(self._latest_external_user_text(session)):
+        if not self._is_effective_implementation_request(session):
             return False
         normalized = content.lower()
         blockers = (
@@ -1116,7 +1171,7 @@ class Agent:
         """
         if is_cron_session:
             return self._get_session_int(session, "repeated_tool_limit", default)
-        if self._is_coding_task(self._latest_external_user_text(session)):
+        if self._is_coding_task(self._effective_coding_task_text(session)):
             return self._get_session_int(session, "coding_repeated_tool_limit", 24)
         return self._get_session_int(session, "repeated_tool_limit", default)
 
@@ -1126,7 +1181,7 @@ class Agent:
         read_file is intentionally chunk-limited, so counting only tool name caused
         large-file coding tasks to stop before the agent had enough context.
         """
-        if tool_name == "read_file" and self._is_coding_task(self._latest_external_user_text(session)):
+        if tool_name == "read_file" and self._is_coding_task(self._effective_coding_task_text(session)):
             return max(base_limit, self._get_session_int(session, "coding_read_file_limit", 32))
         return base_limit
 
@@ -1140,6 +1195,16 @@ class Agent:
             "goto_def",
             "read_file",
         }
+
+    def _is_code_navigation_tool_call(self, tool_call: dict[str, Any]) -> bool:
+        """Return True when a tool call is code/file navigation only."""
+        function = tool_call.get("function", {})
+        tool_name = str(function.get("name", ""))
+        if self._is_code_navigation_tool_name(tool_name):
+            return True
+        if tool_name != "terminal":
+            return False
+        return self._terminal_command_semantic_kind(function.get("arguments", "")) == "navigation"
 
     def _should_pivot_repeated_coding_navigation(
         self,
@@ -1163,10 +1228,9 @@ class Agent:
             return False
         if not repeated_tools:
             return False
-        if not all(self._is_code_navigation_tool_name(name) for name in repeated_tools):
+        if not all(self._is_code_navigation_tool_name(name) or name in {"terminal", "terminal_navigation"} for name in repeated_tools):
             return False
-        tool_names = self._tool_call_names(tool_calls)
-        return bool(tool_names) and all(self._is_code_navigation_tool_name(name) for name in tool_names)
+        return bool(tool_calls) and all(self._is_code_navigation_tool_call(tool_call) for tool_call in tool_calls)
 
     async def _request_coding_navigation_pivot(
         self,
@@ -1188,7 +1252,7 @@ class Agent:
                 "Code has already changed. Stop reading and run the narrowest relevant "
                 "validation command now."
             )
-        elif not build_results and self._task_needs_build_attempt(self._latest_external_user_text(session)):
+        elif not build_results and self._task_needs_build_attempt(self._effective_coding_task_text(session)):
             next_action = (
                 "Validation has already run. Stop reading and attempt the narrowest "
                 "compile/build command now, or report the concrete blocker."
@@ -1206,12 +1270,100 @@ class Agent:
             content=(
                 "NOTICE: Repeated code navigation detected "
                 f"({', '.join(repeated_tools)}). This is an implementation request, so do not finalize yet. "
-                f"{next_action} Do not call grep_code/read_lines/list_symbols/find_refs/goto_def/read_file again "
+                f"{next_action} Do not call grep_code/read_lines/list_symbols/find_refs/goto_def/read_file "
+                "or terminal grep/sed/find/cat loops again "
                 "unless a new error or validation failure creates a specific new question. "
                 "Do not mention this notice to the user."
             ),
         )
         await self.sessions.save_message(session, reminder)
+
+    def _has_active_coding_ledger(self, session: Session) -> bool:
+        """Return True when a previous coding turn has unfinished persisted state."""
+        if not isinstance(session.metadata, dict):
+            return False
+        status = session.metadata.get("coding_task_status")
+        if not isinstance(status, dict) or status.get("kind") != "coding_task_status":
+            return False
+        tasks = status.get("tasks")
+        if not isinstance(tasks, list):
+            return False
+        return any(
+            isinstance(task, dict) and task.get("status") not in {"completed", "skipped"}
+            for task in tasks
+        )
+
+    def _is_continue_request(self, text: str) -> bool:
+        normalized = text.strip().lower()
+        return normalized in {"继续", "继续吧", "继续实现", "接着来", "接着改", "go on", "continue"}
+
+    def _latest_raw_external_user_text(self, session: Session) -> str:
+        for msg in reversed(session.messages):
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if content and not content.startswith("NOTICE:"):
+                return content
+        return ""
+
+    def _persisted_coding_task_text(self, session: Session) -> str:
+        status = session.metadata.get("coding_task_status") if isinstance(session.metadata, dict) else None
+        if isinstance(status, dict):
+            return str(status.get("task_text", "")).strip()
+        return ""
+
+    def _effective_coding_task_text(self, session: Session) -> str:
+        current = self._latest_external_user_text(session)
+        if self._is_coding_task(current):
+            return current
+        persisted = self._persisted_coding_task_text(session)
+        return persisted or current
+
+    def _hydrate_coding_ledger(self, session: Session) -> tuple[set[str], list[str], list[str]]:
+        """Load persisted coding effects from session metadata for continuation turns."""
+        if not isinstance(session.metadata, dict):
+            return set(), [], []
+        raw_files = session.metadata.get("coding_changed_files", [])
+        raw_validation = session.metadata.get("coding_validation_results", [])
+        raw_build = session.metadata.get("coding_build_results", [])
+        changed_files = {str(item) for item in raw_files if str(item).strip()} if isinstance(raw_files, list) else set()
+        validation_results = [str(item) for item in raw_validation if str(item).strip()] if isinstance(raw_validation, list) else []
+        build_results = [str(item) for item in raw_build if str(item).strip()] if isinstance(raw_build, list) else []
+        return changed_files, validation_results, build_results
+
+    async def _persist_coding_ledger(
+        self,
+        session: Session,
+        *,
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+        next_action: str,
+    ) -> None:
+        """Persist controller-observed coding progress across Feishu continue turns."""
+        if not isinstance(session.metadata, dict):
+            return
+        session.metadata["coding_changed_files"] = sorted(changed_files)
+        session.metadata["coding_validation_results"] = validation_results[-10:]
+        session.metadata["coding_build_results"] = build_results[-10:]
+        session.metadata["coding_next_action"] = next_action
+        await self._persist_session_metadata(session)
+
+    def _infer_coding_next_action(
+        self,
+        *,
+        session: Session,
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+    ) -> str:
+        if not changed_files:
+            return "patch"
+        if not validation_results:
+            return "validate"
+        if self._task_needs_build_attempt(self._effective_coding_task_text(session)) and not build_results:
+            return "build"
+        return "report"
 
     def _is_coding_task(self, text: str) -> bool:
         """Heuristic for tasks where implementing/verifying code is expected."""
@@ -1245,6 +1397,9 @@ class Agent:
         if any(marker in normalized for marker in negative_markers):
             return False
         return False
+
+    def _is_effective_implementation_request(self, session: Session) -> bool:
+        return self._is_implementation_request(self._effective_coding_task_text(session))
 
     def _new_coding_task_status(self, task_text: str) -> dict[str, Any]:
         """Create a lightweight todo/checklist state for a coding turn.
@@ -1315,7 +1470,7 @@ class Agent:
             set_status("validate", "completed" if self._latest_result_passed(validation_results) else "failed")
         if build_results:
             set_status("build", "completed" if self._latest_result_passed(build_results) else "failed")
-        elif validation_results and not self._task_needs_build_attempt(self._latest_external_user_text(session)):
+        elif validation_results and not self._task_needs_build_attempt(self._effective_coding_task_text(session)):
             set_status("build", "skipped")
         set_status("report", "in_progress")
 
@@ -1379,6 +1534,11 @@ class Agent:
                 if file_path:
                     changed_files.add(file_path)
 
+            if success and name == "copy_file":
+                file_path = self._extract_changed_file_path(content)
+                if file_path:
+                    changed_files.add(file_path)
+
             if name == "terminal":
                 command = self._extract_terminal_command_from_observation(content)
                 if self._looks_like_validation_command(command or content):
@@ -1389,7 +1549,7 @@ class Agent:
                         build_results.append(result_text)
 
     def _extract_changed_file_path(self, content: str) -> str:
-        for pattern in (r"File edited:\s*(.+)", r"File written:\s*(.+)"):
+        for pattern in (r"File edited:\s*(.+)", r"File written:\s*(.+)", r"File copied:\s*.+?\s*->\s*(.+)"):
             match = re.search(pattern, content)
             if match:
                 return match.group(1).strip()
@@ -1426,6 +1586,60 @@ class Agent:
             "xcodebuild", "make", "编译", "构建",
         )
         return any(marker in normalized for marker in markers)
+
+    def _terminal_command_semantic_kind(self, arguments: Any) -> str:
+        """Classify terminal calls for coding-agent control flow."""
+        command = self._extract_terminal_command(arguments)
+        if not command:
+            return "unknown"
+        if self._looks_like_validation_command(command) or self._looks_like_build_command(command):
+            return "validation"
+        if self._looks_like_terminal_mutation(command):
+            return "mutation"
+        if self._looks_like_terminal_navigation(command):
+            return "navigation"
+        return "unknown"
+
+    def _looks_like_terminal_navigation(self, command: str) -> bool:
+        """Return True for shell commands commonly used only to inspect code/files."""
+        if not command:
+            return False
+        # Pipes are common in read-only navigation (`rg foo | head`). Redirection,
+        # command substitution, chaining, and backgrounding can hide writes, so keep
+        # them out of the navigation bucket.
+        if re.search(r"[;&<>`]", command) or "$" in command:
+            return False
+        pipeline_parts = [part.strip() for part in command.split("|") if part.strip()]
+        if not pipeline_parts:
+            return False
+        try:
+            parsed = [shlex.split(part) for part in pipeline_parts]
+        except ValueError:
+            return False
+        allowed_heads = {"rg", "grep", "find", "sed", "head", "tail", "cat", "wc", "ls", "pwd", "tree"}
+        for index, parts in enumerate(parsed):
+            if not parts:
+                return False
+            head = os.path.basename(parts[0])
+            if head not in allowed_heads:
+                return False
+            if head == "sed" and any(arg == "-i" or arg.startswith("-i") for arg in parts[1:]):
+                return False
+            if index > 0 and head not in {"head", "tail", "grep", "rg", "wc", "sed", "cat"}:
+                return False
+        return True
+
+    def _looks_like_terminal_mutation(self, command: str) -> bool:
+        if not command:
+            return False
+        mutation_patterns = (
+            r"(^|\s)(cp|mv|rm|mkdir|touch|chmod|chown|git\s+commit|git\s+push|git\s+add)\b",
+            r"\bsed\b[^\n]*\s-i\b",
+            r"\bperl\b[^\n]*\s-pi\b",
+            r">",
+            r"\b(write_text|open\([^)]*,\s*['\"]w|unlink\(|rename\(|replace\()",
+        )
+        return any(re.search(pattern, command) for pattern in mutation_patterns)
 
     def _task_needs_build_attempt(self, task_text: str) -> bool:
         if not self._is_coding_task(task_text):
@@ -1575,7 +1789,7 @@ class Agent:
         changed_files: set[str],
         validation_results: list[str],
     ) -> str:
-        if not changed_files or not self._is_coding_task(self._latest_external_user_text(session)):
+        if not changed_files or not self._is_coding_task(self._effective_coding_task_text(session)):
             return content
         if self._final_mentions_validation(content):
             return content
@@ -1597,7 +1811,7 @@ class Agent:
         build_results: list[str],
     ) -> str:
         """Prevent final answers from overstating unverified coding delivery."""
-        task_text = self._latest_external_user_text(session)
+        task_text = self._effective_coding_task_text(session)
         if not changed_files or not self._is_coding_task(task_text):
             return content
 
@@ -1635,6 +1849,89 @@ class Agent:
         if warning in downgraded:
             return downgraded
         return downgraded.rstrip() + "\n\n" + warning
+
+    def _prepare_coding_final_content(
+        self,
+        *,
+        session: Session,
+        content: str,
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+        coding_task_status: dict[str, Any],
+    ) -> str:
+        """Apply coding final gates on every final/stop path."""
+        prepared = content
+        if self._is_unfinished_implementation_without_diff(
+            session=session,
+            content=prepared,
+            changed_files=changed_files,
+        ):
+            prepared = self._implementation_not_completed_message()
+        prepared = self._ensure_validation_summary_for_coding_final(
+            session=session,
+            content=prepared,
+            changed_files=changed_files,
+            validation_results=validation_results,
+        )
+        prepared = self._downgrade_unverified_coding_completion_claims(
+            session=session,
+            content=prepared,
+            changed_files=changed_files,
+            validation_results=validation_results,
+            build_results=build_results,
+        )
+        if coding_task_status and (changed_files or validation_results or build_results):
+            self._refresh_coding_task_status_sync(
+                status=coding_task_status,
+                session=session,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+            )
+            prepared = self._ensure_task_status_summary_for_coding_final(
+                content=prepared,
+                status=coding_task_status,
+            )
+        return prepared
+
+    def _refresh_coding_task_status_sync(
+        self,
+        *,
+        status: dict[str, Any],
+        session: Session,
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+    ) -> None:
+        """Synchronous checklist refresh for final formatting paths."""
+        tool_names = [m.metadata.get("tool_name") for m in session.messages if m.role == MessageRole.TOOL]
+        has_code_navigation = any(
+            name in {
+                "grep_code", "read_lines", "list_symbols", "find_refs", "goto_def",
+                "read_file", "terminal",
+            }
+            for name in tool_names
+        )
+        task_map = {task.get("id"): task for task in status.get("tasks", []) if isinstance(task, dict)}
+
+        def set_status(task_id: str, value: str) -> None:
+            task = task_map.get(task_id)
+            if task is not None:
+                task["status"] = value
+
+        set_status("understand", "completed")
+        if has_code_navigation:
+            set_status("locate", "completed")
+        if changed_files:
+            set_status("patch", "completed")
+        if validation_results:
+            set_status("validate", "completed" if self._latest_result_passed(validation_results) else "failed")
+        if build_results:
+            set_status("build", "completed" if self._latest_result_passed(build_results) else "failed")
+        elif validation_results and not self._task_needs_build_attempt(self._effective_coding_task_text(session)):
+            set_status("build", "skipped")
+        set_status("report", "in_progress")
 
     def _final_mentions_validation(self, content: str) -> bool:
         normalized = content.lower()
@@ -2063,7 +2360,7 @@ class Agent:
             return f"cronjob:{action}:{job_id or '<no-job-id>'}"
         if normalized == "terminal":
             return self._terminal_side_effect_call_key(arguments)
-        if normalized in {"edit_file", "write_file", "delete_file"}:
+        if normalized in {"edit_file", "write_file", "delete_file", "copy_file"}:
             return self._file_side_effect_call_key(normalized, arguments, session=session)
         if self._is_side_effect_tool(tool_name):
             return normalized
@@ -2142,7 +2439,8 @@ class Agent:
 
     def _terminal_side_effect_call_key(self, arguments: Any) -> Optional[str]:
         """Return a repeat key for terminal calls, or None for safe reads."""
-        if self._is_read_only_terminal_call(arguments):
+        semantic_kind = self._terminal_command_semantic_kind(arguments)
+        if semantic_kind in {"navigation", "validation"}:
             return None
         command = self._extract_terminal_command(arguments)
         if not command:
