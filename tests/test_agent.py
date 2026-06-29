@@ -1954,6 +1954,18 @@ async def test_agent_clear_session_on_reset_command():
     assert "会话已重置" in response.content
 
 
+def test_agent_reset_command_parser_accepts_lark_mentions():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+
+    assert agent._is_session_reset_command("/new")
+    assert agent._is_session_reset_command("/reset")
+    assert agent._is_session_reset_command("/new@PyClawBot")
+    assert agent._is_session_reset_command("@PyClaw /new")
+    assert agent._is_session_reset_command("@PyClaw /reset@PyClawBot")
+    assert not agent._is_session_reset_command("已经发过 /new 了")
+    assert not agent._is_session_reset_command("请解释 /reset 的作用")
+
+
 @pytest.mark.asyncio
 async def test_telegram_new_command_is_forwarded_to_agent():
     from pyclaw.channels.telegram import TelegramChannel
@@ -2695,6 +2707,55 @@ async def test_coding_ledger_persists_across_continue_turns():
     assert session.metadata["coding_validation_results"]
     assert session.metadata["coding_build_results"]
     assert "验证结果：PASS: pytest tests/test_app.py -q; PASS: python -m py_compile app.py" in response.content
+
+
+@pytest.mark.asyncio
+async def test_unrelated_message_does_not_resume_stale_coding_ledger():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.return_value = {"content": "按你的新问题回复。", "__tool_calls__": False}
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-stale-ledger"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {
+        "coding_changed_files": ["old.py"],
+        "coding_task_status": {
+            "kind": "coding_task_status",
+            "task_text": "请修改旧代码",
+            "tasks": [{"id": "patch", "title": "旧代码修改", "status": "pending"}],
+        },
+    }
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-new-topic", channel="feishu", channel_user_id="u1", session_id="s-stale-ledger",
+        type=MessageType.TEXT, role=MessageRole.USER, content="华为手机微信能加密码吗",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "按你的新问题回复。"
+    assert tools.execute_tool_calls.call_count == 0
+    first_call_messages = model.chat.call_args_list[0][1]["messages"]
+    assert not any("旧代码修改" in str(m.get("content", "")) for m in first_call_messages)
 
 
 @pytest.mark.asyncio

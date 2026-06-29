@@ -188,9 +188,10 @@ class Agent:
             context.session_id = session.session_id
             context.current_objective = session.metadata.get("current_objective", "")
             context.current_plan = session.metadata.get("current_plan", "")
-            context.coding_task_status = self._format_coding_task_status_for_prompt(
-                session.metadata.get("coding_task_status", {})
-            )
+            if self._should_expose_coding_task_status(session):
+                context.coding_task_status = self._format_coding_task_status_for_prompt(
+                    session.metadata.get("coding_task_status", {})
+                )
             
             # 获取语义记忆
             semantic_memory, experience_memory = await self._get_semantic_memories(session)
@@ -325,8 +326,9 @@ class Agent:
         )
         self._touch_activity("session_ready", session)
 
-        # 检查是否是 /new 或 /reset 指令
-        if message.content.strip().lower() in {"/new", "/reset"}:
+        # 检查是否是 /new 或 /reset 指令。飞书群聊里命令可能带 bot mention
+        # 或被写成 /new@BotName，不能只做严格字符串相等。
+        if self._is_session_reset_command(message.content):
             await self.sessions.clear_session(session)
             return Message(
                 id=f"response-{message.id}",
@@ -399,6 +401,25 @@ class Agent:
 
         return response
 
+    def _is_session_reset_command(self, content: str) -> bool:
+        """Return True for standalone /new or /reset commands.
+
+        Channel adapters may pass commands as ``/new@Bot`` or include visible
+        mention tokens such as ``@PyClaw /new``. Treat only standalone commands
+        as reset requests; phrases that merely discuss /new should stay normal
+        user messages.
+        """
+        text = str(content or "").strip()
+        if not text:
+            return False
+
+        command_pattern = re.compile(r"^/(?:new|reset)(?:@[\w.\-]+)?$", re.IGNORECASE)
+        if command_pattern.fullmatch(text):
+            return True
+
+        non_mentions = [token for token in text.split() if not token.startswith("@")]
+        return len(non_mentions) == 1 and bool(command_pattern.fullmatch(non_mentions[0]))
+
     async def run(self, session: Session, prompt: str) -> str:
         """运行一次性任务（如 Cron 任务）"""
         # 创建并保存用户消息
@@ -425,11 +446,12 @@ class Agent:
         raw_task_text = self._latest_external_user_text(session)
         initial_task_text = raw_task_text
         has_active_coding_ledger = self._has_active_coding_ledger(session)
-        if has_active_coding_ledger and (self._is_continue_request(raw_task_text) or not self._is_coding_task(raw_task_text)):
+        is_continue_coding_turn = has_active_coding_ledger and self._is_continue_request(raw_task_text)
+        if is_continue_coding_turn:
             persisted_task_text = self._persisted_coding_task_text(session)
             if persisted_task_text:
                 initial_task_text = persisted_task_text
-        is_coding_turn = self._is_coding_task(initial_task_text) or has_active_coding_ledger
+        is_coding_turn = self._is_coding_task(initial_task_text) or is_continue_coding_turn
         max_tool_calls = self._effective_max_tool_calls(session, is_cron_session=is_cron_session, is_coding_turn=is_coding_turn)
         repeated_tool_limit = self._effective_repeated_tool_limit(session, default=8, is_cron_session=is_cron_session)
         side_effect_tool_limit = 1
@@ -456,7 +478,6 @@ class Agent:
             and existing_coding_task_status
             and (
                 self._is_continue_request(self._latest_raw_external_user_text(session))
-                or not self._is_coding_task(self._latest_raw_external_user_text(session))
                 or existing_coding_task_status.get("task_text") == initial_task_text
             )
         )
@@ -1292,6 +1313,15 @@ class Agent:
             isinstance(task, dict) and task.get("status") not in {"completed", "skipped"}
             for task in tasks
         )
+
+    def _should_expose_coding_task_status(self, session: Session) -> bool:
+        """Expose old coding ledger only for explicit continuation or same-task turns."""
+        if not self._has_active_coding_ledger(session):
+            return False
+        latest = self._latest_raw_external_user_text(session)
+        if self._is_continue_request(latest):
+            return True
+        return bool(latest and latest == self._persisted_coding_task_text(session))
 
     def _is_continue_request(self, text: str) -> bool:
         normalized = text.strip().lower()

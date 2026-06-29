@@ -148,11 +148,20 @@ class SessionManager:
                 session_id = row["session_id"]
                 metadata = json.loads(row["metadata"])
                 
-                # 加载该会话的所有消息
+                # 加载该会话的所有消息。
+                #
+                # 历史版本曾把外部通道传入的 message.session_id 直接写入
+                # messages 表；例如飞书消息会写成 ``feishu:<open_id>``，而
+                # sessions 表里的真实 session_id 是 UUID。重启后如果只按 UUID
+                # 加载，就会丢掉真实用户消息，只剩 system/tool/assistant 和内部
+                # NOTICE，导致 Agent 继续总结旧任务、答非所问。这里兼容读取旧
+                # storage key，后续 save_message 会统一写回真实 session_id。
                 messages = []
+                storage_ids = self._message_storage_ids(session_id, channel, user_id)
+                placeholders = ", ".join("?" for _ in storage_ids)
                 async with db.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
-                    (session_id,)
+                    f"SELECT * FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp ASC",
+                    tuple(storage_ids)
                 ) as cursor:
                     async for msg_row in cursor:
                         messages.append(Message(
@@ -209,6 +218,11 @@ class SessionManager:
 
     async def save_message(self, session: Session, message: Message) -> None:
         """保存消息到数据库，并同步到内存会话"""
+        # The SessionManager owns the canonical session id. Channel adapters may
+        # pass a transport-derived id such as ``feishu:<open_id>``; persisting that
+        # id splits one conversation across two logical histories after restart.
+        message.session_id = session.session_id
+
         async with aiosqlite.connect(self.db_path) as db:
             # 检查是否是更新已有的消息（主要针对 system prompt 的动态更新）
             async with db.execute("SELECT 1 FROM messages WHERE id = ?", (message.id,)) as cursor:
@@ -253,14 +267,27 @@ class SessionManager:
         """清空会话在内存和数据库中的所有消息及元数据"""
         session.messages = []
         session.metadata = {}
+        storage_ids = self._message_storage_ids(session.session_id, session.channel, session.user_id)
+        placeholders = ", ".join("?" for _ in storage_ids)
         
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM messages WHERE session_id = ?", (session.session_id,))
+            await db.execute(
+                f"DELETE FROM messages WHERE session_id IN ({placeholders})",
+                tuple(storage_ids),
+            )
             await db.execute(
                 "UPDATE sessions SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
                 (json.dumps({}), session.session_id)
             )
             await db.commit()
+
+    def _message_storage_ids(self, session_id: str, channel: str, user_id: str) -> list[str]:
+        """Return canonical plus legacy message storage ids for one session."""
+        storage_ids = [session_id]
+        legacy_id = f"{channel}:{user_id}"
+        if legacy_id and legacy_id not in storage_ids:
+            storage_ids.append(legacy_id)
+        return storage_ids
 
     def get_by_id(self, session_id: str) -> Optional[Session]:
         """通过会话ID从缓存获取"""

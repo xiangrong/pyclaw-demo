@@ -88,3 +88,64 @@ async def test_session_manager_clear(tmp_path):
     loaded_session = await manager.get_or_create(channel="test_chan", user_id="user_123")
     assert len(loaded_session.messages) == 0
     assert loaded_session.metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_session_manager_normalizes_channel_supplied_session_id(tmp_path):
+    db_file = tmp_path / "test.db"
+    manager = SessionManager(db_path=str(db_file))
+    await manager.init_db()
+
+    session = await manager.get_or_create(channel="feishu", user_id="ou_user")
+    assert session.session_id != "feishu:ou_user"
+
+    msg = Message(
+        id="om_1", channel="feishu", channel_user_id="ou_user", session_id="feishu:ou_user",
+        type=MessageType.TEXT, role=MessageRole.USER, content="最新真实问题"
+    )
+    await manager.save_message(session, msg)
+
+    key = "feishu:ou_user"
+    manager._sessions.pop(key, None)
+    loaded_session = await manager.get_or_create(channel="feishu", user_id="ou_user")
+
+    assert [m.content for m in loaded_session.messages] == ["最新真实问题"]
+    assert loaded_session.messages[0].session_id == session.session_id
+
+
+@pytest.mark.asyncio
+async def test_session_manager_loads_and_clears_legacy_channel_storage_id(tmp_path):
+    db_file = tmp_path / "test.db"
+    manager = SessionManager(db_path=str(db_file))
+    await manager.init_db()
+
+    session = await manager.get_or_create(channel="feishu", user_id="ou_user")
+
+    async with manager.db_connect() as db:
+        await db.execute(
+            """INSERT INTO messages
+               (id, session_id, channel, channel_user_id, user_id, type, role, content, timestamp, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "om_legacy", "feishu:ou_user", "feishu", "ou_user", "ou_user",
+                MessageType.TEXT.value, MessageRole.USER.value, "旧格式真实用户消息",
+                "2026-06-28T22:44:48.240444", "{}",
+            ),
+        )
+        await db.execute(
+            "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+            ('{"history_summary":"旧任务摘要","coding_task_status":{"kind":"coding_task_status","tasks":[{"status":"pending"}]}}', session.session_id),
+        )
+        await db.commit()
+
+    manager._sessions.pop("feishu:ou_user", None)
+    loaded_session = await manager.get_or_create(channel="feishu", user_id="ou_user")
+    assert [m.content for m in loaded_session.messages] == ["旧格式真实用户消息"]
+    assert loaded_session.metadata["history_summary"] == "旧任务摘要"
+
+    await manager.clear_session(loaded_session)
+    manager._sessions.pop("feishu:ou_user", None)
+    reset_session = await manager.get_or_create(channel="feishu", user_id="ou_user")
+
+    assert reset_session.messages == []
+    assert reset_session.metadata == {}
