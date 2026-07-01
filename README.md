@@ -33,10 +33,13 @@ python3.10 -m venv venv
 source venv/bin/activate
 
 # 2. 安装核心依赖
-pip install -r requirements.txt
+pip install -e .
 
 # 3. (可选) 安装语义记忆 (RAG) 增强依赖
-pip install -r requirements-extra.txt
+pip install -e ".[rag]"
+
+# 4. (可选) 安装本地 Embedding + RAG 完整增强依赖
+pip install -e ".[all]"
 ```
 
 ### 2. 配置
@@ -117,4 +120,3 @@ MIT License | **Made with ❤️ by PyClaw Team**
 ---
 
 **Made with ❤️ by PyClaw Team**
-

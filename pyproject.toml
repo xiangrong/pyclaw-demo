@@ -18,11 +18,26 @@ dependencies = [
   "aiohttp>=3.9.0",
   "lark-oapi>=1.2.0",
   "mcp>=1.0.0",
+  "ddgs>=9.0.0",
+  "trafilatura>=2.0.0",
   "qrcode>=8.0",
   "cryptography>=42.0",
+]
+
+[project.optional-dependencies]
+rag = [
   "lancedb>=0.25.0",
   "pyarrow>=19.0.0",
   "tantivy>=0.22.0",
+]
+local-embedding = [
+  "sentence-transformers>=3.0.0",
+]
+all = [
+  "lancedb>=0.25.0",
+  "pyarrow>=19.0.0",
+  "tantivy>=0.22.0",
+  "sentence-transformers>=3.0.0",
 ]
 
 [project.scripts]
