@@ -631,7 +631,12 @@ class Agent:
                     if side_effect_key:
                         already_executed = side_effect_call_counts.get(side_effect_key, 0)
                         already_pending = pending_side_effect_counts.get(side_effect_key, 0)
-                        if already_executed + already_pending >= side_effect_tool_limit:
+                        side_effect_limit = self._side_effect_call_limit(
+                            side_effect_key,
+                            session=session,
+                            default=side_effect_tool_limit,
+                        )
+                        if already_executed + already_pending >= side_effect_limit:
                             repeated_side_effect_calls.append(side_effect_key)
                         else:
                             pending_side_effect_counts[side_effect_key] = already_pending + 1
@@ -659,7 +664,7 @@ class Agent:
                     filtered_tool_calls, skipped_side_effect_calls = self._filter_duplicate_side_effect_tool_calls(
                         tool_calls,
                         executed_counts=side_effect_call_counts,
-                        limit=side_effect_tool_limit,
+                        default_limit=side_effect_tool_limit,
                         session=session,
                     )
                     if not filtered_tool_calls:
@@ -2420,7 +2425,7 @@ class Agent:
         tool_calls: list[dict[str, Any]],
         *,
         executed_counts: dict[str, int],
-        limit: int,
+        default_limit: int,
         session: Optional[Session] = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Drop duplicate side-effect calls without aborting the whole turn.
@@ -2443,6 +2448,11 @@ class Agent:
                 filtered.append(tool_call)
                 continue
 
+            limit = self._side_effect_call_limit(
+                side_effect_key,
+                session=session,
+                default=default_limit,
+            )
             already_used = executed_counts.get(side_effect_key, 0) + pending_counts.get(side_effect_key, 0)
             if already_used >= limit:
                 skipped.append(side_effect_key)
@@ -2457,7 +2467,7 @@ class Agent:
         """Return a repeat key for terminal calls, or None for safe reads."""
         command = self._extract_terminal_command(arguments)
         if self._looks_like_mac_desktop_control_command(command):
-            return None
+            return f"terminal:mac_desktop_control:{self._mac_desktop_control_action(command)}"
         semantic_kind = self._terminal_command_semantic_kind(arguments)
         if semantic_kind in {"navigation", "validation"}:
             return None
@@ -2467,14 +2477,77 @@ class Agent:
         digest = hashlib.sha256(normalized_command.encode("utf-8")).hexdigest()[:12]
         return f"terminal:{digest}"
 
+    def _side_effect_call_limit(
+        self,
+        side_effect_key: str,
+        *,
+        session: Optional[Session],
+        default: int,
+    ) -> int:
+        """Return the per-key repeat budget for a side-effect call."""
+        if side_effect_key.startswith("terminal:mac_desktop_control:"):
+            return self._mac_desktop_control_repeat_limit(session, default=default)
+        return default
+
+    def _mac_desktop_control_repeat_limit(self, session: Optional[Session], *, default: int) -> int:
+        """Allow repeated lock/wake only when the user explicitly asks for it."""
+        if session is None:
+            return default
+        text = self._latest_external_user_text(session)
+        explicit_count = self._explicit_repeat_count(text)
+        if explicit_count is None:
+            return default
+        return max(default, min(explicit_count, 5))
+
+    def _explicit_repeat_count(self, text: str) -> Optional[int]:
+        """Parse explicit small repeat counts such as '两次' or 'repeat 3 times'."""
+        if not text:
+            return None
+        normalized = text.strip().lower()
+        chinese_digits = {
+            "一": 1,
+            "二": 2,
+            "两": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+        }
+        counts: list[int] = []
+        for match in re.finditer(r"([一二两三四五])\s*(?:次|遍|回|下)", normalized):
+            counts.append(chinese_digits[match.group(1)])
+        for match in re.finditer(r"(\d{1,2})\s*(?:次|遍|回|下|times?\b)", normalized):
+            counts.append(int(match.group(1)))
+        for match in re.finditer(r"(?:repeat|run|execute)\s+(\d{1,2})\s+times?\b", normalized):
+            counts.append(int(match.group(1)))
+        if not counts:
+            return None
+        return max(counts)
+
+    def _mac_desktop_control_action(self, command: str) -> str:
+        """Return a stable action name for allowlisted Mac desktop commands."""
+        normalized = " ".join(command.strip().split()).lower()
+        if normalized == "pmset displaysleepnow":
+            return "display_sleep"
+        if normalized.startswith("caffeinate -u"):
+            return "wake"
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return "unknown"
+        if parts and os.path.basename(parts[0]) == "CGSession":
+            return "lock_screen"
+        if parts and os.path.basename(parts[0]) == "osascript":
+            return "lock_shortcut"
+        return "unknown"
+
     def _looks_like_mac_desktop_control_command(self, command: str) -> bool:
         """Return True for allowlisted Mac lock/wake desktop-control commands.
 
-        These commands are intentionally exempt from PyClaw's duplicate
-        side-effect guard because users may legitimately ask WeChat/Feishu to
-        lock, wake, or trigger the lock-screen shortcut more than once. This
-        does not bypass TerminalTool's own approval/sandbox policy; it only
-        avoids the agent-level duplicate-call stop.
+        These commands get semantic side-effect keys instead of opaque terminal
+        hashes.  They are allowed as desktop-control actions, but they are not
+        exempt from duplicate protection: a plain "lock screen" request should
+        execute once, while an explicit "lock twice" request can raise the
+        per-action repeat budget in a bounded way.
         """
         if not command:
             return False
