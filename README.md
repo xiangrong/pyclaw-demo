@@ -45,7 +45,8 @@ pip install -e ".[all]"
 如果使用 `--no-build-isolation` 或遇到 `editables` 缺失，请先安装构建依赖：
 ```bash
 pip install --upgrade pip hatchling editables
-pip install --no-build-isolation -e .
+pip install -r requirements.txt
+pip install --no-build-isolation --no-deps -e .
 ```
 
 ### 2. 配置

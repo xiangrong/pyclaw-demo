@@ -216,7 +216,8 @@ PY
     # 安装依赖（使用架构适配的 pip）
     log_info "安装依赖..."
     arch_pip install --upgrade pip hatchling editables
-    arch_pip install --no-build-isolation -e "$INSTALL_DIR/pyclaw-demo"
+    arch_pip install -r "$INSTALL_DIR/pyclaw-demo/requirements.txt"
+    arch_pip install --no-build-isolation --no-deps -e "$INSTALL_DIR/pyclaw-demo"
 
     # 创建可执行文件链接
     log_info "创建命令链接..."

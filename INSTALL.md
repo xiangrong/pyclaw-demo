@@ -53,7 +53,8 @@ pip install -e .
 如果你使用 `--no-build-isolation` 或旧版安装脚本，请先确保 editable 构建依赖已安装：
 ```bash
 pip install --upgrade pip hatchling editables
-pip install --no-build-isolation -e .
+pip install -r requirements.txt
+pip install --no-build-isolation --no-deps -e .
 ```
 
 *注意：核心依赖不包含向量数据库。如果您需要启用「语义记忆 (RAG)」功能，请额外安装：*
@@ -125,7 +126,7 @@ PYCLAW_PYTHON=/opt/homebrew/bin/python3.11 bash scripts/install.sh
   如果你之前已经用 3.9 创建过 `~/.pyclaw/venv`，新版安装脚本会自动检测并重建该虚拟环境。
 
 - **安装卡在 `Preparing metadata (pyproject.toml)` 很久**
-  这通常是 pip 在构建隔离环境、解析依赖或下载较重依赖。新版安装脚本会预装 `hatchling` / `editables` 并使用 `--no-build-isolation` 安装核心包，默认安装也不再包含 `lancedb` / `pyarrow` / `tantivy` / `sentence-transformers` 等 RAG 重依赖。若需要语义记忆，再单独运行：
+  这通常是 pip 在构建隔离环境、解析依赖或下载较重依赖。新版安装脚本会先正常安装 `requirements.txt`，再用 `--no-build-isolation --no-deps` 安装 PyClaw 自身，避免把第三方依赖的源码构建也放进无隔离环境。默认安装也不再包含 `lancedb` / `pyarrow` / `tantivy` / `sentence-transformers` 等 RAG 重依赖。若需要语义记忆，再单独运行：
   ```bash
   pip install -e ".[rag]"
   ```
@@ -138,7 +139,16 @@ PYCLAW_PYTHON=/opt/homebrew/bin/python3.11 bash scripts/install.sh
   这是 editable 安装所需的构建依赖缺失。请更新代码后重新运行一键安装脚本；如果是手动安装，请执行：
   ```bash
   pip install --upgrade pip hatchling editables
-  pip install --no-build-isolation -e .
+  pip install -r requirements.txt
+  pip install --no-build-isolation --no-deps -e .
+  ```
+
+- **遇到 `BackendUnavailable: Cannot import 'maturin'`**
+  这是旧安装脚本把 `--no-build-isolation` 同时作用到了第三方依赖，导致某些 Rust/Python 包源码构建时找不到自己的构建后端。请更新代码后重新运行一键安装脚本；如果是手动安装，请分两步安装：
+  ```bash
+  pip install -r requirements.txt
+  pip install --upgrade hatchling editables
+  pip install --no-build-isolation --no-deps -e .
   ```
 
 - **检查当前版本**
