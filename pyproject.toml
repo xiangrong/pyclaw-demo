@@ -44,7 +44,7 @@ all = [
 pyclaw = "pyclaw.cli.main:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "editables>=0.5"]
 build-backend = "hatchling.build"
 
 [tool.ruff]

@@ -42,6 +42,12 @@ pip install -e ".[rag]"
 pip install -e ".[all]"
 ```
 
+如果使用 `--no-build-isolation` 或遇到 `editables` 缺失，请先安装构建依赖：
+```bash
+pip install --upgrade pip hatchling editables
+pip install --no-build-isolation -e .
+```
+
 ### 2. 配置
 
 1. 运行初始化命令生成配置：`python -m pyclaw init`
