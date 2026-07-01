@@ -23,13 +23,13 @@
 
 ### 1. 环境准备与安装
 
-建议在虚拟环境中运行：
+PyClaw 要求 Python >= 3.10，建议在虚拟环境中运行：
 
 ```bash
 # 1. 克隆并创建环境
 git clone https://github.com/xiangrong/pyclaw-demo.git
 cd pyclaw-demo
-python3 -m venv venv
+python3.10 -m venv venv
 source venv/bin/activate
 
 # 2. 安装核心依赖

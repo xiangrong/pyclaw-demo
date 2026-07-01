@@ -4,7 +4,7 @@
 
 ## 💻 系统要求
 - **操作系统**: macOS / Linux / Ubuntu / CentOS 等
-- **Python**: Python 3.9 或更高版本
+- **Python**: Python 3.10 或更高版本
 - **Git**: 必须安装 Git (用于拉取代码和安装技能)
 
 ---
@@ -33,11 +33,16 @@ cd pyclaw-demo
 
 **2. 创建虚拟环境 (强烈推荐，确保使用 Python 3.10+)**
 ```bash
-python3 -m venv venv
+python3.10 -m venv venv
 source venv/bin/activate
 ```
 
-*注意：如果你的系统默认 python3 版本低于 3.10，请先升级 Python 或使用 Conda。*
+*注意：PyClaw 的 `pyproject.toml` 要求 Python >= 3.10。如果你的系统默认 `python3` 版本低于 3.10（例如 macOS 自带的 3.9.6），请先升级 Python，或使用 Homebrew/Conda/pyenv 安装 3.10+ 后再创建虚拟环境。*
+
+如果已安装 Python 3.10+，但命令名不是 `python3.10`，可以把上面的命令替换成你的实际路径，例如：
+```bash
+/opt/homebrew/bin/python3.11 -m venv venv
+```
 
 **3. 安装依赖与包**
 ```bash
@@ -90,14 +95,26 @@ git pull origin main
 pip install -e .
 ```
 
+如果一键安装脚本检测到当前 `python3` 低于 3.10，可以通过 `PYCLAW_PYTHON` 指定解释器：
+```bash
+PYCLAW_PYTHON=/opt/homebrew/bin/python3.11 bash scripts/install.sh
+```
+
 ## ❓ 常见问题
 - **遇到 `command not found: pyclaw`**
   如果您是一键安装的，请确保 `~/.local/bin` 已经加入到了您的 `PATH` 环境变量中。
   您可以执行 `export PATH="$HOME/.local/bin:$PATH"` 然后重试。
 
+- **遇到 `Package pyclaw requires a different Python: 3.9.6 not in >=3.10`**
+  说明当前安装用的是 Python 3.9.6，但 PyClaw 要求 Python >= 3.10。请安装 Python 3.10+ 后重试：
+  ```bash
+  brew install python@3.11
+  PYCLAW_PYTHON=/opt/homebrew/bin/python3.11 bash scripts/install.sh
+  ```
+  如果你之前已经用 3.9 创建过 `~/.pyclaw/venv`，新版安装脚本会自动检测并重建该虚拟环境。
+
 - **检查当前版本**
   运行命令检查您安装的 PyClaw 版本：
   ```bash
   pyclaw --version
-  ```on
   ```

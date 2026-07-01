@@ -24,6 +24,9 @@ REPO_URL="https://github.com/xiangrong/pyclaw-demo"
 INSTALL_DIR="$HOME/.pyclaw"
 VENV_DIR="$INSTALL_DIR/venv"
 BIN_DIR="$HOME/.local/bin"
+MIN_PYTHON_MAJOR=3
+MIN_PYTHON_MINOR=10
+PYTHON_BIN=""
 
 # ============================================================================
 # 辅助函数
@@ -62,10 +65,10 @@ log_error() {
 arch_python() {
     if [[ "$(uname -m)" == "arm64" ]]; then
         # Apple Silicon - 强制 arm64 架构执行
-        arch -arm64 python3 "$@"
+        arch -arm64 "$PYTHON_BIN" "$@"
     else
         # Intel 或其他架构
-        python3 "$@"
+        "$PYTHON_BIN" "$@"
     fi
 }
 
@@ -82,9 +85,11 @@ arch_pip() {
 check_system() {
     log_info "检查系统环境..."
 
+    find_python
+
     # 检查架构
     CPU_ARCH=$(uname -m)
-    PYTHON_ARCH=$(python3 -c "import platform; print(platform.machine())")
+    PYTHON_ARCH=$(arch_python -c "import platform; print(platform.machine())")
     
     if [[ "$CPU_ARCH" == "arm64" ]]; then
         log_success "CPU: Apple Silicon (arm64)"
@@ -97,14 +102,8 @@ check_system() {
         log_success "CPU: Intel (x86_64)"
     fi
 
-    # 检查 Python
-    if ! command -v python3 &> /dev/null; then
-        log_error "未找到 python3，请先安装 Python 3.9+"
-        exit 1
-    fi
-
-    PYTHON_VERSION=$(arch_python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    log_success "Python $PYTHON_VERSION 已找到"
+    PYTHON_VERSION=$(arch_python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
+    log_success "Python $PYTHON_VERSION 已找到: $PYTHON_BIN"
 
     # 检查 Git
     if ! command -v git &> /dev/null; then
@@ -114,11 +113,66 @@ check_system() {
     log_success "Git 已找到"
 
     # 检查 pip
-    if ! python3 -m pip --version &> /dev/null; then
+    if ! arch_python -m pip --version &> /dev/null; then
         log_error "pip 不可用，请先安装 pip"
         exit 1
     fi
     log_success "pip 已找到"
+}
+
+python_version_ok() {
+    local candidate="$1"
+    if [[ -z "$candidate" ]] || ! command -v "$candidate" &> /dev/null; then
+        return 1
+    fi
+
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        arch -arm64 "$candidate" - "$MIN_PYTHON_MAJOR" "$MIN_PYTHON_MINOR" <<'PY' &> /dev/null
+import sys
+major = int(sys.argv[1])
+minor = int(sys.argv[2])
+sys.exit(0 if sys.version_info >= (major, minor) else 1)
+PY
+    else
+        "$candidate" - "$MIN_PYTHON_MAJOR" "$MIN_PYTHON_MINOR" <<'PY' &> /dev/null
+import sys
+major = int(sys.argv[1])
+minor = int(sys.argv[2])
+sys.exit(0 if sys.version_info >= (major, minor) else 1)
+PY
+    fi
+}
+
+find_python() {
+    local candidates=()
+    if [[ -n "${PYCLAW_PYTHON:-}" ]]; then
+        candidates+=("$PYCLAW_PYTHON")
+    fi
+    candidates+=(python3.13 python3.12 python3.11 python3.10 python3)
+
+    for candidate in "${candidates[@]}"; do
+        if python_version_ok "$candidate"; then
+            PYTHON_BIN=$(command -v "$candidate")
+            return 0
+        fi
+    done
+
+    log_error "未找到 Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+。PyClaw 当前要求 Python >=3.10。"
+    echo ""
+    echo "当前 python3 版本:"
+    if command -v python3 &> /dev/null; then
+        python3 --version || true
+    else
+        echo "  未安装 python3"
+    fi
+    echo ""
+    echo "请先安装 Python 3.10 或更高版本，例如："
+    echo "  macOS Homebrew: brew install python@3.11"
+    echo "  Ubuntu/Debian:  sudo apt install python3.11 python3.11-venv"
+    echo ""
+    echo "如果已安装但命令名不是 python3，可指定："
+    echo "  PYCLAW_PYTHON=/path/to/python3.11 bash scripts/install.sh"
+    exit 1
 }
 
 # ============================================================================
@@ -143,7 +197,20 @@ install_pyclaw() {
     # 创建虚拟环境（注意：venv 创建不能用 arch -arm64 前缀，直接创建）
     if [ ! -d "$VENV_DIR" ]; then
         log_info "创建虚拟环境..."
-        python3 -m venv "$VENV_DIR"
+        arch_python -m venv "$VENV_DIR"
+    else
+        VENV_PYTHON_VERSION=$("$VENV_DIR/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
+        if ! "$VENV_DIR/bin/python" - "$MIN_PYTHON_MAJOR" "$MIN_PYTHON_MINOR" <<'PY' &> /dev/null
+import sys
+major = int(sys.argv[1])
+minor = int(sys.argv[2])
+sys.exit(0 if sys.version_info >= (major, minor) else 1)
+PY
+        then
+            log_warn "现有虚拟环境 Python $VENV_PYTHON_VERSION 低于 3.10，将重建: $VENV_DIR"
+            rm -rf "$VENV_DIR"
+            arch_python -m venv "$VENV_DIR"
+        fi
     fi
 
     # 安装依赖（使用架构适配的 pip）
