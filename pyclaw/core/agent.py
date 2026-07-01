@@ -656,23 +656,6 @@ class Agent:
                     continue
 
                 if repeated_side_effect_calls:
-                    already_executed_repeats = [
-                        key for key in repeated_side_effect_calls
-                        if side_effect_call_counts.get(key, 0) > 0
-                    ]
-                    if already_executed_repeats:
-                        await self._request_final_answer_without_tools(
-                            session,
-                            (
-                                "副作用工具此前已经成功执行，本轮检测到模型试图重复执行："
-                                f"{', '.join(already_executed_repeats)}。"
-                                "不要再次调用 terminal、cronjob、发送消息、写文件或其他副作用工具；"
-                                "请基于已有工具结果直接确认任务已完成。"
-                            ),
-                        )
-                        force_final_answer = True
-                        continue
-
                     filtered_tool_calls, skipped_side_effect_calls = self._filter_duplicate_side_effect_tool_calls(
                         tool_calls,
                         executed_counts=side_effect_call_counts,

@@ -870,6 +870,156 @@ async def test_agent_filters_duplicate_terminal_calls_in_same_batch():
 
 
 @pytest.mark.asyncio
+async def test_agent_continues_distinct_terminal_side_effect_after_duplicate_executed_call():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_args = json.dumps({"command": "pmset displaysleepnow", "approved": True})
+    wake_args = json.dumps({"command": "caffeinate -u -t 1", "approved": True})
+    model.chat.side_effect = [
+        {
+            "content": "先锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock1", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {
+            "content": "再唤醒屏幕...",
+            "__tool_calls__": True,
+            "tool_calls": [
+                {"id": "lock2", "function": {"name": "terminal", "arguments": lock_args}},
+                {"id": "wake1", "function": {"name": "terminal", "arguments": wake_args}},
+            ],
+        },
+        {"content": "锁屏和唤醒命令已执行。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "lock1",
+                "name": "terminal",
+                "content": "display sleep requested",
+                "success": True,
+                "metadata": {},
+            }
+        ],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "wake1",
+                "name": "terminal",
+                "content": "wake requested",
+                "success": True,
+                "metadata": {},
+            }
+        ],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-lock-wake"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-lock-wake", channel="wechat", channel_user_id="u1", session_id="s-terminal-lock-wake",
+        type=MessageType.TEXT, role=MessageRole.USER, content="帮我锁屏然后唤醒 Mac",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    second_payload = json.loads(tools.execute_tool_calls.await_args_list[1].args[0])
+    assert [tc["id"] for tc in second_payload["tool_calls"]] == ["wake1"]
+    assert response.content == "锁屏和唤醒命令已执行。"
+    assert "副作用工具重复调用" not in response.content
+    assert any("已跳过重复项" in m.content and "terminal:" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_synthesizes_after_repeated_executed_terminal_side_effect():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_args = json.dumps({"command": "pmset displaysleepnow", "approved": True})
+    model.chat.side_effect = [
+        {
+            "content": "执行锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock1", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {
+            "content": "再执行一次锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock2", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {"content": "已请求 Mac 锁屏。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lock1",
+            "name": "terminal",
+            "content": "display sleep requested",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-lock-repeat"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-lock-repeat", channel="wechat", channel_user_id="u1", session_id="s-terminal-lock-repeat",
+        type=MessageType.TEXT, role=MessageRole.USER, content="帮我锁屏 Mac",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "已请求 Mac 锁屏。"
+    assert "副作用工具重复调用" not in response.content
+    assert any("本轮只有重复的副作用工具调用" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
 async def test_agent_allows_corrected_retry_after_failed_side_effect_attempt():
     model = AsyncMock()
     tools = MagicMock()
@@ -1713,7 +1863,7 @@ async def test_agent_synthesizes_after_repeated_executed_cron_side_effect():
     assert response.content == "任务已触发完成。"
     assert "副作用工具重复调用" not in response.content
     assert model.chat.await_args_list[-1].kwargs["tools"] is None
-    assert any("试图重复执行" in m.content and "cronjob:trigger:job-a" in m.content for m in session.messages)
+    assert any("本轮只有重复的副作用工具调用" in m.content and "cronjob:trigger:job-a" in m.content for m in session.messages)
 
 
 @pytest.mark.asyncio
