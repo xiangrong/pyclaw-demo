@@ -9,6 +9,7 @@ from typing import Any
 from pyclaw.channels.base import BaseChannel
 from pyclaw.core.agent import Agent
 from pyclaw.core.message import Message
+from pyclaw.core.public_sanitize import sanitize_user_facing_content
 from pyclaw.cron.scheduler import tick as cron_tick
 from pyclaw.cron.tools import CronJobTool
 
@@ -77,6 +78,7 @@ class Gateway:
 
             # 交给 Agent 处理
             response = await self.agent.process_message(message)
+            response.content = sanitize_user_facing_content(response.content)
 
             # 1. 首先通过原通道发送回复文本
             await self.channels[message.channel].send_message(response)

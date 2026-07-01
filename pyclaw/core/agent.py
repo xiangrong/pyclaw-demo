@@ -18,6 +18,7 @@ from pyclaw.tools.registry import ToolRegistry
 from pyclaw.core.system_prompt.manager import SystemPromptManager
 from pyclaw.core.system_prompt.models import LayerContext
 from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
+from pyclaw.core.public_sanitize import sanitize_user_facing_content
 
 
 class Agent:
@@ -2213,31 +2214,7 @@ class Agent:
         if not content:
             return content
 
-        cleaned = content.strip()
-        internal_prefix_patterns = (
-            r"^(?:⚠️\s*)?工具调用已达到执行时限[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?工具预算或时间预算已用完[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?检测到副作用工具重复调用[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?副作用工具此前已经成功执行[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?本轮只有重复的副作用工具调用[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?本轮模型生成了重复的副作用工具调用[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?检测到只读/查询类工具重复调用过多[^。\n]*(?:。|\n)+\s*",
-            r"^(?:⚠️\s*)?由于[^。\n]*工具调用[^。\n]*停止[^。\n]*(?:。|\n)+\s*",
-        )
-        previous = None
-        while previous != cleaned:
-            previous = cleaned
-            for pattern in internal_prefix_patterns:
-                cleaned = re.sub(pattern, "", cleaned, count=1)
-
-        # Operational delivery failures should be logged separately from the
-        # business report body, especially for cron pushes.
-        cleaned = re.sub(
-            r"(?m)^\s*>?\s*📨\s*邮件发送[:：].*?(?:执行时限|工具调用|未能发送).*\n?",
-            "",
-            cleaned,
-        ).strip()
-        return cleaned
+        return sanitize_user_facing_content(content)
 
     async def _request_final_answer_without_tools(self, session: Session, reason: str) -> None:
         """Ask the model to produce a final answer using existing observations.

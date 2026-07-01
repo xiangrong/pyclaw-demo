@@ -194,6 +194,17 @@ def test_sanitize_cron_final_response_removes_internal_notices():
     assert "已确认赛程" in sanitized
 
 
+def test_sanitize_cron_final_response_removes_side_effect_guardrail_notice():
+    from pyclaw.cron.scheduler import _sanitize_cron_final_response
+
+    content = "⚠️  检测到副作用工具重复调用（terminal:abc），我已停止继续执行。\n\n任务已完成。"
+
+    sanitized = _sanitize_cron_final_response(content, "wechat")
+
+    assert sanitized == "任务已完成。"
+    assert "副作用工具重复调用" not in sanitized
+
+
 def test_feishu_delivery_style_instruction_is_concise_and_channel_specific():
     from pyclaw.cron.scheduler import _delivery_style_instruction
 
