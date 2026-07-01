@@ -500,6 +500,9 @@ class Agent:
             await self._persist_coding_task_status(session, coding_task_status)
 
         for i in range(max_iterations):
+            side_effect_call_counts.update(
+                self._current_turn_attempt_counted_side_effect_counts(session)
+            )
             self._touch_activity(f"loop_iteration_{i + 1}", session)
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
 
@@ -621,6 +624,12 @@ class Agent:
                 pending_side_effect_key_queue: list[str] = []
                 pending_side_effect_counts: dict[str, int] = {}
                 repeated_side_effect_calls: list[str] = []
+                current_turn_side_effect_counts = self._current_turn_attempt_counted_side_effect_counts(session)
+                for side_effect_key, count in current_turn_side_effect_counts.items():
+                    side_effect_call_counts[side_effect_key] = max(
+                        side_effect_call_counts.get(side_effect_key, 0),
+                        count,
+                    )
 
                 for tc in tool_calls:
                     tool_name = tc.get("function", {}).get("name", "unknown")
@@ -667,6 +676,20 @@ class Agent:
                         default_limit=side_effect_tool_limit,
                         session=session,
                     )
+                    pending_side_effect_keys_by_call_id = {}
+                    pending_side_effect_key_queue = []
+                    for tc in filtered_tool_calls:
+                        side_effect_key = self._side_effect_call_key(
+                            str(tc.get("function", {}).get("name", "unknown")),
+                            tc.get("function", {}).get("arguments", ""),
+                            session=session,
+                        )
+                        if not side_effect_key:
+                            continue
+                        pending_side_effect_key_queue.append(side_effect_key)
+                        tool_call_id = str(tc.get("id", ""))
+                        if tool_call_id:
+                            pending_side_effect_keys_by_call_id[tool_call_id] = side_effect_key
                     if not filtered_tool_calls:
                         await self._request_final_answer_without_tools(
                             session,
@@ -2497,6 +2520,50 @@ class Agent:
     def _should_count_side_effect_attempt(self, side_effect_key: str) -> bool:
         """Return True when a side-effect attempt should consume repeat budget even on failure."""
         return side_effect_key.startswith("terminal:mac_desktop_control:")
+
+    def _current_turn_attempt_counted_side_effect_counts(self, session: Session) -> dict[str, int]:
+        """Recover admitted attempt-counted side effects from saved assistant messages.
+
+        Some chat channels can trigger a fresh model turn immediately after the
+        screen lock/sleep command suspends the UI.  In that path the in-memory
+        counter may be rebuilt while the assistant tool-call message is already
+        in the session history.  Rehydrate one-shot desktop-control attempts from
+        the current user turn so a repeated ``pmset displaysleepnow`` is skipped
+        before it reaches TerminalTool.
+        """
+        latest_user_index = -1
+        for index in range(len(session.messages) - 1, -1, -1):
+            msg = session.messages[index]
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if content and not content.startswith("NOTICE:"):
+                latest_user_index = index
+                break
+
+        counts: dict[str, int] = {}
+        recent_messages = session.messages[latest_user_index + 1:] if latest_user_index >= 0 else session.messages
+        for msg in recent_messages:
+            if msg.role != MessageRole.ASSISTANT:
+                continue
+            metadata = getattr(msg, "metadata", {}) or {}
+            tool_calls = metadata.get("tool_calls") if isinstance(metadata, dict) else None
+            if not isinstance(tool_calls, list):
+                continue
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                function = tc.get("function", {})
+                if not isinstance(function, dict):
+                    continue
+                side_effect_key = self._side_effect_call_key(
+                    str(function.get("name", "unknown")),
+                    function.get("arguments", ""),
+                    session=session,
+                )
+                if side_effect_key and self._should_count_side_effect_attempt(side_effect_key):
+                    counts[side_effect_key] = counts.get(side_effect_key, 0) + 1
+        return counts
 
     def _mac_desktop_control_repeat_limit(self, session: Optional[Session], *, default: int) -> int:
         """Allow repeated lock/wake only when the user explicitly asks for it."""

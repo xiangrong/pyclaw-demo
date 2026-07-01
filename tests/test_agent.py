@@ -1311,6 +1311,91 @@ async def test_agent_counts_mac_lock_attempt_even_without_tool_result():
     )
 
 
+@pytest.mark.asyncio
+async def test_agent_recovers_mac_lock_attempt_from_saved_assistant_message():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_args = json.dumps({"command": "pmset displaysleepnow", "approved": True})
+    model.chat.side_effect = [
+        {
+            "content": "再次尝试锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock2", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {"content": "已锁屏。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lock2",
+            "name": "terminal",
+            "content": "display sleep requested",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-lock-rehydrated"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = [
+        Message(
+            id="m-terminal-lock-rehydrated",
+            channel="wechat",
+            channel_user_id="u1",
+            session_id="s-terminal-lock-rehydrated",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="锁屏",
+        ),
+        Message(
+            id="assistant-toolcall-existing-s-terminal-lock-rehydrated",
+            channel="wechat",
+            channel_user_id="u1",
+            session_id="s-terminal-lock-rehydrated",
+            type=MessageType.TEXT,
+            role=MessageRole.ASSISTANT,
+            content="锁屏...",
+            metadata={
+                "tool_calls": [
+                    {"id": "lock1", "function": {"name": "terminal", "arguments": lock_args}}
+                ]
+            },
+        ),
+    ]
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+
+    response_content, _ = await agent._agent_loop(session)
+
+    assert tools.execute_tool_calls.call_count == 0
+    assert response_content == "已锁屏。"
+    assert "副作用工具重复调用" not in response_content
+    assert any(
+        "本轮只有重复的副作用工具调用" in m.content
+        and "terminal:mac_desktop_control:display_sleep" in m.content
+        for m in session.messages
+    )
+
+
 def test_mac_desktop_control_commands_use_semantic_side_effect_keys():
     agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
 
