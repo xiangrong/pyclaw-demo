@@ -761,6 +761,10 @@ class Agent:
                     print(f"  🛠️  [Tool Call] {tc['function']['name']}({tc['function']['arguments']})")
                 self._touch_activity("tool_calls_requested", session)
 
+                for side_effect_key in pending_side_effect_key_queue:
+                    if self._should_count_side_effect_attempt(side_effect_key):
+                        side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
+
                 # 1. 添加助手消息
                 assistant_msg = Message(
                     id=f"assistant-toolcall-{i}-{session.session_id}",
@@ -836,15 +840,16 @@ class Agent:
                 any_failure = False
                 successful_side_effect_calls: list[str] = []
                 for result_index, tr in enumerate(tool_results):
-                    if tr.get("success"):
-                        side_effect_key = pending_side_effect_keys_by_call_id.get(
-                            str(tr.get("tool_call_id", ""))
-                        )
-                        if side_effect_key is None and result_index < len(pending_side_effect_key_queue):
-                            side_effect_key = pending_side_effect_key_queue[result_index]
-                        if side_effect_key:
-                            side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
-                            successful_side_effect_calls.append(side_effect_key)
+                    side_effect_key = pending_side_effect_keys_by_call_id.get(
+                        str(tr.get("tool_call_id", ""))
+                    )
+                    if side_effect_key is None and result_index < len(pending_side_effect_key_queue):
+                        side_effect_key = pending_side_effect_key_queue[result_index]
+                    if side_effect_key and tr.get("success") and not self._should_count_side_effect_attempt(side_effect_key):
+                        side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
+                        successful_side_effect_calls.append(side_effect_key)
+                    elif side_effect_key and tr.get("success"):
+                        successful_side_effect_calls.append(side_effect_key)
 
                     # 检查是否包含待发送文件
                     if tr.get("metadata", {}).get("is_file_transfer"):
@@ -2488,6 +2493,10 @@ class Agent:
         if side_effect_key.startswith("terminal:mac_desktop_control:"):
             return self._mac_desktop_control_repeat_limit(session, default=default)
         return default
+
+    def _should_count_side_effect_attempt(self, side_effect_key: str) -> bool:
+        """Return True when a side-effect attempt should consume repeat budget even on failure."""
+        return side_effect_key.startswith("terminal:mac_desktop_control:")
 
     def _mac_desktop_control_repeat_limit(self, session: Optional[Session], *, default: int) -> int:
         """Allow repeated lock/wake only when the user explicitly asks for it."""

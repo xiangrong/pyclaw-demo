@@ -1170,6 +1170,147 @@ async def test_agent_stops_repeated_mac_lock_for_simple_wechat_request():
     )
 
 
+@pytest.mark.asyncio
+async def test_agent_counts_failed_mac_lock_attempt_against_repeat_budget():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_args = json.dumps({"command": "pmset displaysleepnow"})
+    model.chat.side_effect = [
+        {
+            "content": "锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock1", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {
+            "content": "再试一次锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock2", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {"content": "已锁屏。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lock1",
+            "name": "terminal",
+            "content": "Command: pmset displaysleepnow\nExit code: 1",
+            "success": False,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-lock-failed-attempt"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-lock-failed-attempt",
+        channel="wechat",
+        channel_user_id="u1",
+        session_id="s-terminal-lock-failed-attempt",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="锁屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "已锁屏。"
+    assert "副作用工具重复调用" not in response.content
+    assert any(
+        "本轮只有重复的副作用工具调用" in m.content
+        and "terminal:mac_desktop_control:display_sleep" in m.content
+        for m in session.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_counts_mac_lock_attempt_even_without_tool_result():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_args = json.dumps({"command": "pmset displaysleepnow"})
+    model.chat.side_effect = [
+        {
+            "content": "锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock1", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {
+            "content": "再次锁屏...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock2", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {"content": "已锁屏。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = []
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-lock-no-result"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-lock-no-result",
+        channel="wechat",
+        channel_user_id="u1",
+        session_id="s-terminal-lock-no-result",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="锁屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "已锁屏。"
+    assert "副作用工具重复调用" not in response.content
+    assert any(
+        "本轮只有重复的副作用工具调用" in m.content
+        and "terminal:mac_desktop_control:display_sleep" in m.content
+        for m in session.messages
+    )
+
+
 def test_mac_desktop_control_commands_use_semantic_side_effect_keys():
     agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
 
