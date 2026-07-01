@@ -2217,6 +2217,10 @@ class Agent:
         internal_prefix_patterns = (
             r"^(?:⚠️\s*)?工具调用已达到执行时限[^。\n]*(?:。|\n)+\s*",
             r"^(?:⚠️\s*)?工具预算或时间预算已用完[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?检测到副作用工具重复调用[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?副作用工具此前已经成功执行[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?本轮只有重复的副作用工具调用[^。\n]*(?:。|\n)+\s*",
+            r"^(?:⚠️\s*)?本轮模型生成了重复的副作用工具调用[^。\n]*(?:。|\n)+\s*",
             r"^(?:⚠️\s*)?检测到只读/查询类工具重复调用过多[^。\n]*(?:。|\n)+\s*",
             r"^(?:⚠️\s*)?由于[^。\n]*工具调用[^。\n]*停止[^。\n]*(?:。|\n)+\s*",
         )
@@ -2393,8 +2397,30 @@ class Agent:
         if normalized in {"edit_file", "write_file", "delete_file", "copy_file"}:
             return self._file_side_effect_call_key(normalized, arguments, session=session)
         if self._is_side_effect_tool(tool_name):
-            return normalized
+            return self._generic_side_effect_call_key(normalized, arguments)
         return None
+
+    def _generic_side_effect_call_key(self, tool_name: str, arguments: Any) -> str:
+        """Return a repeat key for side-effect tools without bespoke policies.
+
+        Older guard logic keyed every generic mutating tool only by its name. That
+        was safe but too coarse: a channel/tool named ``send_message`` could send
+        one legitimate message and then every later distinct send in the same
+        agent loop looked like a duplicate. Key by the normalized argument
+        fingerprint instead, while still blocking exact duplicate sends/creates.
+        """
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (TypeError, json.JSONDecodeError):
+            args = arguments
+
+        try:
+            fingerprint_source = json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            fingerprint_source = str(args)
+
+        digest = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
+        return f"{tool_name}:{digest}"
 
     def _file_side_effect_call_key(
         self,

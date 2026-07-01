@@ -959,6 +959,88 @@ async def test_agent_allows_corrected_retry_after_failed_side_effect_attempt():
 
 
 @pytest.mark.asyncio
+async def test_agent_allows_distinct_generic_side_effect_calls():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "发送第一条消息。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "send1",
+                "function": {
+                    "name": "send_message",
+                    "arguments": json.dumps({"to": "user-1", "text": "第一条"}, ensure_ascii=False),
+                },
+            }],
+        },
+        {
+            "content": "发送第二条消息。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "send2",
+                "function": {
+                    "name": "send_message",
+                    "arguments": json.dumps({"to": "user-1", "text": "第二条"}, ensure_ascii=False),
+                },
+            }],
+        },
+        {"content": "两条消息都已发送。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "send1", "name": "send_message", "content": "ok1", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "send2", "name": "send_message", "content": "ok2", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-generic-side-effect"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-generic-side-effect", channel="wechat", channel_user_id="u1", session_id="s-generic-side-effect",
+        type=MessageType.TEXT, role=MessageRole.USER, content="分别发送两条不同消息",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "两条消息都已发送。"
+    assert "副作用工具重复调用" not in response.content
+    assert not any("试图重复执行" in m.content and "send_message" in m.content for m in session.messages)
+
+
+def test_sanitize_user_facing_content_strips_side_effect_guardrail_prefixes():
+    agent = Agent(MagicMock(), MagicMock(), MagicMock())
+
+    cleaned = agent._sanitize_user_facing_content(
+        "⚠️  检测到副作用工具重复调用（terminal:abc），我已停止继续执行。\n\n"
+        "已根据现有结果完成处理。"
+    )
+
+    assert cleaned == "已根据现有结果完成处理。"
+
+
+@pytest.mark.asyncio
 async def test_agent_allows_repeated_read_only_cronjob_list():
     model = AsyncMock()
     tools = MagicMock()

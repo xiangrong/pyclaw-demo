@@ -67,6 +67,51 @@ async def test_wechat_duplicate_msg_id_is_ignored():
 
 
 @pytest.mark.asyncio
+async def test_wechat_duplicate_content_with_different_msg_id_is_ignored():
+    channel = WechatChannel(bot_token="token", bot_id="bot")
+    handled = []
+
+    async def handler(message):
+        handled.append(message)
+
+    channel.on_message(handler)
+
+    base_data = {
+        "from_user_id": "user-1",
+        "to_user_id": "bot",
+        "context_token": "ctx",
+        "item_list": [{"type": 1, "text_item": {"text": "帮我修改代码"}}],
+    }
+    await channel._process_incoming_message({**base_data, "msg_id": "wechat-msg-1"})
+    await channel._process_incoming_message({**base_data, "msg_id": "wechat-msg-2"})
+
+    assert len(handled) == 1
+    assert handled[0].id == "wechat-msg-1"
+
+
+@pytest.mark.asyncio
+async def test_wechat_duplicate_content_without_msg_id_is_ignored():
+    channel = WechatChannel(bot_token="token", bot_id="bot")
+    handled = []
+
+    async def handler(message):
+        handled.append(message)
+
+    channel.on_message(handler)
+    data = {
+        "from_user_id": "user-1",
+        "to_user_id": "bot",
+        "context_token": "ctx",
+        "item_list": [{"type": 1, "text_item": {"text": "继续"}}],
+    }
+
+    await channel._process_incoming_message(data)
+    await channel._process_incoming_message(data)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
 async def test_wechat_self_message_is_ignored():
     channel = WechatChannel(bot_token="token", bot_id="bot")
     handled = []

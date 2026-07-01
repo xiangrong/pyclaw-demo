@@ -247,6 +247,14 @@ class WechatChannel(BaseChannel):
         if not content:
             return
 
+        # iLink polling/reconnect can occasionally redeliver the same visible
+        # message with a missing or changed msg_id. Add the same short-window
+        # content fingerprint guard used by Feishu so one WeChat message cannot
+        # accidentally start multiple Agent loops and trip side-effect guards.
+        if not self._remember_message_fingerprint(from_user_id, msg_type.value, content):
+            print(f"↩️ [WeChat] 忽略疑似重复内容: msg_id={msg_id}, user={from_user_id}, text={content[:40]!r}")
+            return
+
         msg = Message(
             id=msg_id or str(uuid.uuid4()),
             channel="wechat",
