@@ -2455,15 +2455,69 @@ class Agent:
 
     def _terminal_side_effect_call_key(self, arguments: Any) -> Optional[str]:
         """Return a repeat key for terminal calls, or None for safe reads."""
+        command = self._extract_terminal_command(arguments)
+        if self._looks_like_mac_desktop_control_command(command):
+            return None
         semantic_kind = self._terminal_command_semantic_kind(arguments)
         if semantic_kind in {"navigation", "validation"}:
             return None
-        command = self._extract_terminal_command(arguments)
         if not command:
             return "terminal:<unknown>"
         normalized_command = " ".join(command.split())
         digest = hashlib.sha256(normalized_command.encode("utf-8")).hexdigest()[:12]
         return f"terminal:{digest}"
+
+    def _looks_like_mac_desktop_control_command(self, command: str) -> bool:
+        """Return True for allowlisted Mac lock/wake desktop-control commands.
+
+        These commands are intentionally exempt from PyClaw's duplicate
+        side-effect guard because users may legitimately ask WeChat/Feishu to
+        lock, wake, or trigger the lock-screen shortcut more than once. This
+        does not bypass TerminalTool's own approval/sandbox policy; it only
+        avoids the agent-level duplicate-call stop.
+        """
+        if not command:
+            return False
+
+        normalized = " ".join(command.strip().split())
+        lowered = normalized.lower()
+        if lowered == "pmset displaysleepnow":
+            return True
+        if re.fullmatch(r"caffeinate\s+-u(?:\s+-t\s+\d{1,5})?", lowered):
+            return True
+
+        try:
+            parts = shlex.split(normalized)
+        except ValueError:
+            return False
+        if not parts:
+            return False
+
+        executable = parts[0]
+        basename = os.path.basename(executable)
+        if basename == "CGSession" and parts[1:] == ["-suspend"]:
+            return True
+
+        if basename != "osascript":
+            return False
+        scripts: list[str] = []
+        index = 1
+        while index < len(parts):
+            if parts[index] != "-e" or index + 1 >= len(parts):
+                return False
+            scripts.append(" ".join(parts[index + 1].lower().split()))
+            index += 2
+        if not scripts:
+            return False
+
+        script = " ".join(scripts)
+        return (
+            "system events" in script
+            and "keystroke" in script
+            and "q" in script
+            and "control down" in script
+            and "command down" in script
+        )
 
     def _extract_terminal_command(self, arguments: Any) -> str:
         """Extract the shell command from terminal tool arguments."""
