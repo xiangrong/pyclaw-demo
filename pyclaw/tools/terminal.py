@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import shlex
 
 from pydantic import BaseModel, Field
 
@@ -20,9 +23,39 @@ class TerminalTool(BaseTool):
     description = "Execute shell commands on the system"
     args_schema = TerminalArgs
 
+    def _is_allowed_mac_desktop_control_command(self, command: str) -> bool:
+        """Return True for tightly allowlisted local Mac desktop-control commands."""
+        if not command:
+            return False
+        normalized = " ".join(command.strip().split())
+        lowered = normalized.lower()
+        if lowered == "pmset displaysleepnow":
+            return True
+        if re.fullmatch(r"caffeinate\s+-u(?:\s+-t\s+\d{1,5})?", lowered):
+            return True
+        if lowered in {
+            "~/.pyclaw/bin/unlock.sh",
+            "$home/.pyclaw/bin/unlock.sh",
+            "${home}/.pyclaw/bin/unlock.sh",
+        }:
+            return True
+        try:
+            parts = shlex.split(normalized)
+        except ValueError:
+            return False
+        if not parts:
+            return False
+        if len(parts) == 1:
+            executable = parts[0]
+        elif len(parts) == 2 and os.path.basename(parts[0]) in {"sh", "bash", "zsh"}:
+            executable = parts[1]
+        else:
+            return False
+        expanded = os.path.expandvars(os.path.expanduser(executable))
+        return expanded.endswith("/.pyclaw/bin/unlock.sh")
+
     def _classify_command(self, command: str) -> int:
         """分类指令风险等级：1(安全), 2(需确认), 3(高风险)"""
-        import re
         # 级别 3：危险操作
         risk_patterns = [
             r"rm\s+-rf", r"rmdir", r">\s*/dev/(?!null)", r"mkfs", r"dd\s+", 
@@ -46,27 +79,26 @@ class TerminalTool(BaseTool):
     async def execute(self, **kwargs: str) -> ToolResult:
         command = kwargs.get("command", "")
         timeout = int(kwargs.get("timeout", "60"))
+        is_allowed_desktop_control = self._is_allowed_mac_desktop_control_command(command)
 
         # 1. 增强型高风险指令拦截 (Command Firewall)
         # 拒绝任何包含 ~ 或绝对路径（且不在工作目录内）的指令
         # 逻辑：查找指令中所有看起来像路径的部分
-        import os
-        import re
-        
-        # 匹配看起来像路径的字符串 (以 / 或 ~ 开头，或者包含 /)
-        path_patterns = re.findall(r"(?:^|\s)([/~][\w\.\-/]*)", command)
-        for p in path_patterns:
-            try:
-                # 尝试验证每一个潜在路径
-                self.validate_path(p.strip())
-            except PermissionError as e:
-                return ToolResult(
-                    success=False,
-                    content=f"⚠️ 拦截到非法路径访问: `{p.strip()}`。\n指令: `{command}`\n原因: {str(e)}"
-                )
+        if not is_allowed_desktop_control:
+            # 匹配看起来像路径的字符串 (以 / 或 ~ 开头，或者包含 /)
+            path_patterns = re.findall(r"(?:^|\s)([/~][\w\.\-/]*)", command)
+            for p in path_patterns:
+                try:
+                    # 尝试验证每一个潜在路径
+                    self.validate_path(p.strip())
+                except PermissionError as e:
+                    return ToolResult(
+                        success=False,
+                        content=f"⚠️ 拦截到非法路径访问: `{p.strip()}`。\n指令: `{command}`\n原因: {str(e)}"
+                    )
 
         # 拒绝尝试跳出工作目录的操作 (如 cd ..)
-        if ".." in command:
+        if not is_allowed_desktop_control and ".." in command:
             return ToolResult(
                 success=False,
                 content=f"⚠️ 拦截到尝试跳出工作目录的操作: `{command}`。请不要使用 `..`。"

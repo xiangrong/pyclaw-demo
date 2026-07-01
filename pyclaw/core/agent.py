@@ -2606,6 +2606,8 @@ class Agent:
             return "display_sleep"
         if normalized.startswith("caffeinate -u"):
             return "wake"
+        if self._looks_like_mac_unlock_script_command(command):
+            return "unlock"
         try:
             parts = shlex.split(command)
         except ValueError:
@@ -2633,6 +2635,8 @@ class Agent:
         if lowered == "pmset displaysleepnow":
             return True
         if re.fullmatch(r"caffeinate\s+-u(?:\s+-t\s+\d{1,5})?", lowered):
+            return True
+        if self._looks_like_mac_unlock_script_command(normalized):
             return True
 
         try:
@@ -2667,6 +2671,34 @@ class Agent:
             and "control down" in script
             and "command down" in script
         )
+
+    def _looks_like_mac_unlock_script_command(self, command: str) -> bool:
+        """Return True for the dedicated local Mac unlock helper script."""
+        if not command:
+            return False
+        normalized = " ".join(command.strip().split())
+        lowered = normalized.lower()
+        candidates = {
+            "~/.pyclaw/bin/unlock.sh",
+            "$home/.pyclaw/bin/unlock.sh",
+            "${home}/.pyclaw/bin/unlock.sh",
+        }
+        if lowered in candidates:
+            return True
+        try:
+            parts = shlex.split(normalized)
+        except ValueError:
+            return False
+        if not parts:
+            return False
+        if len(parts) == 1:
+            executable = parts[0]
+        elif len(parts) == 2 and os.path.basename(parts[0]) in {"sh", "bash", "zsh"}:
+            executable = parts[1]
+        else:
+            return False
+        expanded = os.path.expandvars(os.path.expanduser(executable))
+        return expanded.endswith("/.pyclaw/bin/unlock.sh")
 
     def _extract_terminal_command(self, arguments: Any) -> str:
         """Extract the shell command from terminal tool arguments."""

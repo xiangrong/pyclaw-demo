@@ -53,3 +53,12 @@ async def test_terminal_hitl():
     result = await tool.execute(command="rm -rf important_file", approved=False)
     assert "🛑 拦截到高风险指令" in result.content
     assert result.success is False
+
+
+def test_terminal_allows_dedicated_mac_unlock_script_past_path_sandbox():
+    tool = TerminalTool()
+    tool.set_work_dir(os.getcwd())
+
+    assert tool._is_allowed_mac_desktop_control_command("~/.pyclaw/bin/unlock.sh") is True
+    assert tool._is_allowed_mac_desktop_control_command("bash ~/.pyclaw/bin/unlock.sh") is True
+    assert tool._is_allowed_mac_desktop_control_command("~/.pyclaw/bin/not-unlock.sh") is False
