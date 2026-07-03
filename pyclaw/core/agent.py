@@ -865,12 +865,17 @@ class Agent:
                 # 3. 将结果作为 Observation 添加到会话
                 any_failure = False
                 successful_side_effect_calls: list[str] = []
+                attempted_desktop_control_script_calls: list[str] = []
                 for result_index, tr in enumerate(tool_results):
                     side_effect_key = pending_side_effect_keys_by_call_id.get(
                         str(tr.get("tool_call_id", ""))
                     )
                     if side_effect_key is None and result_index < len(pending_side_effect_key_queue):
                         side_effect_key = pending_side_effect_key_queue[result_index]
+                    if side_effect_key and side_effect_key.startswith("terminal:mac_desktop_control:"):
+                        observed_command = self._extract_terminal_command_from_observation(str(tr.get("content", "")))
+                        if observed_command and self._mac_desktop_control_script_action(observed_command):
+                            attempted_desktop_control_script_calls.append(side_effect_key)
                     if side_effect_key and tr.get("success") and not self._should_count_side_effect_attempt(side_effect_key):
                         side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
                         successful_side_effect_calls.append(side_effect_key)
@@ -972,6 +977,11 @@ class Agent:
                         "定时任务收尾交付动作已执行或尝试执行。请不要再调用工具，直接输出最终答复。",
                     )
                     force_final_answer = True
+                elif attempted_desktop_control_script_calls:
+                    await self._request_final_answer_without_tools(
+                        session,
+                        self._desktop_control_final_answer_reason(attempted_desktop_control_script_calls),
+                    )
 
                 continue
 
@@ -1068,6 +1078,7 @@ class Agent:
                 continue
 
             final_content = self._sanitize_user_facing_content("\n\n".join(all_responses))
+            final_content = self._prepare_desktop_control_final_content(session, final_content)
             final_content = self._prepare_coding_final_content(
                 session=session,
                 content=final_content,
@@ -1091,7 +1102,7 @@ class Agent:
         stop_content = self._with_stop_notice(all_responses, self._summarize_final(session))
         return self._prepare_coding_final_content(
             session=session,
-            content=stop_content,
+            content=self._prepare_desktop_control_final_content(session, stop_content),
             changed_files=changed_files,
             validation_results=validation_results,
             build_results=build_results,
@@ -1105,6 +1116,91 @@ class Agent:
         except (TypeError, ValueError):
             return default
         return value if value > 0 else default
+
+    def _prepare_desktop_control_final_content(self, session: Session, content: str) -> str:
+        """Correct unsafe/hallucinated final wording for Mac lock/unlock helpers.
+
+        Desktop control scripts are intentionally one-shot. If the terminal
+        observation proves the helper ran, the final answer must not ask the
+        user to run the same command manually or claim the command did not land.
+        """
+        observation = self._latest_desktop_control_terminal_observation(session)
+        if not observation:
+            return content
+
+        if self._desktop_control_final_contradicts_observation(content):
+            return self._desktop_control_observation_summary(observation)
+        return content
+
+    def _latest_desktop_control_terminal_observation(self, session: Session) -> str:
+        """Return the latest terminal observation for a known Mac desktop helper."""
+        for msg in reversed(getattr(session, "messages", []) or []):
+            if msg.role != MessageRole.TOOL:
+                continue
+            metadata = getattr(msg, "metadata", {}) or {}
+            if not isinstance(metadata, dict) or metadata.get("tool_name") != "terminal":
+                continue
+            content = str(msg.content or "")
+            command = self._extract_terminal_command_from_observation(content)
+            if command and self._mac_desktop_control_script_action(command):
+                return content
+        return ""
+
+    def _desktop_control_final_contradicts_observation(self, content: str) -> bool:
+        """Return True for final answers that deny an observed desktop command."""
+        if not content:
+            return False
+        lowered = content.lower()
+        contradiction_patterns = (
+            "没能真正落到",
+            "没有真正落到",
+            "没落到",
+            "不知道执行了没",
+            "不确定执行了没",
+            "不确定有没有执行",
+            "不知道有没有执行",
+            "未能通过工具直接触发",
+            "没能直接落到",
+            "没能真正在你机器上跑",
+            "没能替你触发",
+            "没能真正把命令",
+            "没有真正解锁",
+            "没能真正解锁",
+            "请手动跑",
+            "手动执行",
+            "手动触发",
+            "run manually",
+            "manual",
+        )
+        if any(pattern in content for pattern in contradiction_patterns):
+            return True
+        return "did not execute" in lowered or "not executed" in lowered
+
+    def _desktop_control_observation_summary(self, observation: str) -> str:
+        """Summarize a desktop-control observation without exposing raw logs."""
+        if "当前状态: UNLOCKED" in observation or "已解锁，跳过" in observation:
+            return "解锁脚本已执行；检测到当前已解锁，所以没有输入密码。"
+        if "已在" in observation and "解锁成功" in observation:
+            return "解锁脚本已执行，检测到已解锁成功。"
+        if "ACTION_NOT_SENT_UNKNOWN" in observation:
+            return "解锁脚本已执行；状态仍未知，出于安全没有输入密码，也不会重复执行。"
+        if "ACTION_SENT_BUT_STILL_LOCKED" in observation:
+            return "解锁脚本已执行并发送了一次输入，但复检仍为锁屏；可能是密码、辅助功能权限或登录框焦点问题，我不会重复输入密码。"
+        if "输入动作: OSASCRIPT_FAILED" in observation:
+            if "exit=124" in observation:
+                return "解锁脚本已执行，但系统按键注入在锁屏界面超时；请检查 PyClaw/终端宿主的辅助功能权限或登录框焦点，我不会重复输入密码。"
+            return "解锁脚本已执行，但系统按键注入失败；请检查 PyClaw/终端宿主的辅助功能权限，我不会重复输入密码。"
+        if "ACTION_SENT_UNCONFIRMED" in observation and "解锁" in observation:
+            return "解锁脚本已执行并发送了一次输入；状态检测不可用，无法自动确认，我不会重复输入密码。"
+        if "ACTION_SENT_UNCONFIRMED" in observation or "锁屏命令已发送" in observation:
+            return "锁屏命令已发送；本机状态检测不可用，无法自动确认，但不会再重复执行。"
+        if "已锁屏" in observation or "锁屏成功" in observation:
+            return "锁屏脚本已执行，检测到已锁屏。"
+        if "unlock.sh" in observation:
+            return "解锁脚本已执行；请以屏幕实际状态为准，我不会重复执行以避免多次输入密码。"
+        if "lock.sh" in observation:
+            return "锁屏脚本已执行；请以屏幕实际状态为准，我不会重复执行。"
+        return "桌面控制命令已执行；请以屏幕实际状态为准，我不会重复执行。"
 
     def _effective_max_tool_calls(
         self,
@@ -2443,6 +2539,19 @@ class Agent:
             ),
         )
         await self.sessions.save_message(session, final_request)
+
+    def _desktop_control_final_answer_reason(self, side_effect_keys: list[str]) -> str:
+        """Return a final-answer guard for one-shot Mac desktop controls."""
+        actions = sorted({key.rsplit(":", 1)[-1] for key in side_effect_keys})
+        action_text = ", ".join(actions) if actions else "mac_desktop_control"
+        return (
+            "Mac 桌面控制工具已经执行或至少已经把命令发送到终端："
+            f"{action_text}。不要再次调用 terminal 或脚本。最终回复必须忠实依据最近的 terminal OBSERVATION："
+            "如果有 Command/Exit code/STDOUT，不能说'没有执行'、'没有落到机器上'、'请手动跑同一条命令'；"
+            "如果 stdout 包含 'ACTION_SENT_UNCONFIRMED' 或 '命令已发送'，应回复'命令已发送，但系统状态检测不可用/未确认'；"
+            "如果 stdout 包含 '当前状态: UNLOCKED' 或 '已解锁，跳过'，应回复'脚本已执行，检测为已解锁，所以没有输入密码'；"
+            "如果 stdout 包含 '已解锁成功'，应回复解锁成功；如果 stdout 包含 '已锁屏' 或 '锁屏命令已发送'，应回复对应结果。"
+        )
 
     async def _request_soft_deadline_wrap_up(self, session: Session) -> None:
         """Ask a cron task to stop research but allow one final delivery action.

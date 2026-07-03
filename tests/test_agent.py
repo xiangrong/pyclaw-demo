@@ -1658,11 +1658,137 @@ async def test_agent_stops_unlock_script_variants_after_one_desktop_control_atte
     assert tools.execute_tool_calls.call_count == 1
     assert response.content == "解锁脚本已执行一次，当前检测为已解锁。"
     assert "副作用工具重复调用" not in response.content
-    assert any(
-        "本轮只有重复的副作用工具调用" in m.content
-        and "terminal:mac_desktop_control:unlock" in m.content
-        for m in session.messages
+
+
+@pytest.mark.asyncio
+async def test_agent_corrects_desktop_control_final_that_denies_successful_unlock_observation():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    unlock_args = json.dumps({"command": "bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh"})
+    model.chat.side_effect = [
+        {
+            "content": "执行解锁脚本...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "unlock1", "function": {"name": "terminal", "arguments": unlock_args}}],
+        },
+        {"content": "这次也没能真正落到你机器上，请手动跑 unlock.sh。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "unlock1",
+            "name": "terminal",
+            "content": "Command: bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh\nExit code: 0\nSTDOUT:\n当前状态: UNLOCKED\n✅ 当前已解锁，跳过",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-unlock-final-correction"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-unlock-final-correction",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-unlock-final-correction",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="解锁",
     )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "解锁脚本已执行；检测到当前已解锁，所以没有输入密码。"
+    assert "手动" not in response.content
+    assert any("Mac 桌面控制工具已经执行" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_corrects_lock_action_sent_unconfirmed_final():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_args = json.dumps({"command": "bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh"})
+    model.chat.side_effect = [
+        {
+            "content": "执行锁屏脚本...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock1", "function": {"name": "terminal", "arguments": lock_args}}],
+        },
+        {"content": "这轮锁屏没落到机器上，请手动跑 lock.sh。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lock1",
+            "name": "terminal",
+            "content": "Command: bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh\nExit code: 0\nSTDOUT:\nACTION_SENT_UNCONFIRMED: 锁屏命令已发送，但本机状态检测不可用，无法自动确认。",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-lock-final-correction"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-lock-final-correction",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-lock-final-correction",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="锁屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "锁屏命令已发送；本机状态检测不可用，无法自动确认，但不会再重复执行。"
+    assert "手动" not in response.content
 
 
 def test_read_only_diagnostics_with_stderr_redirect_are_navigation_not_side_effect():
