@@ -2837,7 +2837,10 @@ class Agent:
                 json.dumps({"command": command}),
                 session=session,
             )
-            if not side_effect_key or self._should_count_side_effect_attempt(side_effect_key):
+            if not side_effect_key:
+                continue
+            if self._should_count_side_effect_attempt(side_effect_key):
+                counts[side_effect_key] = max(counts.get(side_effect_key, 0), 1)
                 continue
             fake_result = {"name": "terminal", "content": content}
             if "OBSERVATION from terminal:" in content or self._failed_side_effect_result_consumes_repeat_budget(side_effect_key, fake_result):
@@ -2881,12 +2884,13 @@ class Agent:
     def _mac_desktop_control_action(self, command: str) -> str:
         """Return a stable action name for allowlisted Mac desktop commands."""
         normalized = " ".join(command.strip().split()).lower()
+        script_action = self._mac_desktop_control_script_action(command)
+        if script_action:
+            return script_action
         if normalized == "pmset displaysleepnow":
             return "display_sleep"
         if normalized.startswith("caffeinate -u"):
             return "wake"
-        if self._looks_like_mac_unlock_script_command(command):
-            return "unlock"
         try:
             parts = shlex.split(command)
         except ValueError:
@@ -2915,7 +2919,7 @@ class Agent:
             return True
         if re.fullmatch(r"caffeinate\s+-u(?:\s+-t\s+\d{1,5})?", lowered):
             return True
-        if self._looks_like_mac_unlock_script_command(normalized):
+        if self._mac_desktop_control_script_action(normalized):
             return True
 
         try:
@@ -2951,33 +2955,51 @@ class Agent:
             and "command down" in script
         )
 
-    def _looks_like_mac_unlock_script_command(self, command: str) -> bool:
-        """Return True for the dedicated local Mac unlock helper script."""
+    def _mac_desktop_control_script_action(self, command: str) -> str:
+        """Return the desktop action for dedicated local Mac helper scripts.
+
+        Models often wrap the helper in harmless logging (`echo ... && bash
+        unlock.sh; echo exit=$?`) or switch between `sh`/`bash`/direct
+        execution.  Key by the helper script's semantic action instead of the
+        literal shell snippet so those variants cannot bypass duplicate
+        side-effect protection.
+        """
         if not command:
-            return False
+            return ""
         normalized = " ".join(command.strip().split())
-        lowered = normalized.lower()
-        candidates = {
-            "~/.pyclaw/bin/unlock.sh",
-            "$home/.pyclaw/bin/unlock.sh",
-            "${home}/.pyclaw/bin/unlock.sh",
-        }
-        if lowered in candidates:
-            return True
-        try:
-            parts = shlex.split(normalized)
-        except ValueError:
-            return False
-        if not parts:
-            return False
-        if len(parts) == 1:
+        segments = [segment.strip() for segment in re.split(r"\s*(?:&&|\|\||;)\s*", normalized) if segment.strip()]
+        for segment in segments:
+            try:
+                parts = shlex.split(segment)
+            except ValueError:
+                continue
+            if not parts:
+                continue
             executable = parts[0]
-        elif len(parts) == 2 and os.path.basename(parts[0]) in {"sh", "bash", "zsh"}:
-            executable = parts[1]
-        else:
-            return False
-        expanded = os.path.expandvars(os.path.expanduser(executable))
-        return expanded.endswith("/.pyclaw/bin/unlock.sh")
+            head = os.path.basename(executable)
+            if head in {"sh", "bash", "zsh"}:
+                script_args = [part for part in parts[1:] if not part.startswith("-")]
+                if not script_args:
+                    continue
+                executable = script_args[0]
+            elif len(parts) != 1:
+                continue
+
+            action = self._mac_desktop_control_script_action_from_text(executable)
+            if action:
+                return action
+        return ""
+
+    def _mac_desktop_control_script_action_from_text(self, text: str) -> str:
+        """Return the action if text references a known local desktop helper."""
+        expanded = os.path.expandvars(os.path.expanduser(text)).lower()
+        if re.search(r"(?:^|[\s;&|()])\S*/?\.pyclaw/bin/unlock\.sh(?:$|[\s;&|()])", expanded):
+            return "unlock"
+        if re.search(r"(?:^|[\s;&|()])\S*/?\.pyclaw/skills/mac-wake-unlock/unlock\.sh(?:$|[\s;&|()])", expanded):
+            return "unlock"
+        if re.search(r"(?:^|[\s;&|()])\S*/?\.pyclaw/skills/mac-lock-unlock/lock\.sh(?:$|[\s;&|()])", expanded):
+            return "lock_screen"
+        return ""
 
     def _extract_terminal_command(self, arguments: Any) -> str:
         """Extract the shell command from terminal tool arguments."""

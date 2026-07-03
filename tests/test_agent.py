@@ -1574,10 +1574,95 @@ def test_mac_desktop_control_commands_use_semantic_side_effect_keys():
     assert agent._terminal_side_effect_call_key(
         json.dumps({"command": "bash ~/.pyclaw/bin/unlock.sh", "approved": True})
     ) == "terminal:mac_desktop_control:unlock"
+    assert agent._terminal_side_effect_call_key(
+        json.dumps({"command": "bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh", "approved": True})
+    ) == "terminal:mac_desktop_control:unlock"
+    assert agent._terminal_side_effect_call_key(
+        json.dumps({"command": "echo start && bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh; echo done", "approved": True})
+    ) == "terminal:mac_desktop_control:unlock"
+    assert agent._terminal_side_effect_call_key(
+        json.dumps({"command": "bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh", "approved": True})
+    ) == "terminal:mac_desktop_control:lock_screen"
 
     assert agent._terminal_side_effect_call_key(
         json.dumps({"command": "osascript -e 'display notification \"ok\"'", "approved": True})
     ) is not None
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_unlock_script_variants_after_one_desktop_control_attempt():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    first_args = json.dumps({"command": "bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh", "approved": True})
+    variant_args = json.dumps({"command": "echo start && bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh; echo done", "approved": True})
+    model.chat.side_effect = [
+        {
+            "content": "执行解锁脚本...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "unlock1", "function": {"name": "terminal", "arguments": first_args}}],
+        },
+        {
+            "content": "换个命令形态再试...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "unlock2", "function": {"name": "terminal", "arguments": variant_args}}],
+        },
+        {"content": "解锁脚本已执行一次，当前检测为已解锁。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "unlock1",
+            "name": "terminal",
+            "content": "Command: bash ~/.pyclaw/skills/mac-wake-unlock/unlock.sh\nExit code: 0\nSTDOUT:\n✅ 当前已解锁，跳过",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-unlock-script-variant-repeat"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-unlock-script-variant-repeat",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-unlock-script-variant-repeat",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="解锁",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "解锁脚本已执行一次，当前检测为已解锁。"
+    assert "副作用工具重复调用" not in response.content
+    assert any(
+        "本轮只有重复的副作用工具调用" in m.content
+        and "terminal:mac_desktop_control:unlock" in m.content
+        for m in session.messages
+    )
 
 
 def test_read_only_diagnostics_with_stderr_redirect_are_navigation_not_side_effect():
