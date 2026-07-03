@@ -3752,3 +3752,143 @@ async def test_unfinished_implementation_confirmation_is_rewritten():
     assert "没有完成代码修改" in response.content
     assert "需要我继续" not in response.content
     assert "如果确认" not in response.content
+
+@pytest.mark.asyncio
+async def test_short_write_confirmation_resumes_pending_file_action():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "写入文件。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "write1",
+                "function": {
+                    "name": "write_file",
+                    "arguments": '{"path":"~/.pyclaw/skills/mac-lock-unlock/lock.sh","content":"#!/bin/bash\\necho lock\\n"}',
+                },
+            }],
+        },
+        {
+            "content": "运行语法检查。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "check1",
+                "function": {"name": "terminal", "arguments": '{"command":"bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh"}'},
+            }],
+        },
+        {"content": "已写入。", "__tool_calls__": False},
+        {"content": "脚本无独立构建步骤，已完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "write1", "name": "write_file", "content": "File written: ~/.pyclaw/skills/mac-lock-unlock/lock.sh", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "check1", "name": "terminal", "content": "Command: bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-short-write-confirmation"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.metadata = {}
+    session.messages = [
+        Message(
+            id="prev-assistant", channel="feishu", channel_user_id="u1", session_id="s-short-write-confirmation",
+            type=MessageType.TEXT, role=MessageRole.ASSISTANT,
+            content="新版 lock.sh 已定稿。你回复『写入』，我就直接写入 ~/.pyclaw/skills/mac-lock-unlock/lock.sh 并验证。",
+        )
+    ]
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=8)
+    user_msg = Message(
+        id="m-write-confirm", channel="feishu", channel_user_id="u1", session_id="s-short-write-confirmation",
+        type=MessageType.TEXT, role=MessageRole.USER, content="写入",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    first_call_messages = model.chat.call_args_list[0][1]["messages"]
+    assert any("PENDING_ACTION_CONTEXT" in str(m.get("content", "")) for m in first_call_messages)
+    assert tools.execute_tool_calls.call_count == 2
+    assert any('"name": "write_file"' in call.args[0] for call in tools.execute_tool_calls.call_args_list)
+    assert "当前没有完成代码修改" not in response.content
+    assert "验证结果：PASS: bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh" in response.content
+
+
+@pytest.mark.asyncio
+async def test_terminal_approval_failures_nudge_to_file_tools_before_max_depth():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {"content": "先备份。", "__tool_calls__": True, "tool_calls": [{"id": "cp1", "function": {"name": "terminal", "arguments": '{"command":"cp ~/.pyclaw/skills/mac-lock-unlock/lock.sh ~/.pyclaw/skills/mac-lock-unlock/lock.sh.bak 2>/dev/null; ls ~/.pyclaw/skills/mac-lock-unlock/"}'}}]},
+        {"content": "换个写法备份。", "__tool_calls__": True, "tool_calls": [{"id": "cp2", "function": {"name": "terminal", "arguments": '{"command":"cp ~/.pyclaw/skills/mac-lock-unlock/lock.sh ~/.pyclaw/skills/mac-lock-unlock/lock.sh.bak 2>/dev/null; echo done"}'}}]},
+        {"content": "改用文件工具。", "__tool_calls__": True, "tool_calls": [{"id": "write1", "function": {"name": "write_file", "arguments": '{"path":"~/.pyclaw/skills/mac-lock-unlock/lock.sh","content":"#!/bin/bash\\necho lock\\n"}'}}]},
+        {"content": "验证。", "__tool_calls__": True, "tool_calls": [{"id": "check1", "function": {"name": "terminal", "arguments": '{"command":"bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh"}'}}]},
+        {"content": "已完成。", "__tool_calls__": False},
+        {"content": "脚本无独立构建步骤，已完成。", "__tool_calls__": False},
+    ]
+    blocked = "⚠️ 检测到有副作用的指令: `cp ~/.pyclaw/skills/mac-lock-unlock/lock.sh ~/.pyclaw/skills/mac-lock-unlock/lock.sh.bak`\n请添加 approved=True"
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "cp1", "name": "terminal", "content": blocked, "success": False, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "cp2", "name": "terminal", "content": blocked, "success": False, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "write1", "name": "write_file", "content": "File written: ~/.pyclaw/skills/mac-lock-unlock/lock.sh", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "check1", "name": "terminal", "content": "Command: bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh\nExit code: 0", "success": True, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-approval-pivot"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.metadata = {}
+    session.messages = [
+        Message(
+            id="prev-assistant", channel="feishu", channel_user_id="u1", session_id="s-terminal-approval-pivot",
+            type=MessageType.TEXT, role=MessageRole.ASSISTANT,
+            content="新版 lock.sh 已定稿。回复写入我就直接写入 ~/.pyclaw/skills/mac-lock-unlock/lock.sh。",
+        )
+    ]
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-write", channel="feishu", channel_user_id="u1", session_id="s-terminal-approval-pivot",
+        type=MessageType.TEXT, role=MessageRole.USER, content="写入",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert any("repeatedly failed terminal mutations" in m.content for m in session.messages)
+    assert tools.execute_tool_calls.call_count == 4
+    assert "达到最大思考深度" not in response.content
+    assert "当前没有完成代码修改" not in response.content
+    assert "验证结果：PASS: bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh" in response.content

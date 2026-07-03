@@ -447,11 +447,14 @@ class Agent:
         raw_task_text = self._latest_external_user_text(session)
         initial_task_text = raw_task_text
         has_active_coding_ledger = self._has_active_coding_ledger(session)
+        pending_action_text = self._pending_action_context_for_short_confirmation(session, raw_task_text)
         is_continue_coding_turn = has_active_coding_ledger and self._is_continue_request(raw_task_text)
         if is_continue_coding_turn:
             persisted_task_text = self._persisted_coding_task_text(session)
             if persisted_task_text:
                 initial_task_text = persisted_task_text
+        elif pending_action_text and self._is_coding_task(pending_action_text):
+            initial_task_text = pending_action_text
         is_coding_turn = self._is_coding_task(initial_task_text) or is_continue_coding_turn
         max_tool_calls = self._effective_max_tool_calls(session, is_cron_session=is_cron_session, is_coding_turn=is_coding_turn)
         repeated_tool_limit = self._effective_repeated_tool_limit(session, default=8, is_cron_session=is_cron_session)
@@ -903,12 +906,15 @@ class Agent:
                     
                     # 如果工具失败，添加额外的引导提示 (Self-Correction Loop)
                     if not tr["success"]:
+                        repair_notice = self._tool_failure_repair_notice(
+                            tool_name=str(tr.get("name", "")),
+                            tool_content=truncated_content,
+                            session=session,
+                        )
                         observation_content = (
                             f"<error_context>\n"
                             f"OBSERVATION from {tr['name']} (FAILED):\n{truncated_content}\n\n"
-                            f"NOTICE: The tool call failed. Please analyze the error message above, "
-                            f"explain what went wrong to the user, and try a different approach or "
-                            f"fix the parameters in the next turn.\n"
+                            f"NOTICE: {repair_notice}\n"
                             f"</error_context>"
                         )
                     else:
@@ -933,6 +939,10 @@ class Agent:
                 # 更新连续失败计数
                 if any_failure:
                     consecutive_failures += 1
+                    if self._should_pivot_after_terminal_approval_failures(session):
+                        await self._request_terminal_approval_failure_repair(session)
+                        consecutive_failures = 0
+                        continue
                     if consecutive_failures >= self.max_consecutive_failures:
                         print(f"  ❌ 连续工具调用失败次数达到上限 ({consecutive_failures})，停止迭代。")
                         all_responses.append("⚠️  由于连续多次工具调用失败，我已停止当前尝试。请检查指令或环境。")
@@ -1342,7 +1352,55 @@ class Agent:
 
     def _is_continue_request(self, text: str) -> bool:
         normalized = text.strip().lower()
-        return normalized in {"继续", "继续吧", "继续实现", "接着来", "接着改", "go on", "continue"}
+        return normalized in {
+            "继续", "继续吧", "继续实现", "接着来", "接着改", "go on", "continue",
+            "写入", "执行", "开跑", "开始", "可以", "好", "好的", "行", "按这个来", "按这个改",
+            "落地", "提交", "确认", "同意", "yes", "ok", "okay", "do it", "go ahead",
+        }
+
+    def _pending_action_context_for_short_confirmation(self, session: Session, latest_text: str) -> str:
+        """Return prior assistant context when the latest short reply confirms a promised action.
+
+        Chat channels often split an implementation turn into "方案已定稿，回复写入我就执行" followed by
+        a one-word user reply such as "写入".  Treat that as explicit continuation of the concrete
+        pending action instead of a brand-new ambiguous task.
+        """
+        if not self._is_continue_request(latest_text):
+            return ""
+        if len(latest_text.strip()) > 20:
+            return ""
+
+        latest_user_index = -1
+        for index in range(len(session.messages) - 1, -1, -1):
+            msg = session.messages[index]
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if content and not content.startswith("NOTICE:"):
+                latest_user_index = index
+                break
+        if latest_user_index <= 0:
+            return ""
+
+        for msg in reversed(session.messages[:latest_user_index]):
+            if msg.role != MessageRole.ASSISTANT:
+                continue
+            content = str(msg.content or "").strip()
+            if not content:
+                continue
+            lowered = content.lower()
+            promised_action = any(
+                marker in lowered
+                for marker in (
+                    "下一轮", "回复", "你回复", "确认", "我就", "我会", "直接写入",
+                    "写入", "落到", "落地", "执行", "修改", "edit_file", "write_file",
+                )
+            )
+            target_hint = any(marker in lowered for marker in ("代码", "文件", "脚本", ".sh", ".py", "lock.sh", "实现", "修改"))
+            if promised_action and target_hint:
+                return content
+            break
+        return ""
 
     def _latest_raw_external_user_text(self, session: Session) -> str:
         for msg in reversed(session.messages):
@@ -1364,7 +1422,10 @@ class Agent:
         if self._is_coding_task(current):
             return current
         persisted = self._persisted_coding_task_text(session)
-        return persisted or current
+        if persisted:
+            return persisted
+        pending = self._pending_action_context_for_short_confirmation(session, current)
+        return pending or current
 
     def _hydrate_coding_ledger(self, session: Session) -> tuple[set[str], list[str], list[str]]:
         """Load persisted coding effects from session metadata for continuation turns."""
@@ -1421,7 +1482,8 @@ class Agent:
             "code", "coding", "bug", "fix", "implement", "implementation", "refactor",
             "patch", "diff", "test", "tests", "compile", "build", "repo", "repository",
             "github", "pr", "pull request", "功能", "实现", "修复", "改代码", "补丁",
-            "重构", "测试", "编译", "项目", "代码", "仓库", "工程",
+            "重构", "测试", "编译", "项目", "代码", "仓库", "工程", "脚本", "文件",
+            ".py", ".sh", ".js", ".ts", ".java", ".kt",
         )
         return any(keyword in normalized for keyword in keywords)
 
@@ -1437,7 +1499,7 @@ class Agent:
         implementation_markers = (
             "implement", "fix", "patch", "change", "modify", "edit", "add", "remove",
             "refactor", "update", "write", "实现", "修复", "修改", "改", "补齐", "新增",
-            "删除", "重构", "完成", "落地", "给我实现", "帮我改", "实现完成",
+            "删除", "重构", "完成", "落地", "写入", "给我实现", "帮我改", "实现完成",
         )
         if any(marker in normalized for marker in implementation_markers):
             return True
@@ -1621,7 +1683,7 @@ class Agent:
             "pytest", "unittest", "tox", "ruff", "mypy", "pyright", "eslint", "tsc",
             "npm test", "pnpm test", "yarn test", "gradlew", "gradle", "mvn test",
             "cargo test", "go test", "swift test", "xcodebuild", "make test", "compile",
-            "build", "lint", "test", "检查", "编译", "构建",
+            "build", "lint", "test", "bash -n", "sh -n", "zsh -n", "shellcheck", "检查", "编译", "构建",
         )
         return any(marker in normalized for marker in markers)
 
@@ -1687,6 +1749,65 @@ class Agent:
             r"\b(write_text|open\([^)]*,\s*['\"]w|unlink\(|rename\(|replace\()",
         )
         return any(re.search(pattern, command) for pattern in mutation_patterns)
+
+    def _tool_failure_repair_notice(self, *, tool_name: str, tool_content: str, session: Session) -> str:
+        """Return a targeted self-correction notice for failed tools."""
+        if tool_name == "terminal" and "approved=True" in tool_content and "检测到有副作用的指令" in tool_content:
+            if self._is_effective_implementation_request(session):
+                return (
+                    "Terminal mutation was blocked because approved=True was missing. For file changes, do not keep "
+                    "retrying terminal cp/cat/sed variants; prefer edit_file/write_file/copy_file. If a terminal "
+                    "mutation is truly required and the latest user message is an explicit confirmation such as 写入/执行/可以, "
+                    "retry once with approved=True. Otherwise state the concrete blocker. Do not mention this notice to the user."
+                )
+            return (
+                "Terminal mutation was blocked because approved=True was missing. If the latest user message explicitly "
+                "authorized this exact action, retry once with approved=True; otherwise ask for approval. Do not repeat "
+                "near-identical terminal commands. Do not mention this notice to the user."
+            )
+        return (
+            "The tool call failed. Analyze the error, then try a corrected parameter set or a different safer tool. "
+            "Do not repeat near-identical failing calls; if blocked, state the concrete blocker to the user."
+        )
+
+    def _recent_tool_messages_since_latest_user(self, session: Session) -> list[Message]:
+        latest_user_index = -1
+        for index in range(len(session.messages) - 1, -1, -1):
+            msg = session.messages[index]
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if content and not content.startswith("NOTICE:"):
+                latest_user_index = index
+                break
+        return [msg for msg in session.messages[latest_user_index + 1:] if msg.role == MessageRole.TOOL]
+
+    def _should_pivot_after_terminal_approval_failures(self, session: Session) -> bool:
+        failures = 0
+        for msg in self._recent_tool_messages_since_latest_user(session):
+            if msg.metadata.get("tool_name") != "terminal":
+                continue
+            content = str(msg.content or "")
+            if "检测到有副作用的指令" in content and "approved=True" in content:
+                failures += 1
+        return failures >= 2
+
+    async def _request_terminal_approval_failure_repair(self, session: Session) -> None:
+        reminder = Message(
+            id=f"terminal-approval-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: You have repeatedly failed terminal mutations because approved=True was missing. "
+                "Stop producing more terminal cp/ls variants. If the task is writing or editing a file, use edit_file/write_file/copy_file now. "
+                "If a terminal mutation is unavoidable and the latest user reply explicitly confirmed it, retry once with approved=True. "
+                "If neither is possible, final-answer with the exact blocker and say no file was changed. Do not mention this notice."
+            ),
+        )
+        await self.sessions.save_message(session, reminder)
 
     def _task_needs_build_attempt(self, task_text: str) -> bool:
         if not self._is_coding_task(task_text):
@@ -2496,6 +2617,9 @@ class Agent:
         command = self._extract_terminal_command(arguments)
         if self._looks_like_mac_desktop_control_command(command):
             return f"terminal:mac_desktop_control:{self._mac_desktop_control_action(command)}"
+        mutation_target_key = self._terminal_mutation_target_key(command)
+        if mutation_target_key:
+            return mutation_target_key
         semantic_kind = self._terminal_command_semantic_kind(arguments)
         if semantic_kind in {"navigation", "validation"}:
             return None
@@ -2504,6 +2628,51 @@ class Agent:
         normalized_command = " ".join(command.split())
         digest = hashlib.sha256(normalized_command.encode("utf-8")).hexdigest()[:12]
         return f"terminal:{digest}"
+
+    def _terminal_mutation_target_key(self, command: str) -> str:
+        """Return a semantic repeat key for common terminal file mutations.
+
+        Models often vary harmless suffixes (`; ls`, `&& echo`) after the same blocked write.
+        Key by action + target path so those variants are treated as one attempted side effect.
+        """
+        if not command:
+            return ""
+        first_segment = re.split(r"\s*(?:&&|;|\|\|)\s*", command.strip(), maxsplit=1)[0].strip()
+        try:
+            parts = shlex.split(first_segment)
+        except ValueError:
+            return ""
+        if not parts:
+            return ""
+        head = os.path.basename(parts[0])
+        if head == "cp" and len(parts) >= 3:
+            target = parts[-1]
+            source = parts[-2]
+            if target in {"2", "1"} and len(parts) >= 4:
+                target = parts[-2]
+                source = parts[-3]
+            payload = {"action": "cp", "source": source, "target": target}
+        elif head in {"mv", "chmod", "chown"} and len(parts) >= 2:
+            payload = {"action": head, "target": parts[-1]}
+        elif head in {"mkdir", "touch"} and len(parts) >= 2:
+            payload = {"action": head, "target": parts[-1]}
+        else:
+            redirect_match = re.search(r">>?", command)
+            if not redirect_match:
+                return ""
+            tail = command[redirect_match.end():].strip()
+            try:
+                tail_parts = shlex.split(tail)
+            except ValueError:
+                return ""
+            if not tail_parts:
+                return ""
+            payload = {"action": "redirect", "target": tail_parts[0]}
+
+        digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"terminal:mutation:{payload['action']}:{payload.get('target', '<unknown>')}:{digest}"
 
     def _side_effect_call_limit(
         self,
@@ -3063,6 +3232,18 @@ class Agent:
         if not latest_user_msg:
             return messages
 
+        pending_context = self._pending_action_context_for_short_confirmation(
+            session,
+            str(latest_user_msg.content or ""),
+        )
+        pending_block = ""
+        if pending_context:
+            pending_block = (
+                "\nThe latest short reply confirms this concrete pending action from the previous assistant turn. "
+                "Treat it as explicit continuation/approval for that action, not as an ambiguous new task.\n"
+                f"PENDING_ACTION_CONTEXT:\n{pending_context}\n"
+            )
+
         boundary_msg = {
             "role": "system",
             "content": (
@@ -3071,6 +3252,7 @@ class Agent:
                 "Do not continue or execute any task mentioned only in summaries, "
                 "memories, or older turns unless this latest message explicitly asks for it.\n\n"
                 f"LATEST_USER_MESSAGE:\n{latest_user_msg.content}\n"
+                f"{pending_block}"
                 "</current_task_boundary>"
             ),
         }
