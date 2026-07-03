@@ -876,6 +876,11 @@ class Agent:
                         successful_side_effect_calls.append(side_effect_key)
                     elif side_effect_key and tr.get("success"):
                         successful_side_effect_calls.append(side_effect_key)
+                    elif side_effect_key and not tr.get("success") and self._failed_side_effect_result_consumes_repeat_budget(
+                        side_effect_key,
+                        tr,
+                    ):
+                        side_effect_call_counts[side_effect_key] = side_effect_call_counts.get(side_effect_key, 0) + 1
 
                     # 检查是否包含待发送文件
                     if tr.get("metadata", {}).get("is_file_transfer"):
@@ -2751,6 +2756,30 @@ class Agent:
         """Return True when a side-effect attempt should consume repeat budget even on failure."""
         return side_effect_key.startswith("terminal:mac_desktop_control:")
 
+    def _failed_side_effect_result_consumes_repeat_budget(self, side_effect_key: str, tool_result: dict[str, Any]) -> bool:
+        """Return True when a failed side-effect already reached the outside world.
+
+        Some tools reject a request before doing anything (for example TerminalTool
+        asking for approved=True). Those failures should allow one corrected retry.
+        But if terminal actually ran a command and returned a non-zero exit code,
+        the side effect may already have happened partially (desktop control,
+        shell scripts, file mutations). Repeating the exact same command is then
+        more likely to spam than to self-heal, so it should consume the repeat
+        budget just like a success.
+        """
+        if self._should_count_side_effect_attempt(side_effect_key):
+            return False
+        if str(tool_result.get("name", "")).lower() != "terminal":
+            return False
+        content = str(tool_result.get("content", ""))
+        if "检测到有副作用的指令" in content and "approved=True" in content:
+            return False
+        command = self._extract_terminal_command_from_observation(content)
+        if not command:
+            return False
+        semantic_kind = self._terminal_command_semantic_kind(json.dumps({"command": command}))
+        return semantic_kind not in {"navigation", "validation"}
+
     def _current_turn_attempt_counted_side_effect_counts(self, session: Session) -> dict[str, int]:
         """Recover admitted attempt-counted side effects from saved assistant messages.
 
@@ -2793,6 +2822,26 @@ class Agent:
                 )
                 if side_effect_key and self._should_count_side_effect_attempt(side_effect_key):
                     counts[side_effect_key] = counts.get(side_effect_key, 0) + 1
+        for msg in recent_messages:
+            if msg.role != MessageRole.TOOL:
+                continue
+            metadata = getattr(msg, "metadata", {}) or {}
+            if not isinstance(metadata, dict) or metadata.get("tool_name") != "terminal":
+                continue
+            content = str(msg.content or "")
+            command = self._extract_terminal_command_from_observation(content)
+            if not command:
+                continue
+            side_effect_key = self._side_effect_call_key(
+                "terminal",
+                json.dumps({"command": command}),
+                session=session,
+            )
+            if not side_effect_key or self._should_count_side_effect_attempt(side_effect_key):
+                continue
+            fake_result = {"name": "terminal", "content": content}
+            if "OBSERVATION from terminal:" in content or self._failed_side_effect_result_consumes_repeat_budget(side_effect_key, fake_result):
+                counts[side_effect_key] = counts.get(side_effect_key, 0) + 1
         return counts
 
     def _mac_desktop_control_repeat_limit(self, session: Optional[Session], *, default: int) -> int:

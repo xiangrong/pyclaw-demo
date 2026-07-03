@@ -1246,6 +1246,154 @@ async def test_agent_counts_failed_mac_lock_attempt_against_repeat_budget():
 
 
 @pytest.mark.asyncio
+async def test_agent_counts_failed_executed_terminal_side_effect_against_repeat_budget():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_script_args = json.dumps({"command": "bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh"})
+    model.chat.side_effect = [
+        {
+            "content": "执行锁屏脚本...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock1", "function": {"name": "terminal", "arguments": lock_script_args}}],
+        },
+        {
+            "content": "再执行一次锁屏脚本...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock2", "function": {"name": "terminal", "arguments": lock_script_args}}],
+        },
+        {"content": "锁屏脚本已尝试执行，检测未通过。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lock1",
+            "name": "terminal",
+            "content": "Command: bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh\nExit code: 1\nSTDOUT:\n❌ 锁屏失败",
+            "success": False,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-script-failed-attempt"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-terminal-script-failed-attempt",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-terminal-script-failed-attempt",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="锁屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert response.content == "锁屏脚本已尝试执行，检测未通过。"
+    assert "副作用工具重复调用" not in response.content
+    assert any("本轮只有重复的副作用工具调用" in m.content and "terminal:" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_recovers_failed_executed_terminal_side_effect_from_tool_history():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    lock_script_args = json.dumps({"command": "bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh"})
+    model.chat.side_effect = [
+        {
+            "content": "再次执行锁屏脚本...",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "lock2", "function": {"name": "terminal", "arguments": lock_script_args}}],
+        },
+        {"content": "锁屏脚本前次已执行失败，不再重复刷屏。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "lock2",
+            "name": "terminal",
+            "content": "Command: bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh\nExit code: 1\nSTDOUT:\n❌ 锁屏失败",
+            "success": False,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-terminal-script-failed-rehydrated"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = [
+        Message(
+            id="m-terminal-script-failed-rehydrated",
+            channel="feishu",
+            channel_user_id="u1",
+            session_id="s-terminal-script-failed-rehydrated",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="锁屏",
+        ),
+        Message(
+            id="tool-lock1-s-terminal-script-failed-rehydrated",
+            channel="feishu",
+            channel_user_id="u1",
+            session_id="s-terminal-script-failed-rehydrated",
+            type=MessageType.TEXT,
+            role=MessageRole.TOOL,
+            content="<error_context>\nOBSERVATION from terminal (FAILED):\nCommand: bash ~/.pyclaw/skills/mac-lock-unlock/lock.sh\nExit code: 1\nSTDOUT:\n❌ 锁屏失败\n</error_context>",
+            metadata={"tool_name": "terminal", "tool_call_id": "lock1"},
+        ),
+    ]
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+
+    response_content, _ = await agent._agent_loop(session)
+
+    assert tools.execute_tool_calls.call_count == 0
+    assert response_content == "锁屏脚本前次已执行失败，不再重复刷屏。"
+    assert "副作用工具重复调用" not in response_content
+    assert any("本轮只有重复的副作用工具调用" in m.content and "terminal:" in m.content for m in session.messages)
+
+
+@pytest.mark.asyncio
 async def test_agent_counts_mac_lock_attempt_even_without_tool_result():
     model = AsyncMock()
     tools = MagicMock()
