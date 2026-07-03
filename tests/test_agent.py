@@ -1432,6 +1432,39 @@ def test_mac_desktop_control_commands_use_semantic_side_effect_keys():
     ) is not None
 
 
+def test_read_only_diagnostics_with_stderr_redirect_are_navigation_not_side_effect():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    command = 'ioreg -n Root -d1 -a 2>/dev/null | grep -i "CGSSessionScreenIsLocked" || echo "NO MATCH"'
+
+    assert agent._looks_like_terminal_navigation(command)
+    assert agent._terminal_command_semantic_kind(json.dumps({"command": command})) == "navigation"
+    assert agent._terminal_side_effect_call_key(json.dumps({"command": command})) is None
+
+
+def test_direct_execution_of_changed_script_counts_as_validation_result():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    changed_files = {"/Users/bytedance/.pyclaw/skills/mac-lock-unlock/lock.sh"}
+    validation_results: list[str] = []
+    build_results: list[str] = []
+
+    agent._record_coding_tool_effects(
+        tool_results=[{
+            "role": "tool",
+            "tool_call_id": "run1",
+            "name": "terminal",
+            "content": "Command: cd ~/.pyclaw/skills/mac-lock-unlock && bash lock.sh 2>&1\nExit code: 1\nSTDOUT:\nfailed",
+            "success": False,
+            "metadata": {},
+        }],
+        changed_files=changed_files,
+        validation_results=validation_results,
+        build_results=build_results,
+    )
+
+    assert validation_results == ["FAIL: cd ~/.pyclaw/skills/mac-lock-unlock && bash lock.sh 2>&1"]
+    assert build_results == []
+
+
 @pytest.mark.asyncio
 async def test_agent_stops_repeated_mac_unlock_script_for_simple_wechat_request():
     model = AsyncMock()
@@ -3892,3 +3925,138 @@ async def test_terminal_approval_failures_nudge_to_file_tools_before_max_depth()
     assert "达到最大思考深度" not in response.content
     assert "当前没有完成代码修改" not in response.content
     assert "验证结果：PASS: bash -n ~/.pyclaw/skills/mac-lock-unlock/lock.sh" in response.content
+
+
+@pytest.mark.asyncio
+async def test_repeated_write_file_same_target_is_stopped_after_success_and_keeps_validation_failure():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    write_args = json.dumps({
+        "path": "~/.pyclaw/skills/mac-lock-unlock/lock.sh",
+        "content": "#!/bin/bash\necho lock\n",
+    })
+    model.chat.side_effect = [
+        {"content": "写入。", "__tool_calls__": True, "tool_calls": [{"id": "write1", "function": {"name": "write_file", "arguments": write_args}}]},
+        {"content": "又写一次。", "__tool_calls__": True, "tool_calls": [{"id": "write2", "function": {"name": "write_file", "arguments": write_args}}]},
+        {"content": "已写入，等待继续。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [
+        {
+            "role": "tool",
+            "tool_call_id": "write1",
+            "name": "write_file",
+            "content": "File written: /Users/bytedance/.pyclaw/skills/mac-lock-unlock/lock.sh",
+            "success": True,
+            "metadata": {},
+        }
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-repeat-write-same-target"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.metadata = {}
+    session.messages = []
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-repeat-write",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-repeat-write-same-target",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="继续，直接覆盖 lock.sh",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert any("本轮只有重复的副作用工具调用" in m.content and "write_file:" in m.content for m in session.messages)
+    assert "File written" not in response.content
+    assert "验证结果：未运行" in response.content
+
+
+@pytest.mark.asyncio
+async def test_failed_script_execution_is_reported_as_failed_validation_not_unrun():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "写入脚本。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "write1",
+                "function": {"name": "write_file", "arguments": '{"path":"~/.pyclaw/skills/mac-lock-unlock/lock.sh","content":"#!/bin/bash\\necho lock\\n"}'},
+            }],
+        },
+        {
+            "content": "运行脚本验证。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "run1",
+                "function": {"name": "terminal", "arguments": '{"command":"cd ~/.pyclaw/skills/mac-lock-unlock && bash lock.sh 2>&1"}'},
+            }],
+        },
+        {"content": "已写入。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{"role": "tool", "tool_call_id": "write1", "name": "write_file", "content": "File written: /Users/bytedance/.pyclaw/skills/mac-lock-unlock/lock.sh", "success": True, "metadata": {}}],
+        [{"role": "tool", "tool_call_id": "run1", "name": "terminal", "content": "Command: cd ~/.pyclaw/skills/mac-lock-unlock && bash lock.sh 2>&1\nExit code: 1\nSTDOUT:\nfailed", "success": False, "metadata": {}}],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-failed-script-validation"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.metadata = {}
+    session.messages = []
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-failed-script-validation",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-failed-script-validation",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="继续，直接覆盖 lock.sh 并验证",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "验证结果：FAIL: cd ~/.pyclaw/skills/mac-lock-unlock && bash lock.sh 2>&1" in response.content
+    assert "验证结果：未运行" not in response.content
+    assert "[!] 运行最小验证" in response.content

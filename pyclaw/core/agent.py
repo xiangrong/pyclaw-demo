@@ -1650,7 +1650,10 @@ class Agent:
 
             if name == "terminal":
                 command = self._extract_terminal_command_from_observation(content)
-                if self._looks_like_validation_command(command or content):
+                if self._looks_like_validation_command(command or content) or self._terminal_command_executes_changed_file(
+                    command or content,
+                    changed_files,
+                ):
                     status = "PASS" if success else "FAIL"
                     result_text = f"{status}: {command or self._first_non_empty_line(content)}"
                     validation_results.append(result_text)
@@ -1687,6 +1690,58 @@ class Agent:
         )
         return any(marker in normalized for marker in markers)
 
+    def _terminal_command_executes_changed_file(self, command: str, changed_files: set[str]) -> bool:
+        """Return True when a terminal command directly runs a changed script/file.
+
+        For single-file script tasks, executing the just-written script is the
+        narrowest meaningful validation even when the command name is simply
+        ``bash lock.sh`` and does not contain words like "test" or "build".
+        """
+        if not command or not changed_files:
+            return False
+
+        executable_suffixes = (".sh", ".bash", ".zsh", ".py", ".js", ".ts", ".rb", ".pl")
+        changed_candidates: set[str] = set()
+        for raw_path in changed_files:
+            path = str(raw_path).strip()
+            if not path:
+                continue
+            expanded = os.path.expandvars(os.path.expanduser(path))
+            changed_candidates.add(path)
+            changed_candidates.add(expanded)
+            changed_candidates.add(os.path.basename(expanded))
+            if expanded.endswith(executable_suffixes):
+                changed_candidates.add(os.path.splitext(os.path.basename(expanded))[0])
+
+        segments = [segment.strip() for segment in re.split(r"\s*(?:&&|;|\|\|)\s*", command) if segment.strip()]
+        cwd_hint = ""
+        for segment in segments:
+            try:
+                parts = shlex.split(segment)
+            except ValueError:
+                continue
+            if not parts:
+                continue
+            head = os.path.basename(parts[0])
+            if head == "cd" and len(parts) >= 2:
+                cwd_hint = os.path.expandvars(os.path.expanduser(parts[1]))
+                continue
+
+            candidate_args: list[str] = []
+            if head in {"bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"}:
+                candidate_args.extend(arg for arg in parts[1:] if not arg.startswith("-"))
+            elif parts[0].startswith("./") or os.path.splitext(parts[0])[1] in executable_suffixes:
+                candidate_args.append(parts[0])
+
+            for arg in candidate_args:
+                expanded_arg = os.path.expandvars(os.path.expanduser(arg))
+                candidates = {arg, expanded_arg, os.path.basename(expanded_arg)}
+                if cwd_hint and not os.path.isabs(expanded_arg):
+                    candidates.add(os.path.normpath(os.path.join(cwd_hint, expanded_arg)))
+                if candidates & changed_candidates:
+                    return True
+        return False
+
     def _looks_like_build_command(self, command: str) -> bool:
         normalized = command.lower()
         markers = (
@@ -1701,31 +1756,34 @@ class Agent:
         command = self._extract_terminal_command(arguments)
         if not command:
             return "unknown"
+        if self._looks_like_terminal_navigation(command):
+            return "navigation"
         if self._looks_like_validation_command(command) or self._looks_like_build_command(command):
             return "validation"
         if self._looks_like_terminal_mutation(command):
             return "mutation"
-        if self._looks_like_terminal_navigation(command):
-            return "navigation"
         return "unknown"
 
     def _looks_like_terminal_navigation(self, command: str) -> bool:
         """Return True for shell commands commonly used only to inspect code/files."""
         if not command:
             return False
-        # Pipes are common in read-only navigation (`rg foo | head`). Redirection,
-        # command substitution, chaining, and backgrounding can hide writes, so keep
+        # Pipes and stderr-to-/dev/null are common in read-only diagnostics
+        # (`ioreg ... 2>/dev/null | grep foo`).  Other redirection, command
+        # substitution, chaining, and backgrounding can hide writes, so keep
         # them out of the navigation bucket.
-        if re.search(r"[;&<>`]", command) or "$" in command:
+        normalized_command = re.sub(r"\s+\|\|\s+echo\s+.+$", "", command).strip()
+        normalized_command = re.sub(r"\s+\d?>\s*/dev/null\b", "", normalized_command)
+        if re.search(r"[;&<>`]", normalized_command) or "$" in normalized_command:
             return False
-        pipeline_parts = [part.strip() for part in command.split("|") if part.strip()]
+        pipeline_parts = [part.strip() for part in normalized_command.split("|") if part.strip()]
         if not pipeline_parts:
             return False
         try:
             parsed = [shlex.split(part) for part in pipeline_parts]
         except ValueError:
             return False
-        allowed_heads = {"rg", "grep", "find", "sed", "head", "tail", "cat", "wc", "ls", "pwd", "tree"}
+        allowed_heads = {"rg", "grep", "find", "sed", "head", "tail", "cat", "wc", "ls", "pwd", "tree", "ioreg"}
         for index, parts in enumerate(parsed):
             if not parts:
                 return False
@@ -1740,6 +1798,9 @@ class Agent:
 
     def _looks_like_terminal_mutation(self, command: str) -> bool:
         if not command:
+            return False
+        read_only_probe = re.sub(r"\s+\d?>\s*/dev/null\b", "", command)
+        if read_only_probe != command and self._looks_like_terminal_navigation(command):
             return False
         mutation_patterns = (
             r"(^|\s)(cp|mv|rm|mkdir|touch|chmod|chown|git\s+commit|git\s+push|git\s+add)\b",
@@ -2617,12 +2678,12 @@ class Agent:
         command = self._extract_terminal_command(arguments)
         if self._looks_like_mac_desktop_control_command(command):
             return f"terminal:mac_desktop_control:{self._mac_desktop_control_action(command)}"
-        mutation_target_key = self._terminal_mutation_target_key(command)
-        if mutation_target_key:
-            return mutation_target_key
         semantic_kind = self._terminal_command_semantic_kind(arguments)
         if semantic_kind in {"navigation", "validation"}:
             return None
+        mutation_target_key = self._terminal_mutation_target_key(command)
+        if mutation_target_key:
+            return mutation_target_key
         if not command:
             return "terminal:<unknown>"
         normalized_command = " ".join(command.split())
