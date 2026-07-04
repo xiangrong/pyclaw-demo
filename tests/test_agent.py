@@ -1858,6 +1858,107 @@ async def test_agent_stops_screenshot_path_variants_after_bounded_repairs():
 
 
 @pytest.mark.asyncio
+async def test_agent_stops_photo_capture_variants_after_bounded_attempts():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.allowed_paths = []
+    tools.get_all_specs.return_value = []
+
+    first_args = json.dumps({
+        "command": "mkdir -p ~/.pyclaw/photos && /usr/local/bin/imagesnap -w 1 ~/.pyclaw/photos/photo_$(date +%Y%m%d_%H%M%S).jpg 2>&1 || /opt/homebrew/bin/imagesnap -w 1 ~/.pyclaw/photos/photo_$(date +%Y%m%d_%H%M%S).jpg 2>&1",
+        "approved": True,
+    }, ensure_ascii=False)
+    second_args = json.dumps({
+        "command": "mkdir -p ~/.pyclaw/photos && imagesnap -w 1 ~/.pyclaw/photos/snap_$(date +%Y%m%d_%H%M%S).jpg && ls -t ~/.pyclaw/photos/*.jpg | head -1",
+    }, ensure_ascii=False)
+    third_args = json.dumps({
+        "command": "mkdir -p ~/.pyclaw/photos && f=~/.pyclaw/photos/snap_$(date +%Y%m%d_%H%M%S).jpg && imagesnap -w 1 \"$f\" >/dev/null 2>&1 && echo \"$f\"",
+    }, ensure_ascii=False)
+
+    model.chat.side_effect = [
+        {
+            "content": "我来拍照。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "photo1", "function": {"name": "terminal", "arguments": first_args}}],
+        },
+        {
+            "content": "换个 imagesnap 路径再试。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "photo2", "function": {"name": "terminal", "arguments": second_args}}],
+        },
+        {
+            "content": "再换一个文件名。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "photo3", "function": {"name": "terminal", "arguments": third_args}}],
+        },
+        {"content": "拍照失败：系统相机权限或 imagesnap 环境阻止执行。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{
+            "role": "tool",
+            "tool_call_id": "photo1",
+            "name": "terminal",
+            "content": "Command: imagesnap\nExit code: 127\nSTDERR:\nimagesnap: command not found",
+            "success": False,
+            "metadata": {},
+        }],
+        [{
+            "role": "tool",
+            "tool_call_id": "photo2",
+            "name": "terminal",
+            "content": "Command: imagesnap\nExit code: 1\nSTDERR:\nNo video device found",
+            "success": False,
+            "metadata": {},
+        }],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-photo-bounded-repair"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-photo-bounded-repair",
+        channel="telegram",
+        channel_user_id="u1",
+        session_id="s-photo-bounded-repair",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="拍个照",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "拍照失败：系统相机权限或 imagesnap 环境阻止执行。"
+    second_payload = json.loads(tools.execute_tool_calls.call_args_list[1].args[0])
+    second_executed_args = json.loads(second_payload["tool_calls"][0]["function"]["arguments"])
+    assert second_executed_args["approved"] is True
+    assert any(
+        "本轮只有重复的副作用工具调用" in m.content
+        and "terminal:semantic:capture_photo" in m.content
+        for m in session.messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_stops_unlock_script_variants_after_one_desktop_control_attempt():
     model = AsyncMock()
     tools = MagicMock()

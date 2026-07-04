@@ -2970,7 +2970,18 @@ class Agent:
 
     def _should_count_side_effect_attempt(self, side_effect_key: str) -> bool:
         """Return True when a side-effect attempt should consume repeat budget even on failure."""
-        return side_effect_key.startswith("terminal:mac_desktop_control:")
+        if side_effect_key.startswith("terminal:mac_desktop_control:"):
+            return True
+        # Capture-style desktop actions are one-shot interactions with external
+        # devices (screen/camera/recorder).  Even a failed attempt can prompt for
+        # permissions, touch the camera, or partially create an artifact.  Count
+        # the admitted attempt before execution so missing-approval/path/runtime
+        # failures cannot spin through many command variants.
+        return side_effect_key in {
+            "terminal:semantic:capture_screenshot",
+            "terminal:semantic:capture_photo",
+            "terminal:semantic:record_screen",
+        }
 
     def _semantic_terminal_repeat_limit(
         self,

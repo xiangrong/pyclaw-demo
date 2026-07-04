@@ -11,7 +11,8 @@ TERMINAL_INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "截屏", "截图", "屏幕截图", "截个屏", "screen shot", "screenshot", "screen capture",
     ),
     "capture_photo": (
-        "拍照", "拍一张", "摄像头", "相机", "camera", "photo", "take a picture", "take photo",
+        "拍照", "拍个照", "拍张照", "拍一张", "照相", "照一张", "摄像头", "相机", "自拍",
+        "camera", "photo", "take a picture", "take photo",
     ),
     "record_screen": (
         "录屏", "屏幕录制", "录制屏幕", "screen record", "record screen", "screen recording",
