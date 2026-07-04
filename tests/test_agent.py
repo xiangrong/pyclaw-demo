@@ -1646,6 +1646,79 @@ def test_agent_auto_approves_terminal_call_when_latest_user_explicitly_requests_
     assert args["approved"] is True
 
 
+@pytest.mark.asyncio
+async def test_agent_executes_screenshot_with_injected_approval_for_real_user_turn():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.allowed_paths = []
+    tools.get_all_specs.return_value = []
+
+    command = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'f=~/.pyclaw/screenshots/截图_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$f" && ls -lh "$f" && echo "PATH=$f"'
+    )
+    model.chat.side_effect = [
+        {
+            "content": "我来截屏。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "shot1",
+                "function": {"name": "terminal", "arguments": json.dumps({"command": command}, ensure_ascii=False)},
+            }],
+        },
+        {"content": "截图已完成。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.return_value = [{
+        "role": "tool",
+        "tool_call_id": "shot1",
+        "name": "terminal",
+        "content": "Command: screencapture\nExit code: 0\nPATH=/Users/bytedance/.pyclaw/screenshots/截图.png",
+        "success": True,
+        "metadata": {},
+    }]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-screenshot-approval"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=3)
+    user_msg = Message(
+        id="m-screenshot-approval",
+        channel="telegram",
+        channel_user_id="u1",
+        session_id="s-screenshot-approval",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="截个屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert response.content == "截图已完成。"
+    payload = json.loads(tools.execute_tool_calls.call_args.args[0])
+    executed_args = json.loads(payload["tool_calls"][0]["function"]["arguments"])
+    assert executed_args["command"] == command
+    assert executed_args["approved"] is True
+
+
 def test_agent_configures_default_capture_artifact_paths_on_terminal_tools():
     registry = ToolRegistry(work_dir="/tmp/pyclaw-work", allowed_paths=[])
     terminal = TerminalTool()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 
 # Set TOKENIZERS_PARALLELISM=false to avoid fork warnings and potential deadlocks
 # when using sentence-transformers (tokenizers) before asyncio.subprocess (fork).
@@ -11,6 +12,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import signal
 import sys
 from importlib import metadata
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -41,6 +43,66 @@ from pyclaw.tools.mcp_client import MCPClientManager
 
 app = typer.Typer(help="PyClaw - Python AI Agent")
 
+
+def _source_root() -> Path:
+    """Return the repository/source root for runtime diagnostics."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _git_commit(source_root: Path) -> str:
+    """Return the currently loaded git commit, if available."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    commit = completed.stdout.strip()
+    return commit or "unknown"
+
+
+def _print_runtime_banner(
+    *,
+    command: str,
+    config_path: Optional[str] = None,
+    cfg: Optional[Config] = None,
+    agent: Optional[Agent] = None,
+    tool_registry: Optional[ToolRegistry] = None,
+) -> None:
+    """Print enough startup state to prove which code a long-lived process loaded."""
+    source_root = _source_root()
+    print("🧩 PyClaw Runtime:")
+    print(f"  • command: {command}")
+    print(f"  • pid: {os.getpid()}")
+    print(f"  • cwd: {os.getcwd()}")
+    print(f"  • source: {source_root}")
+    print(f"  • git: {_git_commit(source_root)}")
+    print(f"  • python: {sys.executable}")
+    if config_path:
+        print(f"  • config: {config_path}")
+    if cfg is not None:
+        print(f"  • work_dir: {cfg.work_dir}")
+        print(f"  • max_iterations: {cfg.max_iterations}")
+        print(f"  • max_consecutive_failures: {cfg.max_consecutive_failures}")
+        print(f"  • exec_approval.mode: {cfg.exec_approval.mode}")
+    if agent is not None:
+        approval_mode = getattr(getattr(agent, "exec_approval", None), "mode", None)
+        if approval_mode is not None:
+            print(f"  • exec_approval.loaded_mode: {getattr(approval_mode, 'value', approval_mode)}")
+    if tool_registry is not None:
+        allowed_paths = getattr(tool_registry, "allowed_paths", []) or []
+        artifact_roots = [
+            path
+            for path in allowed_paths
+            if any(marker in str(path) for marker in (".pyclaw/screenshots", ".pyclaw/photos", ".pyclaw/recordings", ".pyclaw/artifacts"))
+        ]
+        if artifact_roots:
+            print(f"  • terminal_artifact_paths: {artifact_roots}")
+
 def version_callback(value: bool) -> None:
     if value:
         try:
@@ -67,8 +129,7 @@ def main(
 @app.command()
 def start(config: str = typer.Option(None, help="Path to config file")) -> None:
     """启动 PyClaw Agent"""
-    print(f"🐍 Python Executable: {sys.executable}")
-    print(f"📂 Python Path: {sys.path}")
+    _print_runtime_banner(command="start", config_path=config)
 
     async def _start() -> None:
         # 加载配置
@@ -77,6 +138,8 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
         except FileNotFoundError as e:
             typer.echo(f"❌ {e}", err=True)
             sys.exit(1)
+
+        _print_runtime_banner(command="start", config_path=config, cfg=cfg)
 
         # 创建工作目录和 skills 目录
         os.makedirs(cfg.work_dir, exist_ok=True)
@@ -176,6 +239,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             max_consecutive_failures=cfg.max_consecutive_failures,
             exec_approval_mode=cfg.exec_approval.mode,
         )
+        _print_runtime_banner(command="start", config_path=config, cfg=cfg, agent=agent, tool_registry=tool_registry)
 
         # 注册需要 Agent 实例的工具
         tool_registry.register(SendFileTool(agent))
@@ -244,6 +308,7 @@ def cron_exec(
     config: str = typer.Option(None, help="Path to config file"),
 ) -> None:
     """执行 Cron 任务（内部使用，子进程调用）"""
+    _print_runtime_banner(command="cron_exec", config_path=config)
 
     async def _exec() -> None:
         # 加载配置
@@ -252,6 +317,8 @@ def cron_exec(
         except FileNotFoundError as e:
             typer.echo(f"❌ {e}", err=True)
             sys.exit(1)
+
+        _print_runtime_banner(command="cron_exec", config_path=config, cfg=cfg)
 
         # 创建工作目录和 skills 目录
         os.makedirs(cfg.work_dir, exist_ok=True)
@@ -343,6 +410,7 @@ def cron_exec(
             max_consecutive_failures=cfg.max_consecutive_failures,
             exec_approval_mode=cfg.exec_approval.mode,
         )
+        _print_runtime_banner(command="cron_exec", config_path=config, cfg=cfg, agent=agent, tool_registry=tool_registry)
 
         # 注册需要 Agent 实例的工具
         tool_registry.register(SendFileTool(agent))
