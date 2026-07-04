@@ -19,6 +19,7 @@ from pyclaw.core.system_prompt.manager import SystemPromptManager
 from pyclaw.core.system_prompt.models import LayerContext
 from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
 from pyclaw.core.public_sanitize import sanitize_user_facing_content
+from pyclaw.core.exec_approval import ExecApprovalMode, ExecApprovalService
 
 
 class Agent:
@@ -52,6 +53,8 @@ class Agent:
         memory: Optional[SemanticMemory] = None,
         max_iterations: int = 90,
         max_consecutive_failures: int = 8,
+        exec_approval_service: Optional[ExecApprovalService] = None,
+        exec_approval_mode: ExecApprovalMode | str = ExecApprovalMode.AUTO,
     ) -> None:
         self.model = model_provider
         self.tools = tool_registry
@@ -93,6 +96,7 @@ class Agent:
         self._last_activity_event = "initialized"
         self._last_activity_session_id = ""
         self.answer_quality_gate = AnswerQualityGate()
+        self.exec_approval = exec_approval_service or ExecApprovalService(exec_approval_mode)
 
     def _touch_activity(self, event: str, session: Optional[Session] = None) -> None:
         """Record agent progress for cron inactivity monitoring."""
@@ -608,6 +612,10 @@ class Agent:
                     )
                     force_final_answer = True
                     continue
+
+                tool_calls = self._apply_exec_approval_to_tool_calls(tool_calls, session=session)
+                if result.get("tool_calls") is not tool_calls:
+                    result["tool_calls"] = tool_calls
 
                 tool_call_count += len(tool_calls)
 
@@ -2711,6 +2719,46 @@ class Agent:
         digest = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
         return f"{tool_name}:{digest}"
 
+    def _apply_exec_approval_to_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        session: Session,
+    ) -> list[dict[str, Any]]:
+        """Apply centralized execution approval policy to generated tool calls."""
+        latest_user_text = self._latest_external_user_text(session)
+        updated_calls, decisions = self.exec_approval.approve_tool_calls(
+            tool_calls,
+            latest_user_text=latest_user_text,
+            cwd=self.work_dir,
+            channel=str(getattr(session, "channel", "")),
+            session_id=str(getattr(session, "session_id", "")),
+            is_cron=getattr(session, "channel", "") == "cron",
+        )
+        if decisions:
+            metadata = getattr(session, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata["last_exec_approval_decisions"] = [
+                    {
+                        "decision": decision.decision.value,
+                        "reason": decision.reason,
+                        "risk_level": decision.risk_level,
+                        "approval_key": decision.approval_key,
+                        "command_intents": sorted(decision.command_intents),
+                    }
+                    for decision in decisions
+                ]
+        return updated_calls
+
+    # Backwards-compatible wrapper for older tests and integrations.
+    def _auto_approve_explicit_terminal_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        *,
+        session: Session,
+    ) -> list[dict[str, Any]]:
+        return self._apply_exec_approval_to_tool_calls(tool_calls, session=session)
+
     def _file_side_effect_call_key(
         self,
         tool_name: str,
@@ -2790,6 +2838,9 @@ class Agent:
     def _terminal_side_effect_call_key(self, arguments: Any) -> Optional[str]:
         """Return a repeat key for terminal calls, or None for safe reads."""
         command = self._extract_terminal_command(arguments)
+        exec_key = self.exec_approval.side_effect_key("terminal", arguments, cwd=self.work_dir)
+        if exec_key:
+            return exec_key
         if self._looks_like_mac_desktop_control_command(command):
             return f"terminal:mac_desktop_control:{self._mac_desktop_control_action(command)}"
         semantic_kind = self._terminal_command_semantic_kind(arguments)

@@ -46,6 +46,10 @@ class WebSearchConfig(BaseModel):
     brave_api_key: Optional[str] = None
 
 
+class ExecApprovalConfig(BaseModel):
+    mode: str = "auto"
+
+
 class SandboxConfig(BaseModel):
     enabled: bool = False
     image: str = "python:3.10-slim"
@@ -60,6 +64,7 @@ class Config(BaseModel):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     model: ModelConfig
     web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    exec_approval: ExecApprovalConfig = Field(default_factory=ExecApprovalConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     work_dir: str = Field(default_factory=lambda: str(Path.home() / ".pyclaw"))
     config_dir: Optional[str] = None

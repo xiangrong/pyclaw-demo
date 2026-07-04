@@ -1589,6 +1589,87 @@ def test_mac_desktop_control_commands_use_semantic_side_effect_keys():
     ) is not None
 
 
+def test_user_intent_terminal_commands_use_semantic_side_effect_key():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    first = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'f=~/.pyclaw/screenshots/screen_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$f" && ls -lh "$f" && echo "PATH=$f"'
+    )
+    variant = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'FILE=~/.pyclaw/screenshots/截图_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$FILE" && ls -la "$FILE" && echo "PATH=$FILE"'
+    )
+    photo = 'mkdir -p ~/.pyclaw/photos && imagesnap ~/.pyclaw/photos/photo.jpg'
+
+    assert agent._terminal_side_effect_call_key(
+        json.dumps({"command": first})
+    ) == "terminal:semantic:capture_screenshot"
+    assert agent._terminal_side_effect_call_key(
+        json.dumps({"command": variant})
+    ) == "terminal:semantic:capture_screenshot"
+    assert agent._terminal_side_effect_call_key(
+        json.dumps({"command": photo})
+    ) == "terminal:semantic:capture_photo"
+
+
+def test_agent_auto_approves_terminal_call_when_latest_user_explicitly_requests_intent():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    session = MagicMock()
+    session.messages = [
+        Message(
+            id="u1",
+            channel="wechat",
+            channel_user_id="u1",
+            session_id="s1",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="截屏",
+        )
+    ]
+    command = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'f=~/.pyclaw/screenshots/screen_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$f" && ls -lh "$f" && echo "PATH=$f"'
+    )
+    tool_calls = [{
+        "id": "shot1",
+        "function": {"name": "terminal", "arguments": json.dumps({"command": command})},
+    }]
+
+    updated = agent._auto_approve_explicit_terminal_calls(tool_calls, session=session)
+    args = json.loads(updated[0]["function"]["arguments"])
+
+    assert args["approved"] is True
+
+
+def test_agent_does_not_auto_approve_terminal_call_for_mismatched_user_intent():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    session = MagicMock()
+    session.messages = [
+        Message(
+            id="u1",
+            channel="wechat",
+            channel_user_id="u1",
+            session_id="s1",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="看一下目录",
+        )
+    ]
+    command = 'mkdir -p ~/.pyclaw/screenshots && f=~/.pyclaw/screenshots/screen.png && screencapture -x "$f"'
+    tool_calls = [{
+        "id": "shot1",
+        "function": {"name": "terminal", "arguments": json.dumps({"command": command})},
+    }]
+
+    updated = agent._auto_approve_explicit_terminal_calls(tool_calls, session=session)
+    args = json.loads(updated[0]["function"]["arguments"])
+
+    assert "approved" not in args
+
+
 @pytest.mark.asyncio
 async def test_agent_stops_unlock_script_variants_after_one_desktop_control_attempt():
     model = AsyncMock()

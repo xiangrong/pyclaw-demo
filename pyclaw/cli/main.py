@@ -174,6 +174,7 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             memory=semantic_memory,
             max_iterations=cfg.max_iterations,
             max_consecutive_failures=cfg.max_consecutive_failures,
+            exec_approval_mode=cfg.exec_approval.mode,
         )
 
         # 注册需要 Agent 实例的工具
@@ -340,6 +341,7 @@ def cron_exec(
             memory=semantic_memory,
             max_iterations=cfg.max_iterations,
             max_consecutive_failures=cfg.max_consecutive_failures,
+            exec_approval_mode=cfg.exec_approval.mode,
         )
 
         # 注册需要 Agent 实例的工具
@@ -460,6 +462,10 @@ max_iterations: 90
 
 # 连续工具调用失败的最大次数 (触发自我保护停止迭代，默认 8)
 max_consecutive_failures: 8
+
+# 执行审批策略 (对齐 Hermes/OpenClaw: deny/allowlist/ask/auto/full)
+exec_approval:
+  mode: "auto"
 
 # 安全沙箱配置 (可选)
 sandbox:

@@ -1,6 +1,7 @@
 import pytest
 import os
 from pyclaw.tools.terminal import TerminalTool
+from pyclaw.tools.terminal_safety import should_auto_approve_terminal_command, terminal_command_intents
 
 @pytest.mark.asyncio
 async def test_terminal_classification():
@@ -62,3 +63,37 @@ def test_terminal_allows_dedicated_mac_unlock_script_past_path_sandbox():
     assert tool._is_allowed_mac_desktop_control_command("~/.pyclaw/bin/unlock.sh") is True
     assert tool._is_allowed_mac_desktop_control_command("bash ~/.pyclaw/bin/unlock.sh") is True
     assert tool._is_allowed_mac_desktop_control_command("~/.pyclaw/bin/not-unlock.sh") is False
+
+
+def test_terminal_keeps_approval_gate_for_generic_screenshot_shell_snippet():
+    tool = TerminalTool()
+    command = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'f=~/.pyclaw/screenshots/screen_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$f" && '
+        'ls -lh "$f" && '
+        'echo "PATH=$f"'
+    )
+
+    assert tool._classify_command(command) == 2
+    assert tool._is_allowed_mac_desktop_control_command(command) is False
+
+
+def test_terminal_safety_can_auto_approve_explicit_desktop_capture_intents():
+    screenshot_command = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'f=~/.pyclaw/screenshots/screen_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$f" && ls -lh "$f" && echo "PATH=$f"'
+    )
+    photo_command = 'mkdir -p ~/.pyclaw/photos && imagesnap ~/.pyclaw/photos/photo.jpg'
+
+    assert "capture_screenshot" in terminal_command_intents(screenshot_command)
+    assert should_auto_approve_terminal_command(screenshot_command, "截屏") is True
+    assert should_auto_approve_terminal_command(photo_command, "帮我拍照") is True
+
+
+def test_terminal_safety_does_not_auto_approve_mismatched_or_high_risk_commands():
+    screenshot_command = 'mkdir -p ~/.pyclaw/screenshots && f=~/.pyclaw/screenshots/screen.png && screencapture -x "$f"'
+
+    assert should_auto_approve_terminal_command(screenshot_command, "查一下当前目录") is False
+    assert should_auto_approve_terminal_command("rm -rf ~/.pyclaw/screenshots", "截屏") is False

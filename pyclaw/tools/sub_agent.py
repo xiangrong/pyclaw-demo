@@ -71,6 +71,7 @@ class SubAgentTool(BaseTool):
                 session_manager=self.main_agent.sessions,
                 system_prompt=sub_system_prompt,
                 work_dir=self.main_agent.work_dir,
+                exec_approval_service=self.main_agent.exec_approval,
             )
 
             # 创建一个新的独立临时会话

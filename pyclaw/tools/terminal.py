@@ -8,6 +8,7 @@ import shlex
 from pydantic import BaseModel, Field
 
 from .base import BaseTool, ToolResult
+from .terminal_safety import classify_terminal_command
 
 
 class TerminalArgs(BaseModel):
@@ -56,25 +57,7 @@ class TerminalTool(BaseTool):
 
     def _classify_command(self, command: str) -> int:
         """分类指令风险等级：1(安全), 2(需确认), 3(高风险)"""
-        # 级别 3：危险操作
-        risk_patterns = [
-            r"rm\s+-rf", r"rmdir", r">\s*/dev/(?!null)", r"mkfs", r"dd\s+", 
-            r"shutdown", r"reboot", r":\(\)\{ :|:& \};:", r"fdisk", r"parted"
-        ]
-        if any(re.search(p, command) for p in risk_patterns):
-            return 3
-            
-        # 级别 2：有副作用的操作
-        confirm_patterns = [
-            r"rm\s+", r"mkdir", r"touch", r"cp\s+", r"mv\s+", 
-            r"pip\s+install", r"npm\s+install", r"apt-get", r"yum", r"brew",
-            r"git\s+commit", r"git\s+push", r"kill\s+", r"pkill"
-        ]
-        if any(re.search(p, command) for p in confirm_patterns):
-            return 2
-            
-        # 级别 1：只读或安全操作
-        return 1
+        return classify_terminal_command(command)
 
     async def execute(self, **kwargs: str) -> ToolResult:
         command = kwargs.get("command", "")
@@ -118,7 +101,7 @@ class TerminalTool(BaseTool):
                 )
             )
         
-        if level == 2 and not approved:
+        if level == 2 and not approved and not is_allowed_desktop_control:
             return ToolResult(
                 success=False,
                 content=(
