@@ -34,6 +34,26 @@ def test_exec_approval_auto_injects_approval_for_matching_user_intent():
     assert decision.approval_key.startswith("terminal:capture_screenshot:")
 
 
+def test_exec_approval_auto_injects_approval_for_bare_screenshot_capture():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+    command = 'FILE=~/Desktop/截图_$(date +%Y%m%d_%H%M%S).png && screencapture -x "$FILE" && echo "$FILE"'
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": command},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="截屏",
+        )
+    )
+
+    assert decision.decision == ExecApprovalDecision.ALLOW
+    assert decision.risk_level == 2
+    assert decision.approved_arguments is not None
+    assert decision.approved_arguments["approved"] is True
+    assert "capture_screenshot" in decision.command_intents
+
+
 def test_exec_approval_auto_asks_when_user_intent_does_not_match():
     service = ExecApprovalService(ExecApprovalMode.AUTO)
     request = ExecApprovalRequest(

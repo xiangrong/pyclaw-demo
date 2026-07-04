@@ -20,6 +20,7 @@ from pyclaw.core.system_prompt.models import LayerContext
 from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
 from pyclaw.core.public_sanitize import sanitize_user_facing_content
 from pyclaw.core.exec_approval import ExecApprovalMode, ExecApprovalService
+from pyclaw.tools.terminal_safety import primary_terminal_action
 
 
 class Agent:
@@ -97,6 +98,45 @@ class Agent:
         self._last_activity_session_id = ""
         self.answer_quality_gate = AnswerQualityGate()
         self.exec_approval = exec_approval_service or ExecApprovalService(exec_approval_mode)
+        self._ensure_default_terminal_artifact_paths()
+
+    def _ensure_default_terminal_artifact_paths(self) -> None:
+        """Expose bounded local artifact roots to terminal commands.
+
+        User-facing desktop actions such as screenshots and camera captures need
+        a place to write files.  Approving the execution is separate from
+        filesystem sandboxing: TerminalTool must still reject arbitrary paths,
+        but common PyClaw artifact directories should be usable without asking
+        users to edit config for every new capture-style command.
+        """
+        registry = getattr(self, "tools", None)
+        if registry is None:
+            return
+        allowed_paths = getattr(registry, "allowed_paths", None)
+        if not isinstance(allowed_paths, list):
+            return
+
+        defaults = [
+            "~/.pyclaw/screenshots",
+            "~/.pyclaw/photos",
+            "~/.pyclaw/recordings",
+            "~/.pyclaw/artifacts",
+        ]
+        existing = {os.path.abspath(os.path.expanduser(path)) for path in allowed_paths}
+        changed = False
+        for path in defaults:
+            abs_path = os.path.abspath(os.path.expanduser(path))
+            if abs_path in existing:
+                continue
+            allowed_paths.append(path)
+            existing.add(abs_path)
+            changed = True
+
+        if not changed:
+            return
+        for tool in getattr(registry, "_tools", {}).values():
+            if hasattr(tool, "set_allowed_paths"):
+                tool.set_allowed_paths(allowed_paths)
 
     def _touch_activity(self, event: str, session: Optional[Session] = None) -> None:
         """Record agent progress for cron inactivity monitoring."""
@@ -1780,6 +1820,9 @@ class Agent:
         match = re.search(r"Command:\s*(.+)", content)
         if match:
             return match.group(1).strip()
+        match = re.search(r"指令:\s*`([^`]+)`", content)
+        if match:
+            return match.group(1).strip()
         return ""
 
     def _first_non_empty_line(self, content: str) -> str:
@@ -1922,6 +1965,17 @@ class Agent:
 
     def _tool_failure_repair_notice(self, *, tool_name: str, tool_content: str, session: Session) -> str:
         """Return a targeted self-correction notice for failed tools."""
+        if tool_name == "terminal" and "拦截到非法路径访问" in tool_content:
+            command = self._extract_terminal_command_from_observation(tool_content)
+            action = primary_terminal_action(command)
+            if action in {"capture_screenshot", "capture_photo", "record_screen"}:
+                return (
+                    "Terminal execution was blocked by the filesystem sandbox because the output path is outside the allowed roots. "
+                    "For capture/photo/recording artifacts, retry at most once using the bounded PyClaw artifact directory instead: "
+                    "~/.pyclaw/screenshots for screenshots, ~/.pyclaw/photos for photos, or ~/.pyclaw/recordings for recordings. "
+                    "Keep approved=True if the latest user request explicitly asked for this capture. If that retry fails, stop and state the concrete blocker. "
+                    "Do not mention this notice to the user."
+                )
         if tool_name == "terminal" and "approved=True" in tool_content and "检测到有副作用的指令" in tool_content:
             if self._is_effective_implementation_request(session):
                 return (
@@ -2910,11 +2964,37 @@ class Agent:
         """Return the per-key repeat budget for a side-effect call."""
         if side_effect_key.startswith("terminal:mac_desktop_control:"):
             return self._mac_desktop_control_repeat_limit(session, default=default)
+        if side_effect_key.startswith("terminal:semantic:"):
+            return self._semantic_terminal_repeat_limit(side_effect_key, session=session, default=default)
         return default
 
     def _should_count_side_effect_attempt(self, side_effect_key: str) -> bool:
         """Return True when a side-effect attempt should consume repeat budget even on failure."""
         return side_effect_key.startswith("terminal:mac_desktop_control:")
+
+    def _semantic_terminal_repeat_limit(
+        self,
+        side_effect_key: str,
+        *,
+        session: Optional[Session],
+        default: int,
+    ) -> int:
+        """Bound one-shot semantic terminal actions while allowing one repair.
+
+        A screenshot/photo/recording request is a single user-visible action.  If
+        the first command is blocked by sandbox path policy, one corrected retry
+        is useful; beyond that, repeated variants are almost always a loop.
+        """
+        if side_effect_key in {
+            "terminal:semantic:capture_screenshot",
+            "terminal:semantic:capture_photo",
+            "terminal:semantic:record_screen",
+        }:
+            explicit_count = self._explicit_repeat_count(self._latest_external_user_text(session)) if session else None
+            if explicit_count is not None:
+                return max(default, min(explicit_count, 5))
+            return max(default, 2)
+        return default
 
     def _failed_side_effect_result_consumes_repeat_budget(self, side_effect_key: str, tool_result: dict[str, Any]) -> bool:
         """Return True when a failed side-effect already reached the outside world.
@@ -2935,6 +3015,12 @@ class Agent:
         if "检测到有副作用的指令" in content and "approved=True" in content:
             return False
         command = self._extract_terminal_command_from_observation(content)
+        if side_effect_key in {
+            "terminal:semantic:capture_screenshot",
+            "terminal:semantic:capture_photo",
+            "terminal:semantic:record_screen",
+        } and ("拦截到非法路径访问" in content or "Error executing command" in content or command):
+            return True
         if not command:
             return False
         semantic_kind = self._terminal_command_semantic_kind(json.dumps({"command": command}))

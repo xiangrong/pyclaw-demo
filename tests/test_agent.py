@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 from pyclaw.core.agent import Agent
 from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.tools.base import ToolResult
+from pyclaw.tools.registry import ToolRegistry
+from pyclaw.tools.terminal import TerminalTool
 
 @pytest.mark.asyncio
 async def test_agent_self_healing_loop():
@@ -1644,6 +1646,18 @@ def test_agent_auto_approves_terminal_call_when_latest_user_explicitly_requests_
     assert args["approved"] is True
 
 
+def test_agent_configures_default_capture_artifact_paths_on_terminal_tools():
+    registry = ToolRegistry(work_dir="/tmp/pyclaw-work", allowed_paths=[])
+    terminal = TerminalTool()
+    registry.register(terminal)
+
+    Agent(AsyncMock(), registry, AsyncMock(), work_dir="/tmp/pyclaw-work")
+
+    assert "~/.pyclaw/screenshots" in registry.allowed_paths
+    assert "~/.pyclaw/photos" in registry.allowed_paths
+    assert "~/.pyclaw/recordings" in terminal.allowed_paths
+
+
 def test_agent_does_not_auto_approve_terminal_call_for_mismatched_user_intent():
     agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
     session = MagicMock()
@@ -1668,6 +1682,106 @@ def test_agent_does_not_auto_approve_terminal_call_for_mismatched_user_intent():
     args = json.loads(updated[0]["function"]["arguments"])
 
     assert "approved" not in args
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_screenshot_path_variants_after_bounded_repairs():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.allowed_paths = []
+    tools.get_all_specs.return_value = []
+
+    desktop_args = json.dumps({
+        "command": 'FILE=~/Desktop/截图_$(date +%Y%m%d_%H%M%S).png && screencapture -x "$FILE" && echo "$FILE"',
+    }, ensure_ascii=False)
+    pyclaw_args = json.dumps({
+        "command": 'mkdir -p ~/.pyclaw/screenshots && f=~/.pyclaw/screenshots/截图_$(date +%Y%m%d_%H%M%S).png && screencapture -x "$f" && echo "$f"',
+        "approved": True,
+    }, ensure_ascii=False)
+    pyclaw_variant_args = json.dumps({
+        "command": 'mkdir -p ~/.pyclaw/screenshots && f=~/.pyclaw/screenshots/screen_$(date +%Y%m%d_%H%M%S).png && screencapture -x "$f" && ls -lh "$f"',
+        "approved": True,
+    }, ensure_ascii=False)
+
+    model.chat.side_effect = [
+        {
+            "content": "先截到桌面。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "shot1", "function": {"name": "terminal", "arguments": desktop_args}}],
+        },
+        {
+            "content": "改到 PyClaw 目录再试。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "shot2", "function": {"name": "terminal", "arguments": pyclaw_args}}],
+        },
+        {
+            "content": "再换一个文件名。",
+            "__tool_calls__": True,
+            "tool_calls": [{"id": "shot3", "function": {"name": "terminal", "arguments": pyclaw_variant_args}}],
+        },
+        {"content": "截图失败：系统截图权限或沙箱路径仍阻止执行。", "__tool_calls__": False},
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{
+            "role": "tool",
+            "tool_call_id": "shot1",
+            "name": "terminal",
+            "content": "⚠️ 拦截到非法路径访问: `~/Desktop/截图_20260704.png`。\n指令: `FILE=~/Desktop/截图_$(date +%Y%m%d_%H%M%S).png && screencapture -x \"$FILE\" && echo \"$FILE\"`",
+            "success": False,
+            "metadata": {},
+        }],
+        [{
+            "role": "tool",
+            "tool_call_id": "shot2",
+            "name": "terminal",
+            "content": "Command: mkdir -p ~/.pyclaw/screenshots && f=~/.pyclaw/screenshots/截图_$(date +%Y%m%d_%H%M%S).png && screencapture -x \"$f\" && echo \"$f\"\nExit code: 1\nSTDERR:\nscreencapture: cannot write file",
+            "success": False,
+            "metadata": {},
+        }],
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-screenshot-bounded-repair"
+    session.channel = "telegram"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-screenshot-bounded-repair",
+        channel="telegram",
+        channel_user_id="u1",
+        session_id="s-screenshot-bounded-repair",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="截屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert response.content == "截图失败：系统截图权限或沙箱路径仍阻止执行。"
+    assert "副作用工具重复调用" not in response.content
+    assert any(
+        "本轮只有重复的副作用工具调用" in m.content
+        and "terminal:semantic:capture_screenshot" in m.content
+        for m in session.messages
+    )
 
 
 @pytest.mark.asyncio

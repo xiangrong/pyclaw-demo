@@ -60,6 +60,22 @@ def classify_terminal_command(command: str) -> int:
     ]
     if any(re.search(pattern, command) for pattern in confirm_patterns):
         return 2
+
+    # Some commands perform a user-visible desktop side effect even when the
+    # shell snippet itself does not contain a conventional mutation token such
+    # as mkdir/cp/redirection.  Treat these by semantic intent instead of by a
+    # growing command allowlist: ExecApprovalService can then approve them only
+    # when they match the latest explicit user request, while TerminalTool keeps
+    # enforcing the filesystem sandbox.
+    desktop_side_effect_intents = {
+        "capture_screenshot",
+        "capture_photo",
+        "record_screen",
+        "notify",
+        "open",
+    }
+    if terminal_command_intents(command) & desktop_side_effect_intents:
+        return 2
     return 1
 
 

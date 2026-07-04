@@ -79,6 +79,13 @@ def test_terminal_keeps_approval_gate_for_generic_screenshot_shell_snippet():
     assert tool._is_allowed_mac_desktop_control_command(command) is False
 
 
+def test_terminal_classifies_bare_desktop_capture_commands_as_side_effects():
+    tool = TerminalTool()
+
+    assert tool._classify_command('FILE=~/Desktop/shot.png && screencapture -x "$FILE"') == 2
+    assert tool._classify_command('imagesnap "$HOME/.pyclaw/photos/photo.jpg"') == 2
+
+
 def test_terminal_safety_can_auto_approve_explicit_desktop_capture_intents():
     screenshot_command = (
         'mkdir -p ~/.pyclaw/screenshots && '
