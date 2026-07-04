@@ -42,6 +42,11 @@ class Agent:
         "delete",
         "trigger",
     )
+    CAPTURE_SIDE_EFFECT_KEYS = {
+        "terminal:semantic:capture_screenshot",
+        "terminal:semantic:capture_photo",
+        "terminal:semantic:record_screen",
+    }
 
     def __init__(
         self,
@@ -914,6 +919,7 @@ class Agent:
                 any_failure = False
                 successful_side_effect_calls: list[str] = []
                 attempted_desktop_control_script_calls: list[str] = []
+                delivered_capture_artifacts: list[dict[str, str]] = []
                 for result_index, tr in enumerate(tool_results):
                     side_effect_key = pending_side_effect_keys_by_call_id.get(
                         str(tr.get("tool_call_id", ""))
@@ -941,6 +947,12 @@ class Agent:
                             "file_path": tr["metadata"]["file_path"],
                             "description": tr["metadata"]["description"]
                         })
+
+                    if side_effect_key and tr.get("success"):
+                        capture_artifact = self._capture_artifact_from_tool_result(side_effect_key, tr)
+                        if capture_artifact and not self._pending_file_exists(pending_files, capture_artifact["file_path"]):
+                            pending_files.append(capture_artifact)
+                            delivered_capture_artifacts.append(capture_artifact)
                         
                     # 检查是否激活了技能
                     if tr.get("metadata", {}).get("activated_skill"):
@@ -1008,7 +1020,12 @@ class Agent:
                 else:
                     consecutive_failures = 0 # 重置计数
 
-                if is_cron_session and successful_side_effect_calls:
+                if delivered_capture_artifacts:
+                    final_content = self._capture_artifact_final_content(delivered_capture_artifacts)
+                    final_content = self._sanitize_user_facing_content(final_content)
+                    self._touch_activity("capture_artifact_delivered", session)
+                    return final_content, pending_files
+                elif is_cron_session and successful_side_effect_calls:
                     await self._request_final_answer_without_tools(
                         session,
                         (
@@ -2977,11 +2994,81 @@ class Agent:
         # permissions, touch the camera, or partially create an artifact.  Count
         # the admitted attempt before execution so missing-approval/path/runtime
         # failures cannot spin through many command variants.
-        return side_effect_key in {
-            "terminal:semantic:capture_screenshot",
-            "terminal:semantic:capture_photo",
-            "terminal:semantic:record_screen",
+        return side_effect_key in self.CAPTURE_SIDE_EFFECT_KEYS
+
+    def _capture_artifact_from_tool_result(self, side_effect_key: str, tool_result: dict[str, Any]) -> Optional[dict[str, str]]:
+        """Build pending-file metadata from a successful capture terminal result.
+
+        Screen/camera/recording requests are one-shot desktop actions.  Once a
+        terminal command has successfully produced the artifact, the controller
+        should deliver that file directly instead of giving the model another
+        chance to repeat the capture command.
+        """
+        if side_effect_key not in self.CAPTURE_SIDE_EFFECT_KEYS:
+            return None
+        if str(tool_result.get("name", "")).lower() != "terminal":
+            return None
+        content = str(tool_result.get("content", ""))
+        file_path = self._extract_capture_artifact_path(content, side_effect_key)
+        if not file_path:
+            return None
+        return {
+            "file_path": file_path,
+            "description": self._capture_artifact_description(side_effect_key),
         }
+
+    def _extract_capture_artifact_path(self, content: str, side_effect_key: str) -> str:
+        """Extract a generated capture file path from terminal output."""
+        extensions_by_key = {
+            "terminal:semantic:capture_screenshot": ("png", "jpg", "jpeg", "heic"),
+            "terminal:semantic:capture_photo": ("jpg", "jpeg", "png", "heic"),
+            "terminal:semantic:record_screen": ("mov", "mp4", "mkv", "webm"),
+        }
+        directory_markers_by_key = {
+            "terminal:semantic:capture_screenshot": ("/.pyclaw/screenshots/", "/Desktop/"),
+            "terminal:semantic:capture_photo": ("/.pyclaw/photos/",),
+            "terminal:semantic:record_screen": ("/.pyclaw/recordings/",),
+        }
+        extensions = extensions_by_key.get(side_effect_key, ())
+        if not extensions:
+            return ""
+
+        ext_pattern = "|".join(re.escape(ext) for ext in extensions)
+        # Handles PATH=/abs/file.png, OK:/abs/file.png, SAVED:/abs/file.png,
+        # bare absolute paths, and `ls -la /abs/file.png` output.
+        pattern = re.compile(rf"(?P<path>(?:~|/)[^\s`'\"<>]+\.(?:{ext_pattern}))", re.IGNORECASE)
+        candidates: list[str] = []
+        for match in pattern.finditer(content):
+            candidate = match.group("path").rstrip('.,;:)]}')
+            expanded = os.path.abspath(os.path.expanduser(candidate))
+            candidates.append(expanded)
+
+        markers = directory_markers_by_key.get(side_effect_key, ())
+        for candidate in candidates:
+            if markers and not any(marker in candidate for marker in markers):
+                continue
+            if os.path.isfile(candidate):
+                return candidate
+        return ""
+
+    def _capture_artifact_description(self, side_effect_key: str) -> str:
+        if side_effect_key == "terminal:semantic:capture_photo":
+            return "拍照已完成 📷"
+        if side_effect_key == "terminal:semantic:record_screen":
+            return "录屏已完成 🎥"
+        return "截屏已完成 📸"
+
+    def _capture_artifact_final_content(self, artifacts: list[dict[str, str]]) -> str:
+        descriptions = [artifact.get("description", "文件已生成") for artifact in artifacts]
+        if not descriptions:
+            return "已完成，文件已发送。"
+        first = descriptions[0]
+        if len(descriptions) == 1:
+            return f"{first}，图片已发送。" if "截屏" in first or "拍照" in first else f"{first}，文件已发送。"
+        return "已完成，文件已发送。"
+
+    def _pending_file_exists(self, pending_files: list[dict[str, Any]], file_path: str) -> bool:
+        return any(os.path.abspath(os.path.expanduser(str(item.get("file_path", "")))) == file_path for item in pending_files)
 
     def _semantic_terminal_repeat_limit(
         self,

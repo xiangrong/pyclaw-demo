@@ -1719,6 +1719,97 @@ async def test_agent_executes_screenshot_with_injected_approval_for_real_user_tu
     assert executed_args["approved"] is True
 
 
+@pytest.mark.asyncio
+async def test_agent_auto_delivers_successful_screenshot_artifact_and_stops(tmp_path):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.allowed_paths = []
+    tools.get_all_specs.return_value = []
+
+    artifact_dir = tmp_path / ".pyclaw" / "screenshots"
+    artifact_dir.mkdir(parents=True)
+    artifact = artifact_dir / "shot_20260704_234246.png"
+    artifact.write_bytes(b"png")
+    command = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'F=~/.pyclaw/screenshots/shot_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$F" && echo "OK:$F" && ls -la "$F"'
+    )
+    repeated_command = (
+        'mkdir -p ~/.pyclaw/screenshots && '
+        'f=~/.pyclaw/screenshots/screen_$(date +%Y%m%d_%H%M%S).png && '
+        'screencapture -x "$f" && ls -la "$f" && echo "PATH=$f"'
+    )
+    model.chat.side_effect = [
+        {
+            "content": "我来截屏。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "shot1",
+                "function": {"name": "terminal", "arguments": json.dumps({"command": command, "approved": True})},
+            }],
+        },
+        {
+            "content": "再截一次。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "shot2",
+                "function": {"name": "terminal", "arguments": json.dumps({"command": repeated_command, "approved": True})},
+            }],
+        },
+    ]
+    tools.execute_tool_calls.return_value = [{
+        "role": "tool",
+        "tool_call_id": "shot1",
+        "name": "terminal",
+        "content": f"Command: screencapture\nExit code: 0\nSTDOUT:\nOK:{artifact}\n-rw-r--r--  1 mac staff 3 Jul 4 23:42 {artifact}",
+        "success": True,
+        "metadata": {},
+    }]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-screenshot-auto-deliver"
+    session.channel = "wechat"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=5)
+    user_msg = Message(
+        id="m-screenshot-auto-deliver",
+        channel="wechat",
+        channel_user_id="u1",
+        session_id="s-screenshot-auto-deliver",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="截个屏",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 1
+    assert model.chat.call_count == 1
+    assert "截屏已完成" in response.content
+    assert response.metadata["pending_files"] == [{
+        "file_path": str(artifact),
+        "description": "截屏已完成 📸",
+    }]
+
+
 def test_agent_configures_default_capture_artifact_paths_on_terminal_tools():
     registry = ToolRegistry(work_dir="/tmp/pyclaw-work", allowed_paths=[])
     terminal = TerminalTool()
