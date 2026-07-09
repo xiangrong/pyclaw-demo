@@ -37,6 +37,12 @@ class SessionLayer(BaseLayer):
         if context.coding_task_status:
             parts.append(f"<coding_task_status>\n{context.coding_task_status}\n</coding_task_status>")
 
+        if context.active_skills_context:
+            parts.append(context.active_skills_context)
+
+        if context.deliverable_workspace_context:
+            parts.append(context.deliverable_workspace_context)
+
         return "\n\n".join(parts)
 
     def get_cache_key(self, context: LayerContext) -> Optional[str]:

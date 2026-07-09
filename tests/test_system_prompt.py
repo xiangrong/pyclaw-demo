@@ -59,6 +59,26 @@ async def test_session_layer_invalidation(context):
     assert "New Session Content" in prompt2
 
 @pytest.mark.asyncio
+async def test_session_layer_invalidation_includes_deliverable_workspace_context(context):
+    manager = SystemPromptManager()
+
+    prompt1 = await manager.generate_prompt(context)
+    assert "bounded_artifact_dir" not in prompt1
+
+    context.deliverable_workspace_context = (
+        "<skill_workspace_adapter>\n"
+        "bounded_artifact_dir: /tmp/pyclaw-artifacts/rag-deck\n"
+        "required_skill_docs:\n"
+        "- built-in-skills/make-a-deck.md\n"
+        "</skill_workspace_adapter>"
+    )
+
+    prompt2 = await manager.generate_prompt(context)
+
+    assert "<skill_workspace_adapter>" in prompt2
+    assert "bounded_artifact_dir: /tmp/pyclaw-artifacts/rag-deck" in prompt2
+
+@pytest.mark.asyncio
 async def test_static_layer_invalidation(context):
     manager = SystemPromptManager()
     await manager.generate_prompt(context)

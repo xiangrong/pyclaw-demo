@@ -8,6 +8,7 @@ import re
 import shlex
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Any
 
 from pyclaw.core.message import Message, MessageRole, MessageType
@@ -20,7 +21,20 @@ from pyclaw.core.system_prompt.models import LayerContext
 from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
 from pyclaw.core.public_sanitize import sanitize_user_facing_content
 from pyclaw.core.exec_approval import ExecApprovalMode, ExecApprovalService
+from pyclaw.core.artifacts import ArtifactManager
+from pyclaw.core.artifact_acceptance import ArtifactAcceptanceResult, ArtifactAcceptanceService
+from pyclaw.core.artifact_synthesis import ArtifactSynthesisService, SynthesisQuality
+from pyclaw.core.deliverable_workflow import DeliverableWorkflow
+from pyclaw.core.skill_context import SkillContextService
+from pyclaw.core.skill_evidence import SkillEvidenceService
+from pyclaw.core.skill_workspace import SkillWorkspaceService
+from pyclaw.core.completion_contract import (
+    CompletionContract,
+    CompletionContractService,
+    CompletionEvidence,
+)
 from pyclaw.tools.terminal_safety import primary_terminal_action
+from pyclaw.tools.skill_activation import _available_skills_dirs, _discover_markdown_skills, resolve_markdown_skill
 
 
 class Agent:
@@ -103,6 +117,18 @@ class Agent:
         self._last_activity_session_id = ""
         self.answer_quality_gate = AnswerQualityGate()
         self.exec_approval = exec_approval_service or ExecApprovalService(exec_approval_mode)
+        self.artifacts = ArtifactManager()
+        self.artifact_acceptance = ArtifactAcceptanceService()
+        self.artifact_synthesis = ArtifactSynthesisService()
+        self.completion_contracts = CompletionContractService()
+        self.skill_contexts = SkillContextService()
+        self.skill_workspace = SkillWorkspaceService(self.skill_contexts)
+        self.deliverables = DeliverableWorkflow(
+            acceptance=self.artifact_acceptance,
+            synthesis=self.artifact_synthesis,
+            skill_evidence=SkillEvidenceService(self.skill_contexts),
+            skill_workspace=self.skill_workspace,
+        )
         self._ensure_default_terminal_artifact_paths()
 
     def _ensure_default_terminal_artifact_paths(self) -> None:
@@ -242,6 +268,11 @@ class Agent:
                 context.coding_task_status = self._format_coding_task_status_for_prompt(
                     session.metadata.get("coding_task_status", {})
                 )
+            active_contract = self._infer_completion_contract(session)
+            if active_contract is not None:
+                self.skill_workspace.ensure_required_contexts(session, active_contract)
+            context.active_skills_context = self.skill_contexts.render_prompt_context(session)
+            context.deliverable_workspace_context = self.skill_workspace.render_adapter_context(session, active_contract)
             
             # 获取语义记忆
             semantic_memory, experience_memory = await self._get_semantic_memories(session)
@@ -327,16 +358,23 @@ class Agent:
                 desc = desc.replace("\n", " ")
                 skills_index.append(f"- {name}: [Python Tool] {desc}")
 
-        # 2. 遍历目录查找 SKILL.md
-        for skills_dir in self.tools.skills_dirs:
-            if skills_dir and skills_dir.exists():
-                for root, dirs, files in os.walk(skills_dir):
-                    if "SKILL.md" in files:
-                        skill_md_path = os.path.join(root, "SKILL.md")
-                        rel_path = os.path.relpath(root, skills_dir)
-                        description = self._extract_skill_description(skill_md_path)
-                        if not any(item.startswith(f"- {rel_path}:") for item in skills_index):
-                            skills_index.append(f"- {rel_path}: [Markdown Skill] {description}")
+        # 2. 遍历目录查找 SKILL.md.  Use the skill frontmatter name as the
+        # canonical display name so nested bundles such as
+        # baoyu-design/skills/baoyu-design do not trick the model into probing
+        # the wrong top-level path.
+        seen_markdown_names: set[str] = set()
+        for skills_dir in self._markdown_skill_dirs_for_resolution() or _available_skills_dirs():
+            skills_path = Path(skills_dir)
+            if skills_path.exists():
+                for candidate in _discover_markdown_skills([str(skills_path)]):
+                    display_name = candidate.frontmatter_name or candidate.rel_path
+                    key = display_name.lower()
+                    if key in seen_markdown_names:
+                        continue
+                    seen_markdown_names.add(key)
+                    description = candidate.description.replace("\n", " ")
+                    path_hint = "" if display_name == candidate.rel_path else f" (path: {candidate.rel_path})"
+                    skills_index.append(f"- {display_name}: [Markdown Skill] {description}{path_hint}")
         
         return "\n".join(sorted(skills_index)) if skills_index else "No specialized skills currently indexed."
 
@@ -423,6 +461,7 @@ class Agent:
 
         # 执行 Agent 循环
         response_content, pending_files = await self._agent_loop(session)
+        self._dedupe_pending_files(pending_files)
 
         # 检查是否需要压缩历史消息 (PRD v0.7.0)
         if len(session.messages) > 30:
@@ -495,6 +534,15 @@ class Agent:
         max_iterations = configured_max_iterations if is_cron_session else self.max_iterations
         raw_task_text = self._latest_external_user_text(session)
         initial_task_text = raw_task_text
+        initial_completion_contract = self._infer_completion_contract(session)
+        if initial_completion_contract is not None:
+            self.skill_workspace.ensure_required_contexts(session, initial_completion_contract)
+            await self._ensure_skill_workflow_hydration_observations(session, initial_completion_contract)
+            await self._ensure_skill_workflow_orchestration_notice(session, initial_completion_contract)
+            await self._persist_session_metadata(session)
+        is_file_deliverable_turn = bool(
+            initial_completion_contract and initial_completion_contract.kind == "file_deliverable"
+        )
         has_active_coding_ledger = self._has_active_coding_ledger(session)
         pending_action_text = self._pending_action_context_for_short_confirmation(session, raw_task_text)
         is_continue_coding_turn = has_active_coding_ledger and self._is_continue_request(raw_task_text)
@@ -504,7 +552,7 @@ class Agent:
                 initial_task_text = persisted_task_text
         elif pending_action_text and self._is_coding_task(pending_action_text):
             initial_task_text = pending_action_text
-        is_coding_turn = self._is_coding_task(initial_task_text) or is_continue_coding_turn
+        is_coding_turn = (self._is_coding_task(initial_task_text) or is_continue_coding_turn) and not is_file_deliverable_turn
         max_tool_calls = self._effective_max_tool_calls(session, is_cron_session=is_cron_session, is_coding_turn=is_coding_turn)
         repeated_tool_limit = self._effective_repeated_tool_limit(session, default=8, is_cron_session=is_cron_session)
         side_effect_tool_limit = 1
@@ -523,6 +571,8 @@ class Agent:
         patch_first_repair_requested = False
         verification_repair_requested = False
         build_repair_requested = False
+        completion_contract_repair_attempts = 0
+        deliverable_generation_plan_repair_requested = False
         navigation_pivot_requested = False
         changed_files, validation_results, build_results = self._hydrate_coding_ledger(session) if is_coding_turn else (set(), [], [])
         existing_coding_task_status = session.metadata.get("coding_task_status") if isinstance(session.metadata, dict) else {}
@@ -599,7 +649,24 @@ class Agent:
             except Exception as e:
                 print(f"  ❌ LLM 调用出错: {e}")
                 error_msg = self._format_llm_error_for_user(e, session)
-                return "\n\n".join(all_responses + [error_msg]), []
+                error_content = "\n\n".join(all_responses + [error_msg])
+                controller_content = self._controller_final_content_from_observed_progress(
+                    session=session,
+                    fallback_content=error_content,
+                    pending_files=pending_files,
+                    changed_files=changed_files,
+                    validation_results=validation_results,
+                    build_results=build_results,
+                    coding_task_status=coding_task_status,
+                )
+                if controller_content.strip():
+                    return controller_content, pending_files
+                error_content = self._prepare_completion_contract_final_content(
+                    session=session,
+                    content=error_content,
+                    pending_files=pending_files,
+                )
+                return error_content, pending_files
 
             content = result.get("content", "") if isinstance(result, dict) else str(result)
             
@@ -632,16 +699,28 @@ class Agent:
                         all_responses,
                         "⚠️  工具预算或时间预算已用完，但模型仍尝试继续调用工具；我已停止执行以避免刷屏。",
                     )
-                    return self._prepare_coding_final_content(
+                    stop_content = self._prepare_completion_contract_final_content(
                         session=session,
                         content=stop_content,
-                        changed_files=changed_files,
-                        validation_results=validation_results,
-                        build_results=build_results,
-                        coding_task_status=coding_task_status,
-                    ), pending_files
+                        pending_files=pending_files,
+                    )
+                    stop_content = self._prepare_desktop_control_final_content(session, stop_content)
+                    if self._infer_completion_contract(session) is None:
+                        stop_content = self._prepare_coding_final_content(
+                            session=session,
+                            content=stop_content,
+                            changed_files=changed_files,
+                            validation_results=validation_results,
+                            build_results=build_results,
+                            coding_task_status=coding_task_status,
+                        )
+                    return stop_content, pending_files
 
                 tool_calls = result["tool_calls"]
+                terminal_batch_limit = self._terminal_one_shot_batch_limit(session, tool_calls)
+                if terminal_batch_limit and len(tool_calls) > terminal_batch_limit:
+                    tool_calls = tool_calls[:terminal_batch_limit]
+                    result["tool_calls"] = tool_calls
                 if soft_deadline_reached and not self._are_delivery_tool_calls(tool_calls):
                     await self._request_final_answer_without_tools(
                         session,
@@ -661,6 +740,16 @@ class Agent:
                 tool_calls = self._apply_exec_approval_to_tool_calls(tool_calls, session=session)
                 if result.get("tool_calls") is not tool_calls:
                     result["tool_calls"] = tool_calls
+
+                tool_calls, skipped_active_skills = await self._filter_already_active_skill_calls(
+                    session=session,
+                    tool_calls=tool_calls,
+                )
+                if skipped_active_skills:
+                    result["tool_calls"] = tool_calls
+                    await self._request_active_skill_continue(session, skipped_active_skills)
+                    if not tool_calls:
+                        continue
 
                 tool_call_count += len(tool_calls)
 
@@ -712,7 +801,11 @@ class Agent:
 
                 if tool_call_count > max_tool_calls:
                     budget_reason = "工具调用次数已达到上限。请停止调用任何工具，直接基于已有观察结果给用户一个完整、简洁的最终答复。"
-                    if self._is_effective_implementation_request(session) and not changed_files:
+                    if (
+                        self._infer_completion_contract(session) is None
+                        and self._is_effective_implementation_request(session)
+                        and not changed_files
+                    ):
                         budget_reason = (
                             "工具调用次数已达到上限，但本轮实现类任务尚未产生任何文件 diff。"
                             "请停止调用工具，最终答复必须明确说明：当前没有完成代码修改、没有文件变更；"
@@ -747,6 +840,45 @@ class Agent:
                         if tool_call_id:
                             pending_side_effect_keys_by_call_id[tool_call_id] = side_effect_key
                     if not filtered_tool_calls:
+                        completion_contract = self._infer_completion_contract(session)
+                        controller_final = self._controller_finalize_explicit_skill_deliverable_if_ready(
+                            session=session,
+                            contract=completion_contract,
+                            content=content,
+                            pending_files=pending_files,
+                        )
+                        if controller_final.strip():
+                            controller_final = self._sanitize_user_facing_content(controller_final)
+                            self._touch_activity("controller_finalized_after_duplicate_side_effects", session)
+                            return controller_final, pending_files
+                        if self._should_run_completion_contract_gate(
+                            contract=completion_contract,
+                            draft=content,
+                            pending_files=pending_files,
+                            repair_attempts=completion_contract_repair_attempts,
+                            is_final_iteration=is_final_iteration,
+                            force_final_answer=False,
+                            soft_deadline_reached=soft_deadline_reached,
+                            session=session,
+                        ):
+                            decision = self.deliverables.should_repair(
+                                contract=completion_contract,
+                                draft=content,
+                                pending_files=pending_files,
+                                repair_attempts=completion_contract_repair_attempts,
+                                is_final_iteration=is_final_iteration,
+                                force_final_answer=False,
+                                soft_deadline_reached=soft_deadline_reached,
+                                session=session,
+                            )
+                            await self._request_completion_contract_repair(
+                                session,
+                                completion_contract,
+                                decision.acceptance,
+                                decision.skill_evidence,
+                            )
+                            completion_contract_repair_attempts += 1
+                            continue
                         await self._request_final_answer_without_tools(
                             session,
                             (
@@ -760,16 +892,22 @@ class Agent:
 
                     result["tool_calls"] = filtered_tool_calls
                     tool_calls = filtered_tool_calls
-                    await self._request_final_answer_without_tools(
-                        session,
-                        (
-                            "本轮模型生成了重复的副作用工具调用；系统只会执行每个唯一副作用一次，"
-                            f"已跳过重复项：{', '.join(skipped_side_effect_calls or repeated_side_effect_calls)}。"
-                            "后续不要再次调用 terminal、cronjob、发送消息、写文件或其他副作用工具；"
-                            "工具返回后请直接总结任务结果，不要向用户暴露本条内部提示。"
-                        ),
-                    )
-                    force_final_answer = True
+                    if self._infer_completion_contract(session) is None:
+                        await self._request_final_answer_without_tools(
+                            session,
+                            (
+                                "本轮模型生成了重复的副作用工具调用；系统只会执行每个唯一副作用一次，"
+                                f"已跳过重复项：{', '.join(skipped_side_effect_calls or repeated_side_effect_calls)}。"
+                                "后续不要再次调用 terminal、cronjob、发送消息、写文件或其他副作用工具；"
+                                "工具返回后请直接总结任务结果，不要向用户暴露本条内部提示。"
+                            ),
+                        )
+                        force_final_answer = True
+                    else:
+                        await self._request_duplicate_side_effect_delivery_repair(
+                            session,
+                            skipped_side_effect_calls or repeated_side_effect_calls,
+                        )
 
                 repeated_tools = [
                     name for name, count in tool_name_counts.items()
@@ -826,6 +964,7 @@ class Agent:
                             "observations you've received so far. Why is this not working? "
                             "Adjust your strategy and try a different approach."
                         ),
+                        metadata={"internal_notice": True},
                     )
                     await self.sessions.save_message(session, reflection_msg)
                     last_tool_calls = [] # 重置检测
@@ -948,6 +1087,26 @@ class Agent:
                             "description": tr["metadata"]["description"]
                         })
 
+                    self._collect_deliverable_artifact_from_tool_result(
+                        session=session,
+                        tool_result=tr,
+                        pending_files=pending_files,
+                    )
+
+                    if tr.get("success") and str(tr.get("name", "")) == "terminal":
+                        contract = self._infer_completion_contract(session)
+                        if contract is not None and contract.kind == "file_deliverable":
+                            delivered_file = self._artifact_file_from_tool_result_content(
+                                str(tr.get("content", "")),
+                                roots=self._trusted_artifact_roots_for_contract(contract),
+                                extensions=self._deliverable_extensions_for_contract(contract),
+                            )
+                            if delivered_file and not self._pending_file_exists(pending_files, delivered_file):
+                                pending_files.append({
+                                    "file_path": delivered_file,
+                                    "description": self._file_deliverable_description(delivered_file),
+                                })
+
                     if side_effect_key and tr.get("success"):
                         capture_artifact = self._capture_artifact_from_tool_result(side_effect_key, tr)
                         if capture_artifact and not self._pending_file_exists(pending_files, capture_artifact["file_path"]):
@@ -956,18 +1115,17 @@ class Agent:
                         
                     # 检查是否激活了技能
                     if tr.get("metadata", {}).get("activated_skill"):
-                        skill_name = tr["metadata"]["activated_skill"]
-                        active_skills = session.metadata.get("active_skills", [])
-                        if skill_name not in active_skills:
-                            active_skills.append(skill_name)
-                            session.metadata["active_skills"] = active_skills
-                            # 立即保存 session 的 metadata
-                            async with self.sessions.db_connect() as db:
-                                await db.execute(
-                                    "UPDATE sessions SET metadata = ? WHERE session_id = ?",
-                                    (json.dumps(session.metadata), session.session_id)
-                                )
-                                await db.commit()
+                        record = self.skill_contexts.persist_activation(session, tr.get("metadata", {}))
+                        if record is None:
+                            # Python skills do not have a SKILL.md context to
+                            # rehydrate, but their tool specs still need the
+                            # active_skills flag for registry exposure.
+                            skill_name = str(tr.get("metadata", {}).get("activated_skill") or "").strip()
+                            active_skills = session.metadata.get("active_skills", [])
+                            if skill_name and isinstance(active_skills, list) and skill_name not in active_skills:
+                                active_skills.append(skill_name)
+                                session.metadata["active_skills"] = active_skills
+                        await self._persist_session_metadata(session)
 
                     if not tr["success"]:
                         any_failure = True
@@ -1019,6 +1177,65 @@ class Agent:
                         break
                 else:
                     consecutive_failures = 0 # 重置计数
+
+                active_contract = self._infer_completion_contract(session)
+                controller_final = self._controller_finalize_explicit_skill_deliverable_if_ready(
+                    session=session,
+                    contract=active_contract,
+                    content=content,
+                    pending_files=pending_files,
+                )
+                if controller_final.strip():
+                    controller_final = self._sanitize_user_facing_content(controller_final)
+                    self._touch_activity("controller_finalized_after_tool_observation", session)
+                    return controller_final, pending_files
+                if (
+                    active_contract is not None
+                    and active_contract.kind == "file_deliverable"
+                    and not pending_files
+                    and not deliverable_generation_plan_repair_requested
+                    and not is_final_iteration
+                    and not force_final_answer
+                    and not soft_deadline_reached
+                    and self._only_setup_or_dependency_checks(self._current_turn_tool_observations(session))
+                ):
+                    await self._request_deliverable_generation_plan_repair(session, active_contract)
+                    deliverable_generation_plan_repair_requested = True
+                    continue
+
+                if (
+                    active_contract is not None
+                    and active_contract.kind == "file_deliverable"
+                    and pending_files
+                    and self._should_run_completion_contract_gate(
+                        contract=active_contract,
+                        draft=content,
+                        pending_files=pending_files,
+                        repair_attempts=completion_contract_repair_attempts,
+                        is_final_iteration=is_final_iteration,
+                        force_final_answer=force_final_answer,
+                        soft_deadline_reached=soft_deadline_reached,
+                        session=session,
+                    )
+                ):
+                    decision = self.deliverables.should_repair(
+                        contract=active_contract,
+                        draft=content,
+                        pending_files=pending_files,
+                        repair_attempts=completion_contract_repair_attempts,
+                        is_final_iteration=is_final_iteration,
+                        force_final_answer=force_final_answer,
+                        soft_deadline_reached=soft_deadline_reached,
+                        session=session,
+                    )
+                    await self._request_completion_contract_repair(
+                        session,
+                        active_contract,
+                        decision.acceptance,
+                        decision.skill_evidence,
+                    )
+                    completion_contract_repair_attempts += 1
+                    continue
 
                 if delivered_capture_artifacts:
                     final_content = self._capture_artifact_final_content(delivered_capture_artifacts)
@@ -1113,14 +1330,47 @@ class Agent:
                 build_repair_requested = True
                 continue
 
-            content = self._prepare_coding_final_content(
+            completion_contract = self._infer_completion_contract(session)
+            if self._should_run_completion_contract_gate(
+                contract=completion_contract,
+                draft=content,
+                pending_files=pending_files,
+                repair_attempts=completion_contract_repair_attempts,
+                is_final_iteration=is_final_iteration,
+                force_final_answer=force_final_answer,
+                soft_deadline_reached=soft_deadline_reached,
                 session=session,
-                content=content,
-                changed_files=changed_files,
-                validation_results=validation_results,
-                build_results=build_results,
-                coding_task_status=coding_task_status,
-            )
+            ):
+                if content.strip() and all_responses and all_responses[-1] == content:
+                    all_responses.pop()
+                decision = self.deliverables.should_repair(
+                    contract=completion_contract,
+                    draft=content,
+                    pending_files=pending_files,
+                    repair_attempts=completion_contract_repair_attempts,
+                    is_final_iteration=is_final_iteration,
+                    force_final_answer=force_final_answer,
+                    soft_deadline_reached=soft_deadline_reached,
+                    session=session,
+                )
+                await self._request_completion_contract_repair(
+                    session,
+                    completion_contract,
+                    decision.acceptance,
+                    decision.skill_evidence,
+                )
+                completion_contract_repair_attempts += 1
+                continue
+
+            if completion_contract is None:
+                content = self._prepare_coding_final_content(
+                    session=session,
+                    content=content,
+                    changed_files=changed_files,
+                    validation_results=validation_results,
+                    build_results=build_results,
+                    coding_task_status=coding_task_status,
+                )
             if all_responses and all_responses[-1] != content:
                 all_responses[-1] = content
 
@@ -1143,15 +1393,21 @@ class Agent:
                 continue
 
             final_content = self._sanitize_user_facing_content("\n\n".join(all_responses))
-            final_content = self._prepare_desktop_control_final_content(session, final_content)
-            final_content = self._prepare_coding_final_content(
+            final_content = self._prepare_completion_contract_final_content(
                 session=session,
                 content=final_content,
-                changed_files=changed_files,
-                validation_results=validation_results,
-                build_results=build_results,
-                coding_task_status=coding_task_status,
+                pending_files=pending_files,
             )
+            final_content = self._prepare_desktop_control_final_content(session, final_content)
+            if self._infer_completion_contract(session) is None:
+                final_content = self._prepare_coding_final_content(
+                    session=session,
+                    content=final_content,
+                    changed_files=changed_files,
+                    validation_results=validation_results,
+                    build_results=build_results,
+                    coding_task_status=coding_task_status,
+                )
             self._touch_activity("final_answer", session)
             if not final_content.strip():
                 # 如果所有周期都没有内容，且没有工具调用，说明模型可能返回了空响应
@@ -1165,14 +1421,22 @@ class Agent:
             return final_content, pending_files
 
         stop_content = self._with_stop_notice(all_responses, self._summarize_final(session))
-        return self._prepare_coding_final_content(
+        stop_content = self._prepare_completion_contract_final_content(
             session=session,
-            content=self._prepare_desktop_control_final_content(session, stop_content),
-            changed_files=changed_files,
-            validation_results=validation_results,
-            build_results=build_results,
-            coding_task_status=coding_task_status,
-        ), pending_files
+            content=stop_content,
+            pending_files=pending_files,
+        )
+        stop_content = self._prepare_desktop_control_final_content(session, stop_content)
+        if self._infer_completion_contract(session) is None:
+            stop_content = self._prepare_coding_final_content(
+                session=session,
+                content=stop_content,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+                coding_task_status=coding_task_status,
+            )
+        return stop_content, pending_files
 
     def _get_session_int(self, session: Session, key: str, default: int) -> int:
         """Read a positive integer from session metadata with fallback."""
@@ -1188,8 +1452,22 @@ class Agent:
         Desktop control scripts are intentionally one-shot. If the terminal
         observation proves the helper ran, the final answer must not ask the
         user to run the same command manually or claim the command did not land.
+
+        This correction is deliberately turn-scoped. Long-lived Feishu/Telegram
+        sessions may contain old lock/unlock observations; those must never be
+        allowed to rewrite the final answer for an unrelated later task such as
+        generating a PPT. The controller can only summarize desktop-control
+        evidence that happened after the latest external user request.
         """
-        observation = self._latest_desktop_control_terminal_observation(session)
+        latest_user = self._latest_external_user_message(session)
+        latest_text = str(getattr(latest_user, "content", "") or "")
+        if self._is_non_desktop_file_deliverable_turn(session, latest_text):
+            return content
+
+        observation = self._latest_desktop_control_terminal_observation(
+            session,
+            after_timestamp=getattr(latest_user, "timestamp", None),
+        )
         if not observation:
             return content
 
@@ -1197,11 +1475,26 @@ class Agent:
             return self._desktop_control_observation_summary(observation)
         return content
 
-    def _latest_desktop_control_terminal_observation(self, session: Session) -> str:
-        """Return the latest terminal observation for a known Mac desktop helper."""
+    def _latest_desktop_control_terminal_observation(
+        self,
+        session: Session,
+        *,
+        after_timestamp: Any = None,
+    ) -> str:
+        """Return the latest current-turn observation for a known Mac desktop helper."""
         for msg in reversed(getattr(session, "messages", []) or []):
             if msg.role != MessageRole.TOOL:
                 continue
+            if after_timestamp is not None:
+                msg_timestamp = getattr(msg, "timestamp", None)
+                if msg_timestamp is not None:
+                    try:
+                        if msg_timestamp <= after_timestamp:
+                            continue
+                    except TypeError:
+                        # Mixed naive/aware timestamps should not make an old
+                        # desktop observation globally authoritative.
+                        continue
             metadata = getattr(msg, "metadata", {}) or {}
             if not isinstance(metadata, dict) or metadata.get("tool_name") != "terminal":
                 continue
@@ -1210,6 +1503,20 @@ class Agent:
             if command and self._mac_desktop_control_script_action(command):
                 return content
         return ""
+
+    def _is_non_desktop_file_deliverable_turn(self, session: Session, latest_text: str) -> bool:
+        """Return True when the current turn is governed by file delivery.
+
+        File-deliverable workflows have their own completion contract and
+        artifact finalizer. Desktop lock/unlock summarization is a separate
+        one-shot controller concern and must not override those answers.
+        """
+        metadata = getattr(session, "metadata", {}) or {}
+        if isinstance(metadata, dict):
+            contract = CompletionContract.from_metadata(metadata.get("current_completion_contract", {}))
+            if contract is not None and contract.kind == "file_deliverable":
+                return True
+        return self.completion_contracts.is_file_deliverable_request(latest_text)
 
     def _desktop_control_final_contradicts_observation(self, content: str) -> bool:
         """Return True for final answers that deny an observed desktop command."""
@@ -1299,9 +1606,90 @@ class Agent:
 
     def _tool_repeat_counter_name(self, tool_name: str, arguments: Any) -> str:
         """Return the logical repeat bucket for a tool call."""
+        if tool_name == "activate_skill":
+            return f"activate_skill:{self._activate_skill_repeat_name(arguments)}"
         if tool_name == "terminal" and self._terminal_command_semantic_kind(arguments) == "navigation":
             return "terminal_navigation"
         return tool_name
+
+    def _activate_skill_repeat_name(self, arguments: Any) -> str:
+        """Return a stable repeat key for activate_skill arguments.
+
+        Skill bundles can be installed at nested paths while exposing a short
+        frontmatter name (for example ``baoyu-design/skills/baoyu-design`` vs
+        ``baoyu-design``). Use the last path segment as a conservative semantic
+        bucket so retries of the same skill alias do not consume the whole loop.
+        """
+        try:
+            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except (TypeError, json.JSONDecodeError):
+            args = {}
+        if not isinstance(args, dict):
+            return "<unknown>"
+        name = str(args.get("name") or "").strip().strip("/")
+        if not name:
+            return "<unknown>"
+        return name.split("/")[-1].lower()
+
+    async def _filter_already_active_skill_calls(
+        self,
+        *,
+        session: Session,
+        tool_calls: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Drop duplicate activate_skill calls once a skill is active.
+
+        Activating the same skill repeatedly is not useful work: it bloats the
+        prompt with the same SKILL.md and can trip the generic repeated-tool
+        guard before the model reaches the actual deliverable.  Treat it like a
+        controller-level no-op and add a small internal nudge to proceed.
+        """
+        active_names = self.skill_contexts.active_aliases(session)
+        active = session.metadata.get("active_skills", []) if isinstance(session.metadata, dict) else []
+        if isinstance(active, list):
+            active_names.update(
+                str(item).strip().strip("/").split("/")[-1].lower()
+                for item in active
+                if str(item).strip()
+            )
+        active_names = {item for item in active_names if item}
+        if not active_names:
+            return tool_calls, []
+
+        filtered: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            tool_name = str(function.get("name", ""))
+            if tool_name != "activate_skill":
+                filtered.append(tool_call)
+                continue
+            requested = self._activate_skill_repeat_name(function.get("arguments", ""))
+            if requested in active_names:
+                skipped.append(requested)
+                continue
+            filtered.append(tool_call)
+
+        if skipped:
+            # Persist only a compact breadcrumb for observability.  The actual
+            # instruction is injected by _request_active_skill_continue.
+            session.metadata["last_skipped_active_skills"] = sorted(set(skipped))
+            await self._persist_session_metadata(session)
+        return filtered, skipped
+
+    async def _request_active_skill_continue(self, session: Session, skipped_skills: list[str]) -> None:
+        notice_content = self.skill_contexts.context_notice(session, skipped_skills)
+        reminder = Message(
+            id=f"active-skill-continue-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=notice_content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
 
     def _tool_call_repeat_names(self, tool_calls: list[dict[str, Any]]) -> set[str]:
         names: set[str] = set()
@@ -1332,6 +1720,10 @@ class Agent:
         if already_repaired or changed_files:
             return False
         if session.channel == "cron":
+            return False
+        if self._infer_completion_contract(session) is not None:
+            return False
+        if self._is_file_deliverable_request(task_text):
             return False
         if not self._is_implementation_request(task_text):
             return False
@@ -1395,6 +1787,8 @@ class Agent:
         read_file is intentionally chunk-limited, so counting only tool name caused
         large-file coding tasks to stop before the agent had enough context.
         """
+        if tool_name.startswith("activate_skill:"):
+            return min(base_limit, self._get_session_int(session, "activate_skill_repeat_limit", 2))
         if tool_name == "read_file" and self._is_coding_task(self._effective_coding_task_text(session)):
             return max(base_limit, self._get_session_int(session, "coding_read_file_limit", 32))
         return base_limit
@@ -1489,6 +1883,7 @@ class Agent:
                 "unless a new error or validation failure creates a specific new question. "
                 "Do not mention this notice to the user."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -1531,9 +1926,9 @@ class Agent:
         a one-word user reply such as "写入".  Treat that as explicit continuation of the concrete
         pending action instead of a brand-new ambiguous task.
         """
-        if not self._is_continue_request(latest_text):
+        if not self._is_continue_request(latest_text) and not self._is_file_generation_confirmation(latest_text):
             return ""
-        if len(latest_text.strip()) > 20:
+        if len(latest_text.strip()) > 30:
             return ""
 
         latest_user_index = -1
@@ -1542,7 +1937,7 @@ class Agent:
             if msg.role != MessageRole.USER:
                 continue
             content = str(msg.content or "").strip()
-            if content and not content.startswith("NOTICE:"):
+            if content and not self._is_internal_notice_message(msg):
                 latest_user_index = index
                 break
         if latest_user_index <= 0:
@@ -1554,26 +1949,68 @@ class Agent:
             content = str(msg.content or "").strip()
             if not content:
                 continue
+            if self._looks_like_internal_or_guardrail_assistant_text(content):
+                continue
             lowered = content.lower()
             promised_action = any(
                 marker in lowered
                 for marker in (
                     "下一轮", "回复", "你回复", "确认", "我就", "我会", "直接写入",
-                    "写入", "落到", "落地", "执行", "修改", "edit_file", "write_file",
+                    "写入", "落到", "落地", "执行", "修改", "生成", "导出", "创建",
+                    "跑脚本", "edit_file", "write_file", "send_file_to_user",
                 )
             )
-            target_hint = any(marker in lowered for marker in ("代码", "文件", "脚本", ".sh", ".py", "lock.sh", "实现", "修改"))
+            target_hint = any(
+                marker in lowered
+                for marker in (
+                    "代码", "文件", "脚本", ".sh", ".py", "lock.sh", "实现", "修改",
+                    "ppt", "pptx", "powerpoint", "slide", "slides", "deck", "幻灯片", "演示文稿",
+                    "pdf", "docx", "xlsx", "表格", "文档",
+                )
+            )
             if promised_action and target_hint:
                 return content
             break
         return ""
+
+    def _is_file_generation_confirmation(self, text: str) -> bool:
+        """Return True for short follow-ups like '生成 pptx' or '跑脚本出 pptx'."""
+        normalized = text.strip().lower()
+        if not normalized or len(normalized) > 30:
+            return False
+        action_markers = ("生成", "导出", "创建", "做", "跑脚本", "执行", "send", "export", "generate", "create")
+        target_markers = (
+            "ppt", "pptx", "powerpoint", "slide", "slides", "deck", "幻灯片", "演示文稿",
+            "pdf", "docx", "xlsx", "文件",
+        )
+        return any(marker in normalized for marker in action_markers) and any(
+            marker in normalized for marker in target_markers
+        )
+
+    def _is_artifact_continuation_signal(self, text: str) -> bool:
+        """Return True when text is a short workflow-control continuation.
+
+        These phrases are not user objectives.  Hermes/OpenClaw-style
+        controllers treat them as requests to resume durable state; if no state
+        exists, they should not create a fresh artifact contract from the phrase.
+        """
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        if not normalized or len(normalized) > 30:
+            return False
+        if self._is_continue_request(normalized):
+            return True
+        continuation_markers = (
+            "继续", "接着", "再来", "继续生成", "继续导出", "继续做", "继续制作",
+            "continue", "go on", "resume",
+        )
+        return any(marker in normalized for marker in continuation_markers) and self._is_file_generation_confirmation(normalized)
 
     def _latest_raw_external_user_text(self, session: Session) -> str:
         for msg in reversed(session.messages):
             if msg.role != MessageRole.USER:
                 continue
             content = str(msg.content or "").strip()
-            if content and not content.startswith("NOTICE:"):
+            if content and not self._is_internal_notice_message(msg):
                 return content
         return ""
 
@@ -1674,6 +2111,8 @@ class Agent:
         return False
 
     def _is_effective_implementation_request(self, session: Session) -> bool:
+        if self._infer_completion_contract(session) is not None:
+            return False
         return self._is_implementation_request(self._effective_coding_task_text(session))
 
     def _new_coding_task_status(self, task_text: str) -> dict[str, Any]:
@@ -1837,10 +2276,28 @@ class Agent:
         match = re.search(r"Command:\s*(.+)", content)
         if match:
             return match.group(1).strip()
+        match = re.search(r"OBSERVATION from terminal:\s*\nCommand:\s*(.+)", content)
+        if match:
+            return match.group(1).strip()
         match = re.search(r"指令:\s*`([^`]+)`", content)
         if match:
             return match.group(1).strip()
         return ""
+
+    def _terminal_observation_indicates_attempt(self, content: str) -> bool:
+        """Return True when a terminal observation reflects an admitted run.
+
+        Some tests and third-party tool adapters store a compact terminal
+        observation without echoing the original ``Command:`` header.  The
+        repeat budget should still be consumed when the adapter clearly reports
+        process output/status; otherwise a model can keep reissuing the same
+        side-effect command forever because the in-memory budget is lost across
+        channel-triggered turns.
+        """
+        normalized = str(content or "")
+        if "OBSERVATION from terminal:" in normalized:
+            return True
+        return bool(re.search(r"(?:^|\n)Exit code:\s*-?\d+", normalized))
 
     def _first_non_empty_line(self, content: str) -> str:
         for line in content.splitlines():
@@ -1982,6 +2439,13 @@ class Agent:
 
     def _tool_failure_repair_notice(self, *, tool_name: str, tool_content: str, session: Session) -> str:
         """Return a targeted self-correction notice for failed tools."""
+        if "Invalid JSON arguments" in tool_content:
+            return (
+                "The tool arguments were invalid JSON. Retry once with a strict JSON object matching that tool's schema; "
+                "escape newlines and quotes correctly. For large generated content, write a small helper script under "
+                "the task artifact directory first, then run or send the generated file. Do not switch tasks or repeat "
+                "the same malformed call. Do not mention this notice to the user."
+            )
         if tool_name == "terminal" and "拦截到非法路径访问" in tool_content:
             command = self._extract_terminal_command_from_observation(tool_content)
             action = primary_terminal_action(command)
@@ -1994,6 +2458,16 @@ class Agent:
                     "Do not mention this notice to the user."
                 )
         if tool_name == "terminal" and "approved=True" in tool_content and "检测到有副作用的指令" in tool_content:
+            contract = self._infer_completion_contract(session)
+            if contract is not None and contract.kind == "file_deliverable":
+                return (
+                    "Terminal artifact generation was blocked because approved=True was missing. The user already requested "
+                    "a concrete file deliverable, so do not ask for another confirmation and do not switch tasks. Retry at most "
+                    f"once with approved=True only for a bounded artifact-generation command under {contract.artifact_dir}/, "
+                    "or use write_file to create the helper/output under that same directory. After the file exists, call "
+                    "send_file_to_user. If blocked by a missing package or filesystem denial, state that concrete blocker. "
+                    "Do not mention this notice to the user."
+                )
             if self._is_effective_implementation_request(session):
                 return (
                     "Terminal mutation was blocked because approved=True was missing. For file changes, do not keep "
@@ -2006,9 +2480,32 @@ class Agent:
                 "authorized this exact action, retry once with approved=True; otherwise ask for approval. Do not repeat "
                 "near-identical terminal commands. Do not mention this notice to the user."
             )
+        if tool_name in {"write_file", "edit_file", "copy_file", "read_file"} and self._is_file_sandbox_error(tool_content):
+            return (
+                "File tool access was denied by the workspace sandbox. Do not retry ~/Desktop, ~/gen_*.py, "
+                "or /Users/<user>/... paths. For generated deliverables and helper scripts, use a path under "
+                "~/.pyclaw/artifacts/<task-name>/... or the current work_dir. After creating the deliverable, "
+                "call send_file_to_user with the generated file path. Do not repeat the same blocked path and "
+                "do not ask the user for another confirmation unless external credentials or missing content are required. "
+                "Do not mention this notice to the user."
+            )
         return (
             "The tool call failed. Analyze the error, then try a corrected parameter set or a different safer tool. "
             "Do not repeat near-identical failing calls; if blocked, state the concrete blocker to the user."
+        )
+
+    def _is_file_sandbox_error(self, tool_content: str) -> bool:
+        normalized = tool_content.lower()
+        return any(
+            marker in normalized
+            for marker in (
+                "access denied",
+                "outside the allowed workspace",
+                "outside allowed workspace",
+                "not in allowed workspace",
+                "非法路径",
+                "不在允许",
+            )
         )
 
     def _recent_tool_messages_since_latest_user(self, session: Session) -> list[Message]:
@@ -2018,7 +2515,7 @@ class Agent:
             if msg.role != MessageRole.USER:
                 continue
             content = str(msg.content or "").strip()
-            if content and not content.startswith("NOTICE:"):
+            if content and not self._is_internal_notice_message(msg):
                 latest_user_index = index
                 break
         return [msg for msg in session.messages[latest_user_index + 1:] if msg.role == MessageRole.TOOL]
@@ -2034,6 +2531,23 @@ class Agent:
         return failures >= 2
 
     async def _request_terminal_approval_failure_repair(self, session: Session) -> None:
+        contract = self._infer_completion_contract(session)
+        if contract is not None and contract.kind == "file_deliverable":
+            content = (
+                "NOTICE: Terminal artifact generation has repeatedly failed because approved=True was missing. "
+                "The active user task is a concrete file deliverable. Do not ask the user for another confirmation, "
+                "do not fall back to an outline, and do not switch to old context. Use write_file or one bounded "
+                f"approved terminal command under {contract.artifact_dir}/ to create/export the file, then call "
+                "send_file_to_user. If the only blocker is a missing dependency or denied path, state that exact blocker. "
+                "Do not mention this notice."
+            )
+        else:
+            content = (
+                "NOTICE: You have repeatedly failed terminal mutations because approved=True was missing. "
+                "Stop producing more terminal cp/ls variants. If the task is writing or editing a file, use edit_file/write_file/copy_file now. "
+                "If a terminal mutation is unavoidable and the latest user reply explicitly confirmed it, retry once with approved=True. "
+                "If neither is possible, final-answer with the exact blocker and say no file was changed. Do not mention this notice."
+            )
         reminder = Message(
             id=f"terminal-approval-repair-{int(datetime.now().timestamp())}-{session.session_id}",
             channel=session.channel,
@@ -2041,12 +2555,8 @@ class Agent:
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
-            content=(
-                "NOTICE: You have repeatedly failed terminal mutations because approved=True was missing. "
-                "Stop producing more terminal cp/ls variants. If the task is writing or editing a file, use edit_file/write_file/copy_file now. "
-                "If a terminal mutation is unavoidable and the latest user reply explicitly confirmed it, retry once with approved=True. "
-                "If neither is possible, final-answer with the exact blocker and say no file was changed. Do not mention this notice."
-            ),
+            content=content,
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2063,6 +2573,1720 @@ class Agent:
         # build for pure code review/explanation tasks.
         return self._is_implementation_request(task_text)
 
+    def _is_file_deliverable_request(self, text: str) -> bool:
+        """Return True when the user expects a concrete generated file."""
+        return self.completion_contracts.is_file_deliverable_request(text)
+
+    def _is_internal_notice_message(self, msg: Message) -> bool:
+        """Return True for controller-injected turns that must not become task context."""
+        metadata = getattr(msg, "metadata", {}) or {}
+        content = str(getattr(msg, "content", "") or "").strip()
+        return bool(isinstance(metadata, dict) and metadata.get("internal_notice")) or content.startswith("NOTICE:")
+
+    def _looks_like_internal_or_guardrail_assistant_text(self, content: str) -> bool:
+        """Detect assistant text that is a guardrail fallback, not a pending user deliverable."""
+        normalized = (content or "").strip().lower()
+        if not normalized:
+            return False
+        markers = (
+            "检测到副作用工具重复调用",
+            "达到最大思考深度",
+            "工具调用次数已达到上限",
+            "工具预算或时间预算已用完",
+            "未观察到目标文件已生成",
+            "任务未完成",
+            "已停止继续执行",
+            "避免重复触发",
+            "验证结果",
+            "稍后重试",
+            "暂时没法继续调工具",
+            "已生成并发送文件",
+            "tool usage must stop",
+            "completion contract failed",
+            "patch-first quality gate failed",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _looks_like_polluted_task_context(self, content: str) -> bool:
+        """Return True when text should never seed a new controller contract.
+
+        Completion contracts must bind to the user's real objective.  Prior
+        assistant fallback text, guardrail notices, and synthetic delivery
+        claims can mention the same file type (PPT/PDF/etc.); using that prose
+        as task context pollutes artifact paths and fingerprints.
+        """
+        normalized = (content or "").strip().lower()
+        if not normalized:
+            return False
+        markers = (
+            "notice:",
+            "检测到副作用工具重复调用",
+            "避免重复触发",
+            "达到最大思考深度",
+            "工具预算",
+            "工具调用次数已达到上限",
+            "已停止继续执行",
+            "未观察到目标文件",
+            "任务未完成",
+            "验证结果",
+            "代码已产生修改",
+            "稍后重试",
+            "暂时没法继续调工具",
+            "completion contract failed",
+            "file deliverable gate failed",
+            "patch-first quality gate failed",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _infer_completion_contract(self, session: Session) -> Optional[CompletionContract]:
+        """Infer the controller-level completion contract for the current turn."""
+        if self._completion_contracts_disabled_for_session(session):
+            self._clear_completion_contract_metadata(session)
+            return None
+        task_text = self._latest_external_user_text(session)
+        if self._completion_contract_completed_for_latest(session, task_text):
+            return None
+        existing = self._current_completion_contract_from_metadata(session, task_text)
+        if existing is not None:
+            return existing
+        pending_context = self._pending_action_context_for_short_confirmation(session, task_text)
+        if self._looks_like_polluted_task_context(pending_context):
+            pending_context = ""
+        contract_task = self._artifact_task_text_for_completion_contract(session, task_text, pending_context)
+        if (
+            self._is_artifact_continuation_signal(task_text)
+            and (not contract_task or self._is_artifact_continuation_signal(contract_task))
+            and not pending_context
+        ):
+            # A short continuation like ``继续生成 deck`` is only a control
+            # signal.  If no durable controller contract or previous real user
+            # objective can be recovered, do not promote the phrase itself into
+            # a new generic PPT/file task.  That is the failure mode that routed
+            # an explicit baoyu-design/RAG deck workflow to a fresh ``pptx``
+            # workspace named after the continuation text.
+            return None
+        latest_msg = self._latest_external_user_message(session)
+        latest_source_message_id = str(getattr(latest_msg, "id", "") or "")
+        source_message_id = latest_source_message_id
+        if self._is_continue_request(task_text) or self._is_file_generation_confirmation(task_text):
+            original_msg = self._previous_deliverable_user_message_before_latest(session)
+            if original_msg is not None:
+                source_message_id = str(getattr(original_msg, "id", "") or source_message_id)
+        # Continuations such as ``继续生成 deck`` must keep using the original
+        # user-message id as the artifact turn id.  Leaving this empty makes the
+        # workspace session-scoped; a later repair/summary reload can then drift
+        # into a fresh directory named after the continuation phrase and lose the
+        # original explicit-skill contract.
+        artifact_turn_id = source_message_id
+        artifact_dir = self._explicit_safe_artifact_dir_from_task(contract_task) or self.artifacts.task_dir(
+            session_id=str(getattr(session, "session_id", "")),
+            task_text=contract_task,
+            turn_id=artifact_turn_id,
+        )
+        is_short_artifact_confirmation = self._is_continue_request(task_text) or self._is_file_generation_confirmation(task_text)
+        inference_task_text = contract_task if is_short_artifact_confirmation and contract_task else task_text
+        inference_pending_context = "" if inference_task_text != task_text else pending_context
+        contract = self.completion_contracts.infer(
+            task_text=inference_task_text,
+            pending_context=inference_pending_context,
+            artifact_dir=artifact_dir,
+        )
+        if contract:
+            # The service may need assistant pending context to understand a
+            # short confirmation such as "生成 pptx".  That context is only an
+            # intent hint; it must not become the canonical contract text,
+            # fingerprint, artifact path, or acceptance spec.  Otherwise model
+            # progress prose like "12 页大纲" is promoted into a hard user
+            # requirement and clean files are rejected as incomplete.
+            fingerprint_text = contract_task
+            required_skills = self._required_skills_for_task(contract_task, session)
+            if not required_skills and contract.kind == "file_deliverable":
+                required_skills = self._default_required_skills_for_file_deliverable(contract_task)
+            contract = CompletionContract(
+                kind=contract.kind,
+                task_text=contract_task,
+                artifact_dir=os.path.abspath(os.path.expanduser(contract.artifact_dir)),
+                required_evidence=contract.required_evidence,
+                max_repair_attempts=contract.max_repair_attempts,
+                source_message_id=source_message_id,
+                task_fingerprint=self._task_fingerprint(fingerprint_text),
+                required_skills=required_skills,
+                created_at=contract.created_at,
+            )
+        if contract and isinstance(getattr(session, "metadata", None), dict):
+            self._store_incomplete_completion_contract(session, contract)
+        return contract
+
+    def _completion_contracts_disabled_for_session(self, session: Session) -> bool:
+        """Return True when controller artifact contracts are disabled.
+
+        Cron jobs run inside synthetic wrapper prompts and are delivered through
+        the scheduler's text delivery path, not the normal gateway
+        ``pending_files`` path.  Treating those wrapper prompts as normal user
+        artifact requests caused phrases like ``不要创建新任务`` + ``多页面读取``
+        to be misclassified as an HTML deliverable, producing a spurious
+        ``index.html`` and the confusing message ``已生成并发送文件：index.html``.
+
+        Keep this as an execution-context rule instead of a one-off keyword
+        patch: only real channel/user turns (or future cron runs explicitly
+        opting in to artifact delivery) may create completion contracts.
+        """
+        metadata = getattr(session, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            return False
+        if metadata.get("disable_completion_contracts"):
+            return True
+        if getattr(session, "channel", "") == "cron" and not metadata.get("allow_completion_contracts"):
+            return True
+        return False
+
+    def _clear_completion_contract_metadata(self, session: Session) -> None:
+        """Drop artifact-delivery controller state for contexts that disallow it."""
+        metadata = getattr(session, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            return
+        for key in (
+            "current_completion_contract",
+            "last_incomplete_completion_contract",
+            "last_explicit_skill_completion_contract",
+        ):
+            metadata.pop(key, None)
+
+    def _explicit_safe_artifact_dir_from_task(self, task_text: str) -> str:
+        """Return an explicitly requested artifact directory when it is safe.
+
+        Users may provide a concrete deliverable path, e.g.
+        ``~/.pyclaw/artifacts/foo/index.html``. Preserve that bounded workspace
+        instead of inventing a slug directory so repair, adoption and delivery
+        all look at the same place. Only configured artifact-root paths are
+        honored; arbitrary filesystem targets still use the normal task slug.
+        """
+        explicit_path = self._explicit_safe_artifact_file_from_task(task_text)
+        return os.path.dirname(explicit_path) if explicit_path else ""
+
+    def _explicit_safe_artifact_file_from_task(self, task_text: str) -> str:
+        text = (task_text or "").strip()
+        if not text:
+            return ""
+        matches = re.findall(
+            r"(?:(?:写到|保存到|输出到|放到|路径|path|file)\s*[:：]?\s*)?(`?[~/$A-Za-z0-9_./\-\u4e00-\u9fff]+\.(?:html?|pptx|pdf|docx|xlsx|md)`?)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        for raw in matches:
+            candidate = str(raw or "").strip().strip("`'\"，,。；;、)）]】")
+            if not candidate:
+                continue
+            normalized = os.path.abspath(os.path.expanduser(candidate))
+            if self._path_under_artifact_root(normalized):
+                return normalized
+        return ""
+
+    def _path_under_artifact_root(self, path: str) -> bool:
+        try:
+            root = Path(self.artifacts.root_path()).resolve(strict=False)
+            candidate = Path(path).resolve(strict=False)
+            candidate.relative_to(root)
+            return True
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def _completion_contract_completed_for_latest(self, session: Session, latest_task_text: str) -> bool:
+        """Return True when this same user message already passed deliverable finalization.
+
+        Finalization clears the active contract so coding gates and response
+        reconciliation do not keep treating an already-sent artifact as
+        unfinished.  Without this guard, a later call to ``_infer`` in the same
+        turn would recreate the exact same contract from the latest user text.
+        The source message id keeps this turn-local: a new user message with the
+        same text should still create a fresh contract.
+        """
+        if not isinstance(getattr(session, "metadata", None), dict):
+            return False
+        completed = session.metadata.get("completed_completion_contract")
+        if not isinstance(completed, dict):
+            return False
+        latest_msg = self._latest_external_user_message(session)
+        latest_id = str(getattr(latest_msg, "id", "") or "")
+        completed_source_id = str(completed.get("source_message_id") or "")
+        completed_fingerprint = str(completed.get("task_fingerprint") or "")
+
+        latest_fingerprint = self._task_fingerprint(latest_task_text)
+        if latest_id and latest_id == completed_source_id:
+            return bool(latest_fingerprint and latest_fingerprint == completed_fingerprint)
+
+        if self._is_continue_request(latest_task_text) or self._is_file_generation_confirmation(latest_task_text):
+            previous_msg = self._previous_deliverable_user_message_before_latest(session)
+            previous_id = str(getattr(previous_msg, "id", "") or "") if previous_msg is not None else ""
+            previous_text = str(getattr(previous_msg, "content", "") or "").strip() if previous_msg is not None else ""
+            previous_fingerprint = self._task_fingerprint(previous_text)
+            return bool(
+                previous_id
+                and previous_id == completed_source_id
+                and previous_fingerprint
+                and previous_fingerprint == completed_fingerprint
+            )
+
+        return False
+
+    def _artifact_task_text_for_completion_contract(
+        self,
+        session: Session,
+        task_text: str,
+        pending_context: str,
+    ) -> str:
+        """Return the clean user objective used only for artifact paths.
+
+        Pending assistant context can help infer that a short follow-up like
+        "生成 pptx" means a file deliverable, but it should not seed artifact
+        directories.  Long assistant outlines/progress reports produce polluted
+        paths and make later evidence matching fragile.  Anchor paths to the
+        latest real user request, or to the previous real user request for short
+        confirmations.
+        """
+        latest = (task_text or "").strip()
+        if latest and not (self._is_continue_request(latest) or self._is_file_generation_confirmation(latest)):
+            return latest
+        previous = self._previous_deliverable_user_text_before_latest(session)
+        if previous:
+            return previous
+        previous = self._previous_external_user_text_before_latest(session)
+        if previous:
+            return previous
+        if latest:
+            return latest
+        return pending_context or "artifact"
+
+    def _previous_external_user_text_before_latest(self, session: Session) -> str:
+        seen_latest = False
+        for msg in reversed(session.messages):
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if not content or self._is_internal_notice_message(msg):
+                continue
+            if not seen_latest:
+                seen_latest = True
+                continue
+            return content
+        return ""
+
+    def _previous_deliverable_user_text_before_latest(self, session: Session) -> str:
+        """Return the previous real deliverable objective, skipping confirmations.
+
+        A file workflow may span several chat turns (for example "做一个 RAG
+        PPT" -> "继续" -> "继续").  The artifact workspace must remain bound to
+        the original objective rather than to an intermediate confirmation word.
+        """
+        seen_latest = False
+        for msg in reversed(session.messages):
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if not content or self._is_internal_notice_message(msg):
+                continue
+            if not seen_latest:
+                seen_latest = True
+                continue
+            if self._is_continue_request(content) or (
+                self._is_file_generation_confirmation(content)
+                and not self.completion_contracts.is_file_deliverable_request(content)
+            ):
+                continue
+            normalized = content.lower()
+            if self.completion_contracts.is_file_deliverable_request(content) or any(
+                marker in normalized for marker in ("skill", "技能", "ppt", "pptx", "幻灯片", "演示文稿")
+            ):
+                return content
+        return ""
+
+    def _previous_deliverable_user_message_before_latest(self, session: Session) -> Optional[Message]:
+        """Return the previous real deliverable objective message, skipping confirmations."""
+        seen_latest = False
+        for msg in reversed(session.messages):
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if not content or self._is_internal_notice_message(msg):
+                continue
+            if not seen_latest:
+                seen_latest = True
+                continue
+            if self._is_continue_request(content) or (
+                self._is_file_generation_confirmation(content)
+                and not self.completion_contracts.is_file_deliverable_request(content)
+            ):
+                continue
+            normalized = content.lower()
+            if self.completion_contracts.is_file_deliverable_request(content) or any(
+                marker in normalized for marker in ("skill", "技能", "ppt", "pptx", "幻灯片", "演示文稿")
+            ):
+                return msg
+        return None
+
+    def _current_completion_contract_from_metadata(
+        self,
+        session: Session,
+        latest_task_text: str,
+    ) -> Optional[CompletionContract]:
+        """Return the active persisted contract when it belongs to this turn.
+
+        Contract repair messages are stored as internal user turns. If we always
+        re-infer from the latest message, those repair prompts can become the
+        new task and generate nonsense artifact directories. Reuse the original
+        contract while the latest real user message is either the same request or
+        a short confirmation of the pending file-generation action.
+        """
+        if not isinstance(getattr(session, "metadata", None), dict):
+            return None
+        latest = (latest_task_text or "").strip()
+        if not latest:
+            return None
+
+        candidate_keys = ["current_completion_contract", "last_incomplete_completion_contract"]
+        # For short continuations, prefer the last known unfinished controller
+        # contract over a freshly inferred lexical contract such as
+        # ``继续生成 deck``.  This mirrors Hermes/OpenClaw: continuation resumes
+        # controller state; it is not a new artifact objective.
+        if self._is_continue_request(latest) or self._is_file_generation_confirmation(latest):
+            candidate_keys = [
+                "last_explicit_skill_completion_contract",
+                "last_incomplete_completion_contract",
+                "current_completion_contract",
+            ]
+
+        for key in candidate_keys:
+            raw_contract = session.metadata.get(key)
+            if not isinstance(raw_contract, dict):
+                continue
+            contract = self._completion_contract_from_metadata_key(session, key, raw_contract, latest)
+            if contract is not None:
+                if key != "current_completion_contract":
+                    self._store_incomplete_completion_contract(session, contract)
+                return contract
+        return None
+
+    def _completion_contract_from_metadata_key(
+        self,
+        session: Session,
+        key: str,
+        raw_contract: dict[str, Any],
+        latest: str,
+    ) -> Optional[CompletionContract]:
+        contract = CompletionContract.from_metadata(raw_contract)
+        if contract is None:
+            return None
+        if self._is_polluted_completion_contract(contract):
+            session.metadata.pop(key, None)
+            return None
+
+        latest_msg = self._latest_external_user_message(session)
+        latest_id = str(getattr(latest_msg, "id", "") or "")
+        latest_fingerprint = self._task_fingerprint(latest)
+
+        if self._is_continue_request(latest) or self._is_file_generation_confirmation(latest):
+            if self._is_artifact_continuation_signal(contract.task_text):
+                # Never resume a contract whose *objective* is itself a short
+                # continuation phrase.  Such contracts are artifacts of older
+                # buggy turns; keeping them lets ``继续生成 deck`` permanently
+                # replace the real user objective.
+                session.metadata.pop(key, None)
+                if key == "current_completion_contract":
+                    current_last = session.metadata.get("last_incomplete_completion_contract")
+                    if current_last == raw_contract:
+                        session.metadata.pop("last_incomplete_completion_contract", None)
+                return None
+
+            if key == "last_explicit_skill_completion_contract" and contract.required_skills:
+                return self._normalized_completion_contract(contract)
+
+            previous_msg = self._previous_deliverable_user_message_before_latest(session)
+            previous_text = str(getattr(previous_msg, "content", "") or "").strip() if previous_msg is not None else ""
+            previous_fingerprint = self._task_fingerprint(previous_text)
+            if previous_fingerprint and previous_fingerprint != contract.task_fingerprint:
+                # A short continuation such as ``继续生成 deck`` is a control
+                # signal, not a new deliverable objective.  Older buggy runs
+                # could persist a lexical contract whose source_message_id and
+                # fingerprint both point at that continuation turn, which then
+                # permanently routes the workflow to a generic pptx skill and a
+                # workspace named ``继续生成_deck``.  Prefer the prior real
+                # deliverable objective and discard the continuation-shaped
+                # contract; the caller will re-infer from the original task.
+                session.metadata.pop(key, None)
+                if key == "current_completion_contract":
+                    current_last = session.metadata.get("last_incomplete_completion_contract")
+                    if current_last == raw_contract:
+                        session.metadata.pop("last_incomplete_completion_contract", None)
+                return None
+
+        if contract.source_message_id and latest_id and latest_id == contract.source_message_id:
+            if self._completion_contract_matches_latest_task(session, contract, latest, latest_fingerprint):
+                return self._normalized_completion_contract(contract)
+            session.metadata.pop(key, None)
+            return None
+
+        if self._is_continue_request(latest) or self._is_file_generation_confirmation(latest):
+            # Persisted completion contracts are unfinished controller-owned
+            # state.  A short continuation is a request to keep working on that
+            # state, not a new objective to hash against assistant progress or
+            # failure prose.  Requiring a matching pending_context here caused
+            # real failures to drop the original RAG/PPT contract and recreate
+            # a fresh workspace named like "继续_<session>".
+            return self._normalized_completion_contract(contract)
+
+        # A new external user message with the same text is still a new
+        # controller turn.  Do not reuse the previous contract just because its
+        # task fingerprint matches: that preserves the old created_at and
+        # artifact workspace, allowing stale PPTX/deck.html files to satisfy a
+        # fresh explicit-skill request.  Only the same source message id or a
+        # short continuation above may resume persisted state.
+        if (
+            (not contract.task_fingerprint and self._task_fingerprint(contract.task_text) == latest_fingerprint)
+            or (latest_fingerprint and latest_fingerprint == contract.task_fingerprint)
+        ):
+            session.metadata.pop(key, None)
+            return None
+
+        session.metadata.pop(key, None)
+        return None
+
+    def _store_incomplete_completion_contract(self, session: Session, contract: CompletionContract) -> None:
+        """Persist the active unfinished deliverable contract in both slots.
+
+        ``current_completion_contract`` drives the current turn.  The
+        ``last_incomplete_*`` snapshot survives summaries/reloads and lets a
+        later short continuation resume the original objective even if the model
+        or a previous buggy run polluted ``current_completion_contract``.
+        """
+        if not isinstance(getattr(session, "metadata", None), dict):
+            return
+        data = contract.to_metadata()
+        session.metadata["current_completion_contract"] = data
+        session.metadata["last_incomplete_completion_contract"] = data
+        if self._should_persist_explicit_skill_completion_contract(contract):
+            session.metadata["last_explicit_skill_completion_contract"] = data
+
+    def _should_persist_explicit_skill_completion_contract(self, contract: CompletionContract) -> bool:
+        """Return True for durable skill objectives that continuations may resume.
+
+        This is intentionally narrower than ``required_skills``: plain PPT tasks
+        may auto-route to the generic ``pptx`` adapter, but explicit workflows
+        such as ``baoyu-design`` must survive Feishu history compaction and bad
+        continuation turns.  Store the original objective, not a continuation
+        signal like ``继续生成 deck``.
+        """
+        if contract.kind != "file_deliverable" or not contract.required_skills:
+            return False
+        if self._is_artifact_continuation_signal(contract.task_text):
+            return False
+        normalized = (contract.task_text or "").lower()
+        if "skill" in normalized or "技能" in normalized:
+            return True
+        return any(skill and skill != "pptx" for skill in contract.required_skills)
+
+    def _completion_contract_matches_latest_task(
+        self,
+        session: Session,
+        contract: CompletionContract,
+        latest: str,
+        latest_fingerprint: str,
+    ) -> bool:
+        """Validate that a persisted contract still belongs to the latest user task.
+
+        Message IDs alone are not enough.  A stale contract can be rebound to a
+        new channel event when session metadata is persisted across turns.  The
+        controller must therefore require both identity and objective integrity:
+        either the latest user text fingerprints to the contract task, or the
+        latest text is a short continuation whose pending context fingerprints
+        to the contract task.  This is the same controller-owned contract
+        boundary used by Hermes/OpenClaw-style agents: never let old artifacts
+        satisfy a new user request just because both are file deliverables.
+        """
+        if latest_fingerprint and latest_fingerprint == contract.task_fingerprint:
+            return True
+        if not (self._is_continue_request(latest) or self._is_file_generation_confirmation(latest)):
+            return False
+        pending_context = self._pending_action_context_for_short_confirmation(session, latest)
+        if not pending_context:
+            return False
+        return self._task_fingerprint(pending_context) == contract.task_fingerprint
+
+    def _task_fingerprint(self, text: str) -> str:
+        """Stable fingerprint for binding controller contracts to the real user task."""
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
+
+    def _is_polluted_completion_contract(self, contract: CompletionContract) -> bool:
+        """Reject contracts whose task/path was polluted by internal guardrail text."""
+        combined = f"{contract.task_text}\n{contract.artifact_dir}".lower()
+        markers = (
+            "notice:",
+            "completion contract failed",
+            "patch-first quality gate failed",
+            "file deliverable gate failed",
+            "检测到副作用工具重复调用",
+            "避免重复触发",
+            "达到最大思考深度",
+            "工具预算",
+            "工具调用次数已达到上限",
+            "验证结果",
+            "未观察到目标文件",
+            "任务未完成",
+            "read_only_conversation_summary",
+        )
+        return any(marker in combined for marker in markers)
+
+    def _normalized_completion_contract(self, contract: CompletionContract) -> CompletionContract:
+        artifact_dir = os.path.abspath(os.path.expanduser(contract.artifact_dir))
+        if artifact_dir == contract.artifact_dir:
+            return contract
+        return CompletionContract(
+            kind=contract.kind,
+            task_text=contract.task_text,
+            artifact_dir=artifact_dir,
+            required_evidence=contract.required_evidence,
+            max_repair_attempts=contract.max_repair_attempts,
+            source_message_id=contract.source_message_id,
+            task_fingerprint=contract.task_fingerprint,
+            required_skills=contract.required_skills,
+            created_at=contract.created_at,
+        )
+
+    def _artifact_acceptance_for_contract(
+        self,
+        contract: Optional[CompletionContract],
+        pending_files: list[dict[str, Any]],
+    ) -> Optional[ArtifactAcceptanceResult]:
+        if contract is None or contract.kind != "file_deliverable":
+            return None
+        return self.deliverables.acceptance_for_contract(contract, pending_files)
+
+    def _completion_evidence(
+        self,
+        *,
+        contract: Optional[CompletionContract] = None,
+        pending_files: list[dict[str, Any]],
+        session: Optional[Session] = None,
+    ) -> CompletionEvidence:
+        return self.deliverables.evidence(contract=contract, pending_files=pending_files, session=session)
+
+    def _should_run_completion_contract_gate(
+        self,
+        *,
+        contract: Optional[CompletionContract],
+        draft: str,
+        pending_files: list[dict[str, Any]],
+        repair_attempts: int,
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+        session: Optional[Session] = None,
+    ) -> bool:
+        """Require observed evidence before finalizing deliverable tasks.
+
+        This is the generic Hermes/OpenClaw-style gate.  It is intentionally not
+        PPT-specific: any task with a completion contract must satisfy the
+        controller-observed evidence (for now pending file delivery) before the
+        model's final answer is trusted.
+        """
+        if contract is None:
+            return False
+        if self._can_controller_finalize_explicit_skill_deliverable(
+            session=session,
+            contract=contract,
+            draft=draft,
+            pending_files=pending_files,
+        ):
+            return False
+        decision = self.deliverables.should_repair(
+            contract=contract,
+            draft=draft,
+            pending_files=pending_files,
+            repair_attempts=repair_attempts,
+            is_final_iteration=is_final_iteration,
+            force_final_answer=force_final_answer,
+            soft_deadline_reached=soft_deadline_reached,
+            session=session,
+        )
+        return decision.needs_repair
+
+    def _can_controller_finalize_explicit_skill_deliverable(
+        self,
+        *,
+        session: Optional[Session],
+        contract: CompletionContract,
+        draft: str,
+        pending_files: list[dict[str, Any]],
+    ) -> bool:
+        """Return True when the controller can safely own final artifact recovery.
+
+        Hermes/OpenClaw-style controllers own verification, but they do not
+        fabricate proof that an explicitly requested skill was executed.  A
+        "走完整 skill" request must be satisfied by current-turn skill/tool
+        evidence or a reusable real-workflow manifest, never by controller
+        synthesis alone.
+        """
+        if session is None:
+            return False
+        if contract.kind != "file_deliverable" or not contract.required_skills:
+            return False
+        if self.deliverables.pending_files_block_skill_synthesis(contract, pending_files):
+            return False
+        if self._looks_like_concrete_external_blocker(draft):
+            return False
+        contexts = [
+            ctx for ctx in self.skill_contexts.active_contexts(session)
+            if self._skill_context_required_for_contract(ctx, contract)
+        ]
+        if not contexts:
+            return False
+        if any(self.deliverables.skill_evidence.is_html2pptx_workflow(ctx.root_skill_dir) for ctx in contexts):
+            return False
+        if not any(
+            self.deliverables.skill_evidence.is_deck_stage_workflow(ctx.root_skill_dir)
+            or self.deliverables.skill_evidence.is_webpage_coding_workflow(ctx.root_skill_dir)
+            for ctx in contexts
+        ):
+            return False
+        evidence = self.deliverables.skill_evidence.evaluate(session=session, contract=contract, pending_files=pending_files)
+        if evidence is None or not evidence.observed_paths:
+            return False
+        return not any("缺少关键说明文件读取证据" in str(reason) for reason in evidence.reasons)
+
+    def _controller_finalize_explicit_skill_deliverable_if_ready(
+        self,
+        *,
+        session: Session,
+        contract: Optional[CompletionContract],
+        content: str,
+        pending_files: list[dict[str, Any]],
+    ) -> str:
+        """Let the controller finish explicit skill artifacts at loop boundaries.
+
+        The live failure mode for channel file tasks is that the model keeps
+        issuing setup/probe side-effect commands (``mkdir``, ``ls``, helper
+        scaffolding) after the controller has already hydrated the required
+        skill docs.  Hermes/OpenClaw avoid this by making the controller own the
+        final workflow/export/verification boundary: once the explicit skill
+        evidence is present, a duplicate/probe boundary should finalize the
+        artifact instead of asking the model for another repair turn.
+        """
+        if contract is None:
+            return ""
+        if not self._can_controller_finalize_explicit_skill_deliverable(
+            session=session,
+            contract=contract,
+            draft=content,
+            pending_files=pending_files,
+        ):
+            return ""
+        before_count = len(pending_files)
+        before_contract = self._infer_completion_contract(session)
+        final_content = self._prepare_completion_contract_final_content(
+            session=session,
+            content=content,
+            pending_files=pending_files,
+        )
+        if len(pending_files) <= before_count and self._infer_completion_contract(session) is before_contract:
+            return ""
+        if self._infer_completion_contract(session) is not None:
+            return ""
+        return final_content
+
+    def _looks_like_concrete_external_blocker(self, draft: str) -> bool:
+        """Return True only for blockers the controller cannot safely solve itself."""
+        normalized = (draft or "").strip().lower()
+        if not normalized:
+            return False
+        blocker_markers = (
+            "需要登录", "无法登录", "没有权限", "权限不足", "需要凭证", "需要认证",
+            "missing credentials", "permission denied", "not authorized", "unauthorized",
+            "requires login", "cannot access", "external approval",
+        )
+        return any(marker in normalized for marker in blocker_markers)
+
+    async def _request_completion_contract_repair(
+        self,
+        session: Session,
+        contract: Optional[CompletionContract],
+        acceptance: Optional[ArtifactAcceptanceResult] = None,
+        skill_evidence: Any = None,
+    ) -> None:
+        if contract is None:
+            await self._request_file_deliverable_repair(session)
+            return
+        reminder = Message(
+            id=f"completion-contract-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=self._completion_contract_repair_notice(contract, acceptance, skill_evidence),
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    async def _ensure_skill_workflow_orchestration_notice(
+        self,
+        session: Session,
+        contract: Optional[CompletionContract],
+    ) -> None:
+        """Inject a controller-owned workflow state notice for skill deliverables.
+
+        Prompt context alone is not enough for long-running channel tasks: a
+        model can still jump directly to generic PPT generation, reuse a stale
+        file, or ask for another confirmation.  Hermes/OpenClaw-style agents
+        make the controller own the workflow state.  This turn-scoped notice is
+        that state machine: hydrate the skill, load its routed docs, create the
+        bounded workflow artifact, export the final file, verify, then deliver.
+        """
+        if contract is None or contract.kind != "file_deliverable" or not contract.required_skills:
+            return
+        if not isinstance(getattr(session, "metadata", None), dict):
+            session.metadata = {}
+
+        key = f"{contract.source_message_id}:{contract.task_fingerprint}:{','.join(contract.required_skills)}"
+        if session.metadata.get("skill_workflow_orchestration_notice_key") == key:
+            return
+
+        self.skill_workspace.ensure_required_contexts(session, contract)
+        contexts = [
+            ctx for ctx in self.skill_contexts.active_contexts(session)
+            if self._skill_context_required_for_contract(ctx, contract)
+        ]
+        if not contexts:
+            return
+
+        artifact_dir = os.path.abspath(os.path.expanduser(contract.artifact_dir))
+        workflow_steps = self._skill_workflow_steps_for_notice(contexts, contract, artifact_dir)
+        lines = [
+            "NOTICE: Skill deliverable workflow is active. This is controller-owned state, not a user request.",
+            f"original_user_task: {contract.task_text}",
+            f"bounded_artifact_dir: {artifact_dir}",
+            f"required_skills: {', '.join(contract.required_skills)}",
+            "workflow_state_machine:",
+            "1. Use read_file to load every routed required_skill_doc listed below. Directory probes such as terminal ls/find do not satisfy the skill workflow.",
+            *workflow_steps,
+            "required_skill_docs:",
+        ]
+        for ctx in contexts:
+            if not self._skill_context_required_for_contract(ctx, contract):
+                continue
+            requirement = self.deliverables.skill_evidence.infer_requirement(ctx, contract)
+            lines.append(f"- skill: {ctx.name}")
+            lines.append(f"  root_dir: {ctx.root_skill_dir}")
+            for rel_path in requirement.required_paths:
+                lines.append(f"  - {rel_path}")
+        lines.append("Do not mention this notice.")
+
+        notice = Message(
+            id=f"skill-workflow-orchestration-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="\n".join(lines),
+            metadata={
+                "internal_notice": True,
+                "skill_workflow_orchestration": True,
+                "source_message_id": contract.source_message_id,
+                "task_fingerprint": contract.task_fingerprint,
+            },
+        )
+        await self.sessions.save_message(session, notice)
+        session.metadata["skill_workflow_orchestration_notice_key"] = key
+
+    def _skill_workflow_steps_for_notice(
+        self,
+        contexts: list[Any],
+        contract: CompletionContract,
+        artifact_dir: str,
+    ) -> list[str]:
+        task = (contract.task_text or "").lower()
+        is_ppt = any(marker in task for marker in ("ppt", "pptx", "powerpoint", "slide", "slides", "deck", "幻灯片", "演示文稿"))
+        is_html = any(marker in task for marker in ("html", "网页", "页面", "教学网页", "可视化网页", "website", "web page", "webpage"))
+        if is_html and any(self.deliverables.skill_evidence.is_webpage_coding_workflow(ctx.root_skill_dir) for ctx in contexts):
+            return [
+                "2. Create or read bounded_artifact_dir/reference/brief.md. The brief must translate original_user_task into content outline, visual system, interactions, and acceptance checklist.",
+                "3. Follow the webpage-coding workflow to create bounded_artifact_dir/index.html as a self-contained polished webpage.",
+                "4. Use a premium visual system: gradient/glass/depth, responsive layout, cards, sticky navigation, SVG/canvas/Chart.js visuals, and vanilla-JS interactions where useful.",
+                "5. Verify index.html matches original_user_task and call send_file_to_user. Do not ask for another confirmation, return only an outline, or say '交给外部代码生成器了' without a file.",
+            ]
+        if is_ppt and any(self.deliverables.skill_evidence.is_deck_stage_workflow(ctx.root_skill_dir) for ctx in contexts):
+            return [
+                "2. Follow those skill instructions to create bounded_artifact_dir/deck.html for deck/PPT tasks. It must contain <deck-stage width=\"1920\" height=\"1080\"> and one <section data-label=\"...\"> per slide.",
+                "3. Export/create the final PPTX under bounded_artifact_dir. The content must match original_user_task, not old files or progress reports.",
+                "4. Verify the file exists and matches the requested topic/quality, then call send_file_to_user with the final PPTX.",
+                "5. Do not create process-report slides, empty filler slides, or generic fallback artifacts. Do not ask for another confirmation unless blocked by missing source content or credentials.",
+            ]
+        if is_ppt and any(self.deliverables.skill_evidence.is_html2pptx_workflow(ctx.root_skill_dir) for ctx in contexts):
+            return [
+                "2. For the pptx/html2pptx workflow, follow html2pptx.md exactly: design the deck, create HTML slides under bounded_artifact_dir, then convert them with scripts/html2pptx.js or an equivalent invocation of that library.",
+                "3. Export/create the final PPTX under bounded_artifact_dir. The content must match original_user_task, not old files, progress reports, or generic filler.",
+                "4. Generate/inspect thumbnails when available, verify the file exists and matches the requested topic/quality, then call send_file_to_user with the final PPTX.",
+                "5. Do not create deck-stage artifacts unless the active skill explicitly requires deck-stage. Do not ask for another confirmation unless blocked by missing source content or credentials.",
+            ]
+        return [
+            "2. Follow the active skill's own workflow to create the requested artifact under bounded_artifact_dir.",
+            "3. Verify the artifact exists and matches original_user_task, then call send_file_to_user with the final accepted file.",
+            "4. Do not create process reports, placeholders, stale files, or generic fallback artifacts. Do not ask for another confirmation unless blocked by missing source content or credentials.",
+        ]
+
+    async def _ensure_skill_workflow_hydration_observations(
+        self,
+        session: Session,
+        contract: Optional[CompletionContract],
+    ) -> None:
+        """Hydrate skill docs as controller-owned read_file observations.
+
+        The previous implementation only *told* the model to use a skill and
+        then rejected generic outputs at the end.  In channel/cron runs this is
+        too late: the model can spend the whole turn producing a generic PPT or
+        a progress report without ever loading the skill workflow.  Hermes and
+        OpenClaw avoid that class of failure by letting the controller own the
+        workflow state and preload the required capability contract.
+
+        For a skill-backed file-deliverable, PyClaw resolves the routed
+        skill docs and records them in the current turn as ``read_file`` tool
+        observations before the first LLM step.  This gives the model the real
+        skill instructions up front and gives the evidence gate current-turn
+        proof that the workflow was hydrated.  It is generic across markdown
+        skills; PPT/deck specificity lives in ``SkillEvidenceService`` routing.
+        """
+        if contract is None or contract.kind != "file_deliverable" or not contract.required_skills:
+            return
+        if not isinstance(getattr(session, "metadata", None), dict):
+            session.metadata = {}
+
+        self.skill_workspace.ensure_required_contexts(session, contract)
+        contexts = [
+            ctx for ctx in self.skill_contexts.active_contexts(session)
+            if self._skill_context_required_for_contract(ctx, contract)
+        ]
+        if not contexts:
+            return
+
+        key = f"{contract.source_message_id}:{contract.task_fingerprint}:{','.join(contract.required_skills)}"
+        if session.metadata.get("skill_workflow_hydration_key") == key and self._has_skill_workflow_hydration_observations(session, contract):
+            return
+
+        saved_any = False
+        for ctx in contexts:
+            requirement = self.deliverables.skill_evidence.infer_requirement(ctx, contract)
+            for rel_path, abs_path in self._skill_hydration_doc_paths(ctx, requirement.required_paths):
+                content = self._read_skill_hydration_file(abs_path)
+                if not content:
+                    continue
+                # Hydration observations are contract-scoped controller state,
+                # not global per-session file reads.  Earlier versions used
+                # only ``abs_path`` + ``session_id`` in the message id; when a
+                # Feishu/Telegram session asked for the same skill again, the
+                # second turn silently skipped saving SKILL.md because the old
+                # hydration message id already existed.  The evidence gate then
+                # saw user/tool reads for linked docs but no current SKILL.md
+                # proof and stopped with "skill 工作流验收" instead of letting
+                # the controller finish the deck.  Scope the id to the source
+                # message and task fingerprint so each explicit skill task gets
+                # its own durable hydration evidence while still deduping
+                # retries within that task.
+                digest = hashlib.sha256(
+                    f"{contract.source_message_id}\0{contract.task_fingerprint}\0{abs_path}".encode("utf-8")
+                ).hexdigest()[:16]
+                msg = Message(
+                    id=f"skill-hydration-{digest}-{session.session_id}",
+                    channel=session.channel,
+                    channel_user_id=session.user_id,
+                    session_id=session.session_id,
+                    type=MessageType.TEXT,
+                    role=MessageRole.TOOL,
+                    content=(
+                        "OBSERVATION from read_file:\n"
+                        f"File: {abs_path}\n"
+                        f"Skill: {ctx.name}\n"
+                        f"Required path: {rel_path}\n\n"
+                        f"{content}"
+                    ),
+                    metadata={
+                        "tool_call_id": f"skill-hydration-{digest}",
+                        "tool_name": "read_file",
+                        "controller_skill_hydration": True,
+                        "source_message_id": contract.source_message_id,
+                        "task_fingerprint": contract.task_fingerprint,
+                        "skill": ctx.name,
+                        "required_path": rel_path,
+                    },
+                )
+                if any(existing.id == msg.id for existing in session.messages):
+                    continue
+                await self.sessions.save_message(session, msg)
+                saved_any = True
+
+        if saved_any:
+            session.metadata["skill_workflow_hydration_key"] = key
+
+    def _has_skill_workflow_hydration_observations(self, session: Session, contract: CompletionContract) -> bool:
+        """Return True when the loaded turn actually contains hydration evidence.
+
+        Session metadata can survive history compaction/reload while the tool
+        observations that prove skill hydration are absent from the active
+        context.  In that case the controller must rehydrate instead of trusting
+        the stale key.
+        """
+        required = set(contract.required_skills)
+        if not required:
+            return False
+        observed: set[str] = set()
+        for msg in getattr(session, "messages", []) or []:
+            metadata = getattr(msg, "metadata", {}) or {}
+            if not isinstance(metadata, dict) or not metadata.get("controller_skill_hydration"):
+                continue
+            if str(metadata.get("source_message_id") or "") != contract.source_message_id:
+                continue
+            if str(metadata.get("task_fingerprint") or "") != contract.task_fingerprint:
+                continue
+            skill = str(metadata.get("skill") or "").strip()
+            if skill in required:
+                observed.add(skill)
+        return required.issubset(observed)
+
+    def _skill_hydration_doc_paths(self, ctx: Any, required_paths: tuple[str, ...]) -> list[tuple[str, str]]:
+        root = os.path.abspath(os.path.expanduser(str(getattr(ctx, "root_skill_dir", "") or "")))
+        if not root:
+            return []
+        paths: list[tuple[str, str]] = []
+        for rel_path in required_paths:
+            rel = str(rel_path or "").strip().replace("\\", "/")
+            if not rel:
+                continue
+            if "*" in rel:
+                base = rel.split("*", 1)[0].rstrip("/")
+                glob_root = os.path.join(root, base) if base else root
+                if not self._path_within_root(glob_root, root) or not os.path.isdir(glob_root):
+                    continue
+                pattern = os.path.basename(rel) or "*.md"
+                for path in sorted(Path(glob_root).glob(pattern))[:3]:
+                    if path.is_file() and self._path_within_root(str(path), root):
+                        display_rel = os.path.relpath(str(path), root).replace(os.sep, "/")
+                        paths.append((display_rel, os.path.abspath(str(path))))
+                continue
+            abs_path = os.path.abspath(os.path.join(root, rel))
+            if self._path_within_root(abs_path, root) and os.path.isfile(abs_path):
+                paths.append((rel, abs_path))
+        deduped: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for rel, path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            deduped.append((rel, path))
+        return deduped
+
+    def _read_skill_hydration_file(self, path: str, max_chars: int = 30000) -> str:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(max_chars + 1)
+        except OSError:
+            return ""
+        if len(content) > max_chars:
+            return content[:max_chars] + "\n\n... content truncated by controller skill hydration ..."
+        return content
+
+    def _path_within_root(self, path: str, root: str) -> bool:
+        try:
+            return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+        except ValueError:
+            return False
+
+    def _skill_context_required_for_contract(self, ctx: Any, contract: CompletionContract) -> bool:
+        required = {self._normalize_skill_name_for_lookup(item) for item in contract.required_skills}
+        if not required:
+            return True
+        aliases = {self._normalize_skill_name_for_lookup(alias) for alias in ctx.aliases()}
+        aliases.add(self._normalize_skill_name_for_lookup(getattr(ctx, "name", "")))
+        aliases.add(self._normalize_skill_name_for_lookup(getattr(ctx, "canonical_rel_path", "")))
+        return bool(aliases & required)
+
+
+    def _completion_contract_repair_notice(
+        self,
+        contract: CompletionContract,
+        acceptance: Optional[ArtifactAcceptanceResult] = None,
+        skill_evidence: Any = None,
+    ) -> str:
+        notice = self.deliverables.repair_notice(contract, acceptance, skill_evidence)
+        if contract.required_skills:
+            # The concrete prompt context is already injected in the session
+            # layer; keep this repair notice compact but unambiguous so the
+            # model does not satisfy the contract with a generic artifact.
+            notice += (
+                " The controller routed this deliverable through a required skill workflow. "
+                "Continue from the active skill context in the system prompt, load referenced skill files relative to its root_dir, "
+                "and do not use a generic artifact fallback or process-report slides as the final deliverable."
+            )
+        return notice
+
+    def _filter_pending_files_to_accepted(
+        self,
+        contract: CompletionContract,
+        pending_files: list[dict[str, Any]],
+    ) -> None:
+        """Keep only controller-accepted deliverable files for channel delivery."""
+        self.deliverables.filter_pending_files_to_accepted(contract, pending_files)
+
+    async def _request_duplicate_side_effect_delivery_repair(
+        self,
+        session: Session,
+        skipped_side_effect_calls: list[str],
+    ) -> None:
+        """Nudge deliverable tasks forward after skipping duplicate mutations.
+
+        For file deliverables, duplicate side-effect filtering must be a pure
+        guardrail: it should skip the duplicate command, but it must not convert
+        an unfinished artifact workflow into a final answer.  The controller's
+        completion contract will decide whether the task is done after the
+        non-duplicate calls finish.
+        """
+        reminder = Message(
+            id=f"duplicate-side-effect-delivery-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: Completion contract failed after duplicate side-effect calls were skipped internally: "
+                f"{', '.join(skipped_side_effect_calls)}. Continue the file-deliverable workflow using the "
+                "remaining tool observations. Do not repeat the skipped command. If a helper script or source file "
+                "was created, run it once, verify the output file exists, then call send_file_to_user. If blocked, "
+                "state the concrete blocker. Do not mention this notice."
+            ),
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    async def _request_deliverable_generation_plan_repair(
+        self,
+        session: Session,
+        contract: CompletionContract,
+    ) -> None:
+        """Nudge the model from environment checks to a real artifact command.
+
+        Hermes/OpenClaw-style loops do not treat repeated dependency probes as
+        progress.  When the controller sees a file deliverable but only setup or
+        version-check commands have run, ask for one concrete create/export
+        command before allowing fallback synthesis.
+        """
+        reminder = Message(
+            id=f"deliverable-generation-plan-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: The environment check is complete, but no generated deliverable file has been observed. "
+                f"Run one concrete create/export command now under {contract.artifact_dir}/ and print the output file path. "
+                "Do not call another package-version/import check. If writing code is easier, write the helper script under "
+                "the artifact directory, run it once, verify the file exists, then call send_file_to_user. Do not mention this notice."
+            ),
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _prepare_completion_contract_final_content(
+        self,
+        *,
+        session: Session,
+        content: str,
+        pending_files: list[dict[str, Any]],
+    ) -> str:
+        contract = self._infer_completion_contract(session)
+        if contract is None:
+            return content
+        evidence = self._completion_evidence(contract=contract, pending_files=pending_files, session=session)
+        if not contract.satisfied(evidence):
+            self.deliverables.recover_artifact_from_conversation(
+                contract=contract,
+                pending_files=pending_files,
+                session=session,
+            )
+            evidence = self._completion_evidence(contract=contract, pending_files=pending_files, session=session)
+        synthesis_quality = self._synthesis_quality_for_contract(session, contract, content)
+        finalization = self.deliverables.finalize(
+            contract=contract,
+            content=content,
+            pending_files=pending_files,
+            synthesis_quality=synthesis_quality,
+            force_repair_synthesis=(
+                self._should_synthesize_repair_artifact(contract, evidence)
+                and not contract.required_skills
+                and not self._is_explicit_skill_request(contract.task_text)
+            ),
+            allow_skill_synthesis=self._can_controller_finalize_explicit_skill_deliverable(
+                session=session,
+                contract=contract,
+                draft=content,
+                pending_files=pending_files,
+            ),
+            session=session,
+        )
+        pending_files[:] = [dict(item) for item in finalization.pending_files]
+        if contract.required_skills and pending_files:
+            self.skill_workspace.write_manifest(session=session, contract=contract, pending_files=pending_files)
+        final_evidence = self._completion_evidence(contract=contract, pending_files=pending_files, session=session)
+        if contract.satisfied(final_evidence):
+            self._clear_completion_contract(session, contract)
+        else:
+            # Keep unfinished controller-owned state durable.  Channel tasks may
+            # resume via a short follow-up such as ``继续`` or ``继续生成 deck``;
+            # that continuation must bind back to this original contract rather
+            # than being promoted to a fresh generic PPT task.
+            self._store_incomplete_completion_contract(session, contract)
+            self.deliverables.filter_pending_files_to_accepted(
+                contract,
+                pending_files,
+                final_evidence.skill_evidence,
+            )
+        return finalization.content
+
+    def _clear_completion_contract(self, session: Session, contract: CompletionContract) -> None:
+        """Clear a completed deliverable contract without deleting unrelated state."""
+        if not isinstance(getattr(session, "metadata", None), dict):
+            return
+        raw_contract = session.metadata.get("current_completion_contract")
+        current = CompletionContract.from_metadata(raw_contract) if isinstance(raw_contract, dict) else None
+        if current is None:
+            return
+        if current.task_fingerprint and contract.task_fingerprint and current.task_fingerprint != contract.task_fingerprint:
+            return
+        session.metadata["completed_completion_contract"] = {
+            "source_message_id": contract.source_message_id,
+            "task_fingerprint": contract.task_fingerprint,
+        }
+        session.metadata.pop("current_completion_contract", None)
+        session.metadata.pop("last_incomplete_completion_contract", None)
+        explicit = CompletionContract.from_metadata(session.metadata.get("last_explicit_skill_completion_contract", {}))
+        if explicit is not None and explicit.task_fingerprint == contract.task_fingerprint:
+            session.metadata.pop("last_explicit_skill_completion_contract", None)
+
+    def _should_synthesize_repair_artifact(
+        self,
+        contract: CompletionContract,
+        evidence: CompletionEvidence,
+    ) -> bool:
+        """Return True when controller fallback should replace a rejected artifact."""
+        return self.deliverables.should_synthesize_repair_artifact(contract, evidence)
+
+    def _completion_contract_success_content(
+        self,
+        *,
+        contract: CompletionContract,
+        content: str,
+        pending_files: list[dict[str, Any]],
+    ) -> str:
+        """Reconcile final prose with controller-observed deliverable evidence."""
+        return self.deliverables.success_content(
+            contract=contract,
+            content=content,
+            pending_files=pending_files,
+            acceptance=self._artifact_acceptance_for_contract(contract, pending_files),
+        )
+
+    def _file_deliverable_success_content(
+        self,
+        pending_files: list[dict[str, Any]],
+        *,
+        validation_summary: str = "",
+    ) -> str:
+        return self.deliverables.file_deliverable_success_content(
+            pending_files,
+            validation_summary=validation_summary,
+        )
+
+    def _synthesis_quality_for_contract(
+        self,
+        session: Session,
+        contract: CompletionContract,
+        draft: str,
+    ) -> SynthesisQuality:
+        """Decide whether controller fallback synthesis is safe enough.
+
+        Fallback synthesis is only acceptable when there is enough user-facing
+        source material to turn into a useful artifact.  A trace consisting of
+        failed JSON calls and dependency checks must not become a fake
+        "completed" PPTX.
+        """
+        if contract.kind != "file_deliverable":
+            return SynthesisQuality.DISABLED
+        if contract.required_skills or self._is_explicit_skill_request(contract.task_text):
+            # Skill-backed tasks use the controller-owned SkillWorkspaceService
+            # plus skill-aware finalization, not the generic fallback.
+            return SynthesisQuality.DISABLED
+        if self._is_html_deliverable_contract(contract) and self._task_has_rich_html_requirements(contract.task_text):
+            return SynthesisQuality.FULL
+        text = (draft or "").strip()
+        if not text:
+            return SynthesisQuality.DISABLED
+        if self._looks_like_internal_or_guardrail_assistant_text(text):
+            if self._is_basic_fallback_synthesis_safe(session=session, contract=contract, draft=""):
+                return SynthesisQuality.BASIC
+            return SynthesisQuality.DISABLED
+        if self._draft_has_rich_deliverable_material(text):
+            return SynthesisQuality.FULL
+
+        observations = self._current_turn_tool_observations(session)
+        if self._only_setup_or_dependency_checks(observations):
+            return SynthesisQuality.DISABLED
+        if self._is_basic_fallback_synthesis_safe(session=session, contract=contract, draft=text):
+            return SynthesisQuality.BASIC
+        return SynthesisQuality.DISABLED
+
+    def _is_basic_fallback_synthesis_safe(
+        self,
+        *,
+        session: Session,
+        contract: CompletionContract,
+        draft: str,
+    ) -> bool:
+        """Return True when a generic low-fidelity artifact is better than fake completion.
+
+        This is intentionally conservative.  It exists for simple user asks such
+        as "make a deck about X" when the model never manages to create the
+        file, while still avoiding the real failure from history: dependency
+        checks and guardrail text must not be converted into a fake polished PPT.
+        """
+        if contract.kind != "file_deliverable":
+            return False
+        if self._looks_like_internal_or_guardrail_assistant_text(draft):
+            return False
+        if self._current_turn_tool_observations(session) and not (
+            self._is_html_deliverable_contract(contract) and self._task_has_rich_html_requirements(contract.task_text)
+        ):
+            return False
+        normalized = (contract.task_text or "").lower()
+        if any(marker in normalized for marker in ("ppt", "pptx", "powerpoint", "slide", "deck", "幻灯片", "演示文稿", "html", "网页", "页面", "website", "webpage")):
+            return True
+        return False
+
+    def _is_html_deliverable_contract(self, contract: CompletionContract) -> bool:
+        normalized = (contract.task_text or "").lower()
+        return any(marker in normalized for marker in ("html", "网页", "页面", "教学网页", "可视化网页", "website", "webpage"))
+
+    def _task_has_rich_html_requirements(self, task_text: str) -> bool:
+        text = task_text or ""
+        normalized = text.lower()
+        numbered = len(re.findall(r"(?:^|\n)\s*(?:\d{1,2}[.、)]|[-*+]\s+)", text))
+        markers = ("【板块】", "板块", "交互", "动画", "chart.js", "tailwind", "单文件", "术语", "流程图")
+        marker_hits = sum(1 for marker in markers if marker in normalized)
+        return numbered >= 5 or marker_hits >= 3
+
+
+    def _required_skills_for_task(self, task_text: str, session: Optional[Session] = None) -> tuple[str, ...]:
+        """Infer explicit required markdown skill names from the user request.
+
+        This is intentionally generic.  Users can name skills as ``$foo``,
+        ``/foo``, ``foo skill``, ``foo 技能``, or natural-language phrases like
+        ``使用 foo 做 PPT``.  The controller resolves candidates through the
+        same markdown skill index used by ``activate_skill`` so nested bundles
+        and frontmatter names are handled consistently.
+        """
+        names: list[str] = []
+        for candidate, source in self._skill_name_candidate_sources_from_text(task_text):
+            if self._is_tool_or_delivery_skill_candidate(candidate):
+                continue
+            if self._is_implementation_stack_skill_candidate(candidate):
+                continue
+            # Natural-language prefixes such as ``用 X 完成`` are ambiguous:
+            # ``用 Tailwind utility class 完成`` describes an implementation
+            # stack, not a required PyClaw skill.  Hermes/OpenClaw-style
+            # routing only promotes such phrases to required skill workflows
+            # when they resolve to an installed markdown skill.  Explicit
+            # mentions (``$foo``, ``/foo``, ``foo skill``, ``foo 技能``) keep
+            # the unresolved fallback for externally-registered skills.
+            resolved = self._resolve_required_skill_name(candidate, allow_unresolved=(source != "prefix"))
+            if resolved:
+                names.append(resolved)
+
+        if not names and self._is_explicit_skill_request(task_text) and session is not None:
+            for ctx in self.skill_contexts.active_contexts(session):
+                names.append(ctx.name)
+
+        deduped: list[str] = []
+        for name in names:
+            clean = self._normalize_skill_name_for_lookup(name)
+            if clean and not self._is_tool_or_delivery_skill_candidate(clean) and clean not in deduped:
+                deduped.append(clean)
+        return tuple(deduped)
+
+    def _is_tool_or_delivery_skill_candidate(self, candidate: str) -> bool:
+        """Return True for tool names that must never become required skills."""
+        normalized = self._normalize_skill_name_for_lookup(candidate)
+        tool_names = {
+            "send-file-to-user",
+            "send-file",
+            "sendfiletouser",
+            "write-file",
+            "read-file",
+            "terminal",
+            "python-interpreter",
+            "web-search",
+            "web-read",
+            "web-extract",
+            "cronjob",
+            "activate-skill",
+        }
+        if normalized in tool_names:
+            return True
+        compact = normalized.replace("-", "")
+        return compact in {item.replace("-", "") for item in tool_names}
+
+    def _is_implementation_stack_skill_candidate(self, candidate: str) -> bool:
+        """Return True for technology-stack phrases that are not skills.
+
+        Users often say things like ``用 Tailwind utility class 完成`` or
+        ``with Chart.js`` to constrain the artifact implementation.  Those
+        phrases must remain artifact-verifier requirements, not be escalated
+        into fake required skill names such as ``tailwind-utility-class``.
+        """
+        normalized = self._normalize_skill_name_for_lookup(candidate)
+        compact = normalized.replace("-", "")
+        if not normalized:
+            return False
+        explicit_technology_terms = {
+            "tailwind", "tailwindcss", "utilityclass", "chart", "chartjs",
+            "css", "html", "cdn", "vanillajs", "javascript", "js",
+            "typescript", "ts", "react", "vue", "svelte", "nextjs",
+            "vite", "webpack", "python", "node", "canvas", "svg",
+        }
+        parts = {part for part in normalized.split("-") if part}
+        if compact in explicit_technology_terms or parts & explicit_technology_terms:
+            return True
+        return any(term in normalized for term in ("utility-class", "chart-js", "tailwind-css", "vanilla-js"))
+
+    def _default_required_skills_for_file_deliverable(self, task_text: str) -> tuple[str, ...]:
+        """Route common deliverable types to installed markdown skills.
+
+        Hermes/OpenClaw-style agents do not wait for the user to literally say
+        "use skill" for known artifact workflows.  The controller maps the
+        requested artifact type to a capability contract, then hydrates and
+        verifies that capability.  This keeps plain requests such as
+        "做一个 RAG PPT" on the same skill-backed path as explicit
+        "用 pptx skill 做 PPT" requests, without hard-coding the topic.
+        """
+        normalized = (task_text or "").lower()
+        candidate_groups: list[tuple[str, ...]] = []
+        if any(marker in normalized for marker in ("ppt", "pptx", "powerpoint", "slide deck", "slides", "deck", "幻灯片", "演示文稿")):
+            candidate_groups.append(("pptx", "presentation", "presentations"))
+        if any(marker in normalized for marker in ("docx", "word", "文档文件", "word 文档")):
+            candidate_groups.append(("docx", "documents"))
+        if any(marker in normalized for marker in ("pdf", "pdf文件", "pdf 文件")):
+            candidate_groups.append(("pdf",))
+        if any(marker in normalized for marker in ("xlsx", "excel", "表格文件", "电子表格")):
+            candidate_groups.append(("xlsx", "spreadsheet", "spreadsheets"))
+        if self._is_premium_webpage_skill_task(task_text):
+            candidate_groups.append(("webpage-coding",))
+
+        resolved: list[str] = []
+        for group in candidate_groups:
+            for candidate in group:
+                skill = self._resolve_required_skill_name(candidate, allow_unresolved=False)
+                if skill:
+                    resolved.append(skill)
+                    break
+
+        deduped: list[str] = []
+        for name in resolved:
+            clean = self._normalize_skill_name_for_lookup(name)
+            if clean and clean not in deduped:
+                deduped.append(clean)
+        return tuple(deduped)
+
+    def _is_premium_webpage_skill_task(self, task_text: str) -> bool:
+        raw = task_text or ""
+        normalized = raw.lower()
+        is_html = any(marker in normalized for marker in ("html", "网页", "页面", "教学网页", "可视化网页", "website", "web page", "webpage"))
+        premium = re.search(
+            r"精美|高级|漂亮|炫酷|高颜值|设计感|视觉效果|高质量.*(?:网页|页面)|(?:网页|页面).*高质量|polished\s*webpage|premium\s*webpage",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        return bool(is_html and premium)
+
+    def _skill_name_candidates_from_text(self, task_text: str) -> list[str]:
+        return [candidate for candidate, _ in self._skill_name_candidate_sources_from_text(task_text)]
+
+    def _skill_name_candidate_sources_from_text(self, task_text: str) -> list[tuple[str, str]]:
+        text = (task_text or "").strip()
+        if not text:
+            return []
+        candidates: list[tuple[str, str]] = []
+
+        # Explicit command-like mentions: $skill-name or /skill-name.
+        for match in re.finditer(r"(?:^|\s)([$/])([A-Za-z0-9][A-Za-z0-9_./-]{1,120})", text):
+            sigil = match.group(1)
+            candidate = match.group(2)
+            # Treat ``/foo`` as a command-style skill mention, but never turn
+            # absolute/relative file paths such as ``/tmp/out/index.html`` or
+            # ``~/.pyclaw/...`` into required skill names.  This was causing
+            # explicit artifact paths to be misclassified as fake skills.
+            if sigil == "/" and ("/" in candidate or "." in candidate):
+                continue
+            candidates.append((candidate, "explicit"))
+
+        normalized = text.lower().replace("_", "-")
+        # Direct English/Chinese suffixes: baoyu design skill, baoyu-design 技能.
+        for match in re.finditer(r"([a-z0-9][a-z0-9 ./_-]{1,120}?)\s*(?:[- ]?skill|技能)(?:\b|\s|$)", normalized):
+            candidates.append((self._clean_skill_candidate(match.group(1)), "explicit"))
+
+        # Natural-language prefixes.  Keep this bounded so the topic after
+        # ``做一个关于`` is not mistaken for a skill name.
+        prefix_pattern = r"(?:使用|用|按照|按|走完整的?|activate|use|using|with)\s+([a-z0-9][a-z0-9 ./_-]{1,80})"
+        for match in re.finditer(prefix_pattern, normalized):
+            raw = match.group(1)
+            raw = re.split(
+                r"\s+(?:做|制作|生成|创建|导出|完成|来|去|for|to|make|create|generate|export|build)\b",
+                raw,
+                maxsplit=1,
+            )[0]
+            candidates.append((self._clean_skill_candidate(raw), "prefix"))
+
+        return [(candidate, source) for candidate, source in candidates if candidate]
+
+    def _clean_skill_candidate(self, candidate: str) -> str:
+        candidate = (candidate or "").strip().strip("`'\".,，。:：()（）[]【】")
+        candidate = re.sub(r"(?:[- ]?skill|技能)\s*$", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\b(?:the|a|an|full|complete|完整|的)\b", " ", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s+", " ", candidate).strip(" -/_")
+        return candidate
+
+    def _resolve_required_skill_name(self, candidate: str, *, allow_unresolved: bool = True) -> str:
+        candidate = self._clean_skill_candidate(candidate)
+        if not candidate:
+            return ""
+        variants = [
+            candidate,
+            candidate.replace(" ", "-"),
+            candidate.replace("-", " "),
+            candidate.replace("/", os.sep),
+        ]
+        skills_dirs = self._markdown_skill_dirs_for_resolution()
+        for variant in dict.fromkeys(variants):
+            resolved = resolve_markdown_skill(variant, skills_dirs)
+            if resolved is None:
+                continue
+            return self._normalize_skill_name_for_lookup(resolved.frontmatter_name or resolved.rel_path)
+        if not allow_unresolved:
+            return ""
+        # Preserve the existing explicit-skill fallback for sessions where the
+        # skill was activated by another registry but is not discoverable on
+        # disk.  Do not invent names for generic words such as "use skill".
+        normalized = self._normalize_skill_name_for_lookup(candidate.replace(" ", "-"))
+        if self._is_tool_or_delivery_skill_candidate(normalized):
+            return ""
+        if normalized in {"use", "using", "with", "skill", "skills", "complete", "full", "the", "design"}:
+            return ""
+        return normalized if re.fullmatch(r"[a-z0-9][a-z0-9./-]{1,120}", normalized) else ""
+
+    def _markdown_skill_dirs_for_resolution(self) -> list[str] | None:
+        registry = getattr(self, "tools", None)
+        if not hasattr(registry, "skills_dirs"):
+            return None
+        raw_dirs = getattr(registry, "skills_dirs", None)
+        if raw_dirs is None:
+            return None
+        dirs: list[str] = []
+        for raw in raw_dirs:
+            try:
+                path = os.path.abspath(os.path.expanduser(str(raw)))
+            except (TypeError, ValueError):
+                continue
+            if path:
+                dirs.append(path)
+        # ToolRegistry historically left ``skills_dirs`` empty unless the
+        # caller passed explicit roots.  Markdown skill tools still discover
+        # ``~/.pyclaw/skills`` via ``_available_skills_dirs()``, so returning an
+        # empty list here split the controller from the skill tool: explicit
+        # requests such as "走完整的 baoyu design skill ..." could resolve only
+        # by fallback name inference while the system prompt/index claimed no
+        # skills existed.  Hermes/OpenClaw keep capability discovery in one
+        # place; mirror that by falling back to the shared resolver roots when
+        # the registry has no configured roots.
+        return dirs or None
+
+    def _normalize_skill_name_for_lookup(self, name: str) -> str:
+        clean = str(name or "").strip().strip("/ ").lower().replace("_", "-")
+        clean = re.sub(r"\s+", "-", clean)
+        return clean
+
+    def _is_explicit_skill_request(self, text: str) -> bool:
+        """Return True when the user explicitly required a skill workflow."""
+        normalized = (text or "").lower()
+        if not normalized:
+            return False
+        if "skill" in normalized:
+            return True
+        skill_markers = ("技能", "activate_skill", "baoyu-design", "baoyu design")
+        workflow_markers = ("走完整", "使用", "用", "按照", "按")
+        return any(marker in normalized for marker in skill_markers) and any(marker in normalized for marker in workflow_markers) and any(
+            target in normalized for target in ("ppt", "pptx", "幻灯片", "演示文稿", "deck", "slides")
+        )
+
+    def _draft_has_rich_deliverable_material(self, text: str) -> bool:
+        """Return True when draft has enough structured content for fallback artifact synthesis."""
+        if not text:
+            return False
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        headings = sum(1 for line in lines if re.match(r"^#{1,4}\s+", line))
+        bullets = sum(1 for line in lines if re.match(r"^(?:[-*+]|\d+[.)]|[一二三四五六七八九十]+[、.])\s+", line))
+        cjk_or_words = len(re.findall(r"[\u4e00-\u9fff]|\b\w+\b", text))
+        return (headings >= 2 and bullets >= 5) or bullets >= 8 or cjk_or_words >= 260
+
+    def _current_turn_tool_observations(self, session: Session) -> list[str]:
+        latest_user_index = -1
+        for index in range(len(session.messages) - 1, -1, -1):
+            msg = session.messages[index]
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if content and not self._is_internal_notice_message(msg):
+                latest_user_index = index
+                break
+        recent_messages = session.messages[latest_user_index + 1:] if latest_user_index >= 0 else session.messages
+        return [str(msg.content or "") for msg in recent_messages if msg.role == MessageRole.TOOL]
+
+    def _only_setup_or_dependency_checks(self, observations: list[str]) -> bool:
+        if not observations:
+            return False
+        useful = [obs for obs in observations if obs.strip()]
+        if not useful:
+            return False
+        return all(self._looks_like_setup_or_dependency_observation(obs) for obs in useful)
+
+    def _looks_like_setup_or_dependency_observation(self, observation: str) -> bool:
+        normalized = (observation or "").lower()
+        if not normalized:
+            return False
+        if any(ext in normalized for ext in (".pptx", ".pdf", ".docx", ".xlsx")):
+            return False
+        setup_markers = (
+            "invalid json arguments",
+            "python 解释器安全拦截",
+            "import pptx",
+            "pptx ok",
+            "print(pptx.__version__)",
+            "mkdir -p",
+            "exit code: 0",
+        )
+        return any(marker in normalized for marker in setup_markers)
+
+    def _collect_deliverable_artifact_from_tool_result(
+        self,
+        *,
+        session: Session,
+        tool_result: dict[str, Any],
+        pending_files: list[dict[str, Any]],
+    ) -> None:
+        """Collect controller-visible file evidence from successful tool output.
+
+        Some tools create files without using ``send_file_to_user``.  For a
+        concrete file-deliverable task, the controller can still complete the
+        channel delivery by adding the observed file to ``pending_files``.
+        """
+        if not tool_result.get("success"):
+            return
+        contract = self._infer_completion_contract(session)
+        if contract is None or contract.kind != "file_deliverable":
+            return
+        delivered_file = self._artifact_file_from_tool_result_content(
+            str(tool_result.get("content", "")),
+            roots=self._trusted_artifact_roots_for_contract(contract),
+            extensions=self._deliverable_extensions_for_contract(contract),
+        )
+        if delivered_file and not self._pending_file_exists(pending_files, delivered_file):
+            pending_files.append({
+                "file_path": delivered_file,
+                "description": self._file_deliverable_description(delivered_file),
+            })
+
+    def _should_run_file_deliverable_gate(
+        self,
+        *,
+        session: Session,
+        draft: str,
+        pending_files: list[dict[str, Any]],
+        already_repaired: bool,
+        is_final_iteration: bool,
+        force_final_answer: bool,
+        soft_deadline_reached: bool,
+    ) -> bool:
+        """Prevent file-generation requests from ending as outline/script only.
+
+        This is a generic deliverable gate, not PPT-specific: if the user asked
+        for a concrete file and no file has been queued for delivery, one repair
+        turn is required unless we are already forced to stop.
+        """
+        del already_repaired
+        contract = self._infer_completion_contract(session)
+        return self._should_run_completion_contract_gate(
+            contract=contract,
+            draft=draft,
+            pending_files=pending_files,
+            repair_attempts=0,
+            is_final_iteration=is_final_iteration,
+            force_final_answer=force_final_answer,
+            soft_deadline_reached=soft_deadline_reached,
+            session=session,
+        )
+
+    def _is_incomplete_file_deliverable_final(self, draft: str) -> bool:
+        if not draft:
+            return True
+        normalized = draft.lower()
+        incomplete_markers = (
+            "你可以说", "下一轮", "回复", "告诉我", "我再", "稍后", "等下一轮",
+            "生成 pptx", "跑脚本", "一键生成脚本", "保存为", "复制下面", "把下面这段存成",
+            "尚未实际写出", "未实际写出", "待下一轮落地", "本轮尚未", "继续生成",
+            "暂时没法", "无法继续调工具", "没能顺利落地", "未能顺利落地", "没落地",
+            "未能生成", "没能生成", "任务未完成", "未通过交付验收", "不发送", "残缺文件",
+            "未达到", "少于要求", "later", "next turn", "say generate",
+        )
+        if any(marker in normalized for marker in incomplete_markers):
+            return True
+        completion_markers = (
+            "send_file_to_user", "pending_files", "已发送", "文件已发送", "已生成并发送",
+            ".pptx 已", ".pdf 已", ".docx 已", ".xlsx 已",
+        )
+        if any(marker in normalized for marker in completion_markers):
+            return False
+        deliverable_words = ("ppt", "pptx", "powerpoint", "幻灯片", "演示文稿", "pdf", "docx", "xlsx")
+        outline_words = ("大纲", "方案", "文案", "脚本", "markdown", "outline")
+        return any(marker in normalized for marker in deliverable_words) and any(
+            marker in normalized for marker in outline_words
+        )
+
+    async def _request_file_deliverable_repair(self, session: Session) -> None:
+        reminder = Message(
+            id=f"file-deliverable-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "NOTICE: File deliverable gate failed. The user asked for a concrete generated file, "
+                "but the draft only provided an outline/script or asked for another confirmation. "
+                "Do not ask the user to say 'generate' or 'run script'. Create/export the file now under "
+                "~/.pyclaw/artifacts/<task-name>/ using write_file/terminal/python as appropriate, then call "
+                "send_file_to_user with the generated file. If a helper script is needed, write that script under "
+                "the same artifact directory, not ~/ or Desktop. Only ask the user if required source content or "
+                "external credentials are missing. Do not mention this notice."
+            ),
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
     def _should_run_patch_first_gate(
         self,
         *,
@@ -2077,6 +4301,8 @@ class Agent:
         if already_repaired or is_final_iteration or force_final_answer or soft_deadline_reached:
             return False
         if session.channel == "cron":
+            return False
+        if self._is_file_deliverable_request(task_text):
             return False
         if not self._is_implementation_request(task_text):
             return False
@@ -2097,6 +4323,7 @@ class Agent:
                 "then edit files with edit_file or write_file. If you truly cannot edit, state the concrete blocker. "
                 "Do not mention this notice to the user."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2136,6 +4363,7 @@ class Agent:
                 "project build, compile, lint). If validation cannot be run, explain the concrete reason in the final answer. "
                 "Do not mention this notice to the user."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2171,6 +4399,48 @@ class Agent:
             return False
         return self._task_needs_build_attempt(task_text)
 
+    def _controller_final_content_from_observed_progress(
+        self,
+        *,
+        session: Session,
+        fallback_content: str,
+        pending_files: list[dict[str, Any]],
+        changed_files: set[str],
+        validation_results: list[str],
+        build_results: list[str],
+        coding_task_status: dict[str, Any],
+    ) -> str:
+        """Return controller-owned final text when evidence already proves progress.
+
+        Hermes/OpenClaw-style controllers do not let a final LLM timeout or a
+        contradictory prose draft override concrete tool evidence.  If a
+        deliverable has already passed the controller contract, or a coding turn
+        has already produced edits/validation, synthesize the final response
+        from the ledger instead of asking the model for one more sentence.
+        """
+        contract = self._infer_completion_contract(session)
+        if contract is not None:
+            content = self._prepare_completion_contract_final_content(
+                session=session,
+                content=fallback_content,
+                pending_files=pending_files,
+            )
+            if self._infer_completion_contract(session) is None:
+                return content
+            return ""
+
+        if changed_files or validation_results or build_results:
+            content = fallback_content or "已完成本轮操作。"
+            return self._prepare_coding_final_content(
+                session=session,
+                content=content,
+                changed_files=changed_files,
+                validation_results=validation_results,
+                build_results=build_results,
+                coding_task_status=coding_task_status,
+            )
+        return ""
+
     async def _request_build_repair(self, session: Session) -> None:
         reminder = Message(
             id=f"build-repair-{int(datetime.now().timestamp())}-{session.session_id}",
@@ -2187,6 +4457,7 @@ class Agent:
                 "If no build target exists or the sandbox blocks it, say that concrete reason in the final answer. "
                 "Do not mention this notice to the user."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2448,18 +4719,23 @@ class Agent:
             return False
         return any(str(spec.get("name", "")) == tool_name for spec in specs or [])
 
-    def _latest_external_user_text(self, session: Session) -> str:
-        """Return the latest real user request, ignoring internal NOTICE turns."""
+    def _latest_external_user_message(self, session: Session) -> Optional[Message]:
+        """Return the latest real user message, ignoring controller-injected turns."""
         for msg in reversed(session.messages):
             if msg.role != MessageRole.USER:
                 continue
             content = str(msg.content or "").strip()
             if not content:
                 continue
-            if content.startswith("NOTICE:"):
+            if self._is_internal_notice_message(msg):
                 continue
-            return content
-        return ""
+            return msg
+        return None
+
+    def _latest_external_user_text(self, session: Session) -> str:
+        """Return the latest real user request, ignoring internal NOTICE turns."""
+        msg = self._latest_external_user_message(session)
+        return str(msg.content or "").strip() if msg is not None else ""
 
     def _requires_source_extraction(self, text: str) -> bool:
         """Heuristic for tasks where search-only synthesis is not enough."""
@@ -2492,6 +4768,7 @@ class Agent:
                 "rather than another web_search unless no URL is available. Then synthesize "
                 "the final answer. Do not mention this notice to the user."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2561,6 +4838,7 @@ class Agent:
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=notice,
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2616,6 +4894,7 @@ class Agent:
                 "Do not mention tool limits, execution time limits, budgets, guardrails, or internal errors. "
                 "If the available information is incomplete, say what is confirmed so far and mark uncertain details as pending confirmation."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, final_request)
 
@@ -2654,6 +4933,7 @@ class Agent:
                 "Otherwise, produce the final answer immediately from existing observations. "
                 "Do not mention tool limits, execution time limits, budgets, guardrails, or internal errors in the final user-facing answer."
             ),
+            metadata={"internal_notice": True},
         )
         await self.sessions.save_message(session, final_request)
 
@@ -2798,6 +5078,16 @@ class Agent:
     ) -> list[dict[str, Any]]:
         """Apply centralized execution approval policy to generated tool calls."""
         latest_user_text = self._latest_external_user_text(session)
+        completion_contract = self._infer_completion_contract(session)
+        artifact_roots: tuple[str, ...] = ()
+        allow_artifact_side_effects = False
+        if completion_contract and completion_contract.kind == "file_deliverable":
+            allow_artifact_side_effects = True
+            artifact_roots = (
+                completion_contract.artifact_dir,
+                self.artifacts.root,
+                self.artifacts.root_path(),
+            )
         updated_calls, decisions = self.exec_approval.approve_tool_calls(
             tool_calls,
             latest_user_text=latest_user_text,
@@ -2805,6 +5095,8 @@ class Agent:
             channel=str(getattr(session, "channel", "")),
             session_id=str(getattr(session, "session_id", "")),
             is_cron=getattr(session, "channel", "") == "cron",
+            allow_artifact_side_effects=allow_artifact_side_effects,
+            artifact_roots=artifact_roots,
         )
         if decisions:
             metadata = getattr(session, "metadata", None)
@@ -2909,6 +5201,8 @@ class Agent:
     def _terminal_side_effect_call_key(self, arguments: Any) -> Optional[str]:
         """Return a repeat key for terminal calls, or None for safe reads."""
         command = self._extract_terminal_command(arguments)
+        if self._looks_like_artifact_setup_check(command):
+            return None
         exec_key = self.exec_approval.side_effect_key("terminal", arguments, cwd=self.work_dir)
         if exec_key:
             return exec_key
@@ -2925,6 +5219,23 @@ class Agent:
         normalized_command = " ".join(command.split())
         digest = hashlib.sha256(normalized_command.encode("utf-8")).hexdigest()[:12]
         return f"terminal:{digest}"
+
+    def _looks_like_artifact_setup_check(self, command: str) -> bool:
+        """Return True for bounded setup/dependency probes during artifact generation."""
+        if not command:
+            return False
+        lowered = command.lower()
+        if "mkdir -p" not in lowered:
+            return False
+        if not any(marker in lowered for marker in ("import pptx", "__version__", "pip show", "python3 -c", "python -c")):
+            return False
+        # A setup check must not itself name a final deliverable or redirect to
+        # a real file.  This keeps actual generators/write commands counted as
+        # side effects, while avoiding loops where version probes exhaust the
+        # mutation budget before creation starts.
+        if re.search(r"\.(pptx|pdf|docx|xlsx|csv|zip|png|jpg|jpeg)\b", lowered):
+            return False
+        return True
 
     def _terminal_mutation_target_key(self, command: str) -> str:
         """Return a semantic repeat key for common terminal file mutations.
@@ -2954,22 +5265,37 @@ class Agent:
         elif head in {"mkdir", "touch"} and len(parts) >= 2:
             payload = {"action": head, "target": parts[-1]}
         else:
-            redirect_match = re.search(r">>?", command)
-            if not redirect_match:
+            redirect_target = self._terminal_file_redirect_target(command)
+            if not redirect_target:
                 return ""
-            tail = command[redirect_match.end():].strip()
-            try:
-                tail_parts = shlex.split(tail)
-            except ValueError:
-                return ""
-            if not tail_parts:
-                return ""
-            payload = {"action": "redirect", "target": tail_parts[0]}
+            payload = {"action": "redirect", "target": redirect_target}
 
         digest = hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:12]
         return f"terminal:mutation:{payload['action']}:{payload.get('target', '<unknown>')}:{digest}"
+
+    def _terminal_file_redirect_target(self, command: str) -> str:
+        """Return the first real file redirection target in a shell command.
+
+        Shell snippets often include diagnostic redirections such as ``2>&1`` or
+        ``2>/dev/null``.  Those do not write a user artifact and should not be
+        used as mutation repeat keys; otherwise unrelated commands that merely
+        capture stderr all collide as ``redirect:&1`` and the agent stops before
+        running the next real step.
+        """
+        if not command:
+            return ""
+        redirect_pattern = re.compile(r"(?P<fd>\d*)>>?\s*(?P<target>&\d+|[^\s|;&]+)")
+        for match in redirect_pattern.finditer(command):
+            target = match.group("target").strip().strip("'\"")
+            if not target or target.startswith("&"):
+                continue
+            expanded_target = os.path.expandvars(os.path.expanduser(target))
+            if expanded_target in {"/dev/null", os.devnull}:
+                continue
+            return target
+        return ""
 
     def _side_effect_call_limit(
         self,
@@ -2989,12 +5315,34 @@ class Agent:
         """Return True when a side-effect attempt should consume repeat budget even on failure."""
         if side_effect_key.startswith("terminal:mac_desktop_control:"):
             return True
+        if self._is_artifact_scaffold_side_effect_key(side_effect_key):
+            return False
         # Capture-style desktop actions are one-shot interactions with external
         # devices (screen/camera/recorder).  Even a failed attempt can prompt for
         # permissions, touch the camera, or partially create an artifact.  Count
         # the admitted attempt before execution so missing-approval/path/runtime
         # failures cannot spin through many command variants.
         return side_effect_key in self.CAPTURE_SIDE_EFFECT_KEYS
+
+    def _is_artifact_scaffold_side_effect_key(self, side_effect_key: str) -> bool:
+        """Return True for bounded helper-file writes used during artifact generation."""
+        if not side_effect_key.startswith("write_file:"):
+            return False
+        artifact_root = os.path.abspath(os.path.expanduser(self._safe_call_artifact_root_path()))
+        if not artifact_root:
+            return False
+        try:
+            _, rest = side_effect_key.split(":", 1)
+            raw_path, _digest = rest.rsplit(":", 1)
+        except ValueError:
+            return False
+        path = os.path.abspath(os.path.expanduser(raw_path))
+        try:
+            if os.path.commonpath([path, artifact_root]) != artifact_root:
+                return False
+        except ValueError:
+            return False
+        return path.lower().endswith((".py", ".sh", ".js", ".ts", ".md", ".txt", ".json"))
 
     def _capture_artifact_from_tool_result(self, side_effect_key: str, tool_result: dict[str, Any]) -> Optional[dict[str, str]]:
         """Build pending-file metadata from a successful capture terminal result.
@@ -3068,7 +5416,64 @@ class Agent:
         return "已完成，文件已发送。"
 
     def _pending_file_exists(self, pending_files: list[dict[str, Any]], file_path: str) -> bool:
-        return any(os.path.abspath(os.path.expanduser(str(item.get("file_path", "")))) == file_path for item in pending_files)
+        normalized = os.path.abspath(os.path.expanduser(str(file_path)))
+        return any(os.path.abspath(os.path.expanduser(str(item.get("file_path", "")))) == normalized for item in pending_files)
+
+    def _dedupe_pending_files(self, pending_files: list[dict[str, Any]]) -> None:
+        """Normalize and deduplicate queued file deliveries in-place.
+
+        Tool evidence can be discovered by several controller paths (explicit
+        send_file_to_user metadata, stdout path extraction, capture extraction).
+        The gateway sends every item in ``pending_files``, so this list must be a
+        controller-level set by normalized file path rather than a raw append log.
+        """
+        by_path: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for item in pending_files:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("file_path", "")).strip()
+            if not raw_path:
+                continue
+            normalized = os.path.abspath(os.path.expanduser(raw_path))
+            normalized_item = dict(item)
+            normalized_item["file_path"] = normalized
+            description = str(normalized_item.get("description", "")).strip()
+            if not description:
+                normalized_item["description"] = self._file_deliverable_description(normalized)
+            if normalized not in by_path:
+                by_path[normalized] = normalized_item
+                order.append(normalized)
+                continue
+            old_description = str(by_path[normalized].get("description", ""))
+            new_description = str(normalized_item.get("description", ""))
+            if len(new_description) > len(old_description):
+                by_path[normalized]["description"] = new_description
+        pending_files[:] = [by_path[path] for path in order]
+
+    def _terminal_one_shot_batch_limit(self, session: Session, tool_calls: list[dict[str, Any]]) -> int:
+        """Limit a one-shot desktop capture/control batch to one terminal call.
+
+        Hermes/OpenClaw-style controllers treat screenshot/photo/recording as a
+        single action with controller-observed artifact evidence.  If the model
+        emits several terminal variants in one batch, execute one and let the
+        evidence gate decide whether a repair is needed instead of producing
+        seven screenshots/photos.
+        """
+        del session
+        semantic_keys: list[str] = []
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            if str(function.get("name", "")) != "terminal":
+                continue
+            side_effect_key = self._side_effect_call_key(
+                "terminal",
+                function.get("arguments", ""),
+                session=None,
+            )
+            if side_effect_key in self.CAPTURE_SIDE_EFFECT_KEYS:
+                semantic_keys.append(side_effect_key)
+        return 1 if semantic_keys else 0
 
     def _semantic_terminal_repeat_limit(
         self,
@@ -3124,6 +5529,147 @@ class Agent:
         semantic_kind = self._terminal_command_semantic_kind(json.dumps({"command": command}))
         return semantic_kind not in {"navigation", "validation"}
 
+    def _artifact_file_from_terminal_result(self, content: str, *, artifact_dir: str) -> str:
+        """Extract a generated deliverable path from terminal output under one root.
+
+        Kept for compatibility with existing tests/callers.  New controller
+        paths use ``_artifact_file_from_tool_result_content`` so artifacts
+        produced by non-terminal tools or sibling task dirs under the artifact
+        root can satisfy the same completion contract.
+        """
+        return self._artifact_file_from_tool_result_content(
+            content,
+            roots=(artifact_dir,),
+            extensions=self._generic_deliverable_extensions(),
+        )
+
+    def _generic_deliverable_extensions(self) -> tuple[str, ...]:
+        return (
+            "pptx", "ppt", "pdf", "docx", "xlsx", "csv", "zip", "html",
+            "png", "jpg", "jpeg", "md",
+        )
+
+    def _deliverable_extensions_for_contract(self, contract: CompletionContract) -> tuple[str, ...]:
+        normalized = (contract.task_text or "").lower()
+        if any(marker in normalized for marker in ("ppt", "pptx", "powerpoint", "slide", "slides", "deck", "幻灯片", "演示文稿")):
+            return ("pptx", "ppt")
+        if any(marker in normalized for marker in ("pdf",)):
+            return ("pdf",)
+        if any(marker in normalized for marker in ("docx", "word", "文档")):
+            return ("docx",)
+        if any(marker in normalized for marker in ("xlsx", "excel", "表格")):
+            return ("xlsx", "csv")
+        return self._generic_deliverable_extensions()
+
+    def _trusted_artifact_roots_for_contract(self, contract: CompletionContract) -> tuple[str, ...]:
+        roots: list[str] = []
+        for raw in (
+            contract.artifact_dir,
+            self._safe_call_artifact_root_path(),
+            self.work_dir,
+        ):
+            if not raw:
+                continue
+            root = os.path.abspath(os.path.expanduser(str(raw)))
+            if root and root not in roots:
+                roots.append(root)
+        return tuple(roots)
+
+    def _safe_call_artifact_root_path(self) -> str:
+        root_path = getattr(self.artifacts, "root_path", None)
+        if callable(root_path):
+            try:
+                return str(root_path())
+            except Exception:
+                return ""
+        root = getattr(self.artifacts, "root", "")
+        return str(root or "")
+
+    def _artifact_file_from_tool_result_content(
+        self,
+        content: str,
+        *,
+        roots: tuple[str, ...],
+        extensions: tuple[str, ...],
+    ) -> str:
+        """Extract an observed deliverable under trusted roots from any tool output."""
+        trusted_roots: list[str] = []
+        for raw_root in roots:
+            root = os.path.abspath(os.path.expanduser(str(raw_root or "")))
+            if root and root not in trusted_roots:
+                trusted_roots.append(root)
+        if not trusted_roots:
+            return ""
+        normalized_extensions = tuple(ext.lower().lstrip(".") for ext in extensions if ext)
+        if not normalized_extensions:
+            normalized_extensions = self._generic_deliverable_extensions()
+        extensions = (
+            *normalized_extensions,
+        )
+        ext_pattern = "|".join(re.escape(ext) for ext in extensions)
+        candidates: list[str] = []
+        pattern = re.compile(rf"(?P<path>(?:~|/)[^\s`'\"<>]+\.(?:{ext_pattern}))", re.IGNORECASE)
+        for match in pattern.finditer(content or ""):
+            candidate = match.group("path").rstrip('.,;:)]}')
+            expanded = os.path.abspath(os.path.expanduser(candidate))
+            candidates.append(expanded)
+
+        # Some shell snippets only print `ls -l` output from inside the planned
+        # artifact directory.  In that case inspect that exact bounded
+        # directory.  Do not scan broad roots such as ~/.pyclaw/artifacts here:
+        # those can contain stale files from older turns, and Hermes/OpenClaw-
+        # style evidence should come from the current tool observation unless
+        # the model worked inside the controller-assigned directory.
+        for root in trusted_roots[:1]:
+            candidates.extend(self._scan_deliverable_candidates(root, extensions=extensions, max_depth=2))
+
+        for candidate in candidates:
+            if not self._path_under_any_root(candidate, trusted_roots):
+                continue
+            if os.path.isfile(candidate):
+                return candidate
+        return ""
+
+    def _scan_deliverable_candidates(self, root: str, *, extensions: tuple[str, ...], max_depth: int) -> list[str]:
+        root = os.path.abspath(os.path.expanduser(root))
+        if not os.path.isdir(root):
+            return []
+        candidates: list[tuple[float, str]] = []
+        root_depth = root.rstrip(os.sep).count(os.sep)
+        try:
+            for current, dirs, files in os.walk(root):
+                current_depth = current.rstrip(os.sep).count(os.sep) - root_depth
+                if current_depth >= max_depth:
+                    dirs[:] = []
+                for name in files:
+                    ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+                    if ext not in extensions:
+                        continue
+                    path = os.path.join(current, name)
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        mtime = 0.0
+                    candidates.append((mtime, path))
+        except OSError:
+            return []
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in candidates]
+
+    def _path_under_any_root(self, path: str, roots: list[str]) -> bool:
+        candidate = os.path.abspath(os.path.expanduser(path))
+        for root in roots:
+            try:
+                if os.path.commonpath([candidate, root]) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _file_deliverable_description(self, file_path: str) -> str:
+        basename = os.path.basename(file_path) or "生成文件"
+        return f"已生成文件：{basename}"
+
     def _current_turn_attempt_counted_side_effect_counts(self, session: Session) -> dict[str, int]:
         """Recover admitted attempt-counted side effects from saved assistant messages.
 
@@ -3140,11 +5686,12 @@ class Agent:
             if msg.role != MessageRole.USER:
                 continue
             content = str(msg.content or "").strip()
-            if content and not content.startswith("NOTICE:"):
+            if content and not self._is_internal_notice_message(msg):
                 latest_user_index = index
                 break
 
         counts: dict[str, int] = {}
+        side_effect_key_by_tool_call_id: dict[str, str] = {}
         recent_messages = session.messages[latest_user_index + 1:] if latest_user_index >= 0 else session.messages
         for msg in recent_messages:
             if msg.role != MessageRole.ASSISTANT:
@@ -3164,7 +5711,12 @@ class Agent:
                     function.get("arguments", ""),
                     session=session,
                 )
-                if side_effect_key and self._should_count_side_effect_attempt(side_effect_key):
+                if not side_effect_key:
+                    continue
+                tool_call_id = str(tc.get("id", "") or "")
+                if tool_call_id:
+                    side_effect_key_by_tool_call_id[tool_call_id] = side_effect_key
+                if self._should_count_side_effect_attempt(side_effect_key):
                     counts[side_effect_key] = counts.get(side_effect_key, 0) + 1
         for msg in recent_messages:
             if msg.role != MessageRole.TOOL:
@@ -3173,21 +5725,24 @@ class Agent:
             if not isinstance(metadata, dict) or metadata.get("tool_name") != "terminal":
                 continue
             content = str(msg.content or "")
-            command = self._extract_terminal_command_from_observation(content)
-            if not command:
-                continue
-            side_effect_key = self._side_effect_call_key(
-                "terminal",
-                json.dumps({"command": command}),
-                session=session,
-            )
+            tool_call_id = str(metadata.get("tool_call_id", "") or "")
+            side_effect_key = side_effect_key_by_tool_call_id.get(tool_call_id, "")
+            if not side_effect_key:
+                command = self._extract_terminal_command_from_observation(content)
+                if not command:
+                    continue
+                side_effect_key = self._side_effect_call_key(
+                    "terminal",
+                    json.dumps({"command": command}),
+                    session=session,
+                )
             if not side_effect_key:
                 continue
             if self._should_count_side_effect_attempt(side_effect_key):
                 counts[side_effect_key] = max(counts.get(side_effect_key, 0), 1)
                 continue
             fake_result = {"name": "terminal", "content": content}
-            if "OBSERVATION from terminal:" in content or self._failed_side_effect_result_consumes_repeat_budget(side_effect_key, fake_result):
+            if self._terminal_observation_indicates_attempt(content) or self._failed_side_effect_result_consumes_repeat_budget(side_effect_key, fake_result):
                 counts[side_effect_key] = counts.get(side_effect_key, 0) + 1
         return counts
 
@@ -3692,18 +6247,16 @@ class Agent:
         accidentally look like pending work. This lightweight boundary makes the
         recency contract explicit right before the model call.
         """
-        get_latest_user_message = getattr(session, "get_latest_user_message", None)
-        if callable(get_latest_user_message):
-            latest_user_msg = get_latest_user_message()
-        else:
-            latest_user_msg = None
-
-        if not isinstance(latest_user_msg, Message):
-            latest_user_msg = None
-            for msg in reversed(session.messages):
-                if msg.role == MessageRole.USER and not msg.id.startswith("reflection-"):
-                    latest_user_msg = msg
-                    break
+        latest_user_msg = None
+        for msg in reversed(getattr(session, "messages", []) or []):
+            if msg.role != MessageRole.USER:
+                continue
+            if str(getattr(msg, "id", "") or "").startswith("reflection-"):
+                continue
+            if self._is_internal_notice_message(msg):
+                continue
+            latest_user_msg = msg
+            break
 
         if not latest_user_msg:
             return messages

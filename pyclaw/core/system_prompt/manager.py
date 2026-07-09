@@ -65,7 +65,22 @@ class SystemPromptManager:
         """
         Create a hash of session-specific context fields to detect changes.
         """
-        data = f"{context.current_objective}|{context.current_plan}|{context.semantic_memory}|{context.experience_memory}"
+        data = "|".join([
+            context.current_objective,
+            context.current_plan,
+            context.semantic_memory,
+            context.experience_memory,
+            context.coding_task_status,
+            context.active_skills_context,
+            # Explicit deliverable/skill tasks inject a controller-owned
+            # workspace adapter into the SessionLayer.  This field changes
+            # when a new file-deliverable contract is inferred (artifact dir,
+            # required skill docs, original task).  If it is not part of the
+            # cache hash, the model can receive a stale session prompt from a
+            # previous turn and miss the Hermes/OpenClaw-style skill workflow
+            # contract entirely.
+            context.deliverable_workspace_context,
+        ])
         return hashlib.md5(data.encode()).hexdigest()
 
     def invalidate_static_cache(self) -> None:

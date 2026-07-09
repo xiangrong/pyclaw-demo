@@ -64,8 +64,16 @@ class Session(BaseModel):
     def get_latest_user_message(self) -> Optional[Message]:
         """Return the most recent real user message in this session, if any."""
         for msg in reversed(self.messages):
-            if msg.role == MessageRole.USER and not msg.id.startswith("reflection-"):
-                return msg
+            if msg.role != MessageRole.USER:
+                continue
+            if msg.id.startswith("reflection-"):
+                continue
+            metadata = getattr(msg, "metadata", {}) or {}
+            if isinstance(metadata, dict) and metadata.get("internal_notice"):
+                continue
+            if str(msg.content or "").lstrip().startswith("NOTICE:"):
+                continue
+            return msg
         return None
 
     def clear(self) -> None:
@@ -245,10 +253,13 @@ class SessionManager:
                     )
                 )
             
-            # 更新会话的活跃时间
+            # 更新会话的活跃时间，同时持久化 controller-owned session state。
+            # Completion contracts、active skills、history summaries 等状态都
+            # 存在 session.metadata 中；如果这里只更新时间，跨进程/重启后短
+            # 续写（例如“继续生成 deck”）会丢失原始任务合约，被误当成新任务。
             await db.execute(
-                "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
-                (session.session_id,)
+                "UPDATE sessions SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (json.dumps(session.metadata), session.session_id)
             )
             await db.commit()
         

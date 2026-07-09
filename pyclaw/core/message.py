@@ -42,6 +42,14 @@ class Message(BaseModel):
 
         # 工具消息需要 tool_call_id
         if self.role == MessageRole.TOOL:
+            # Controller-owned synthetic observations (for example preloaded
+            # skill docs) are stored internally as TOOL messages so evidence
+            # gates can reason over them, but they do not correspond to an
+            # assistant tool_call in the chat transcript.  Send them to the LLM
+            # as user context to avoid invalid OpenAI-style histories while
+            # still preserving the internal role/metadata for verification.
+            if self.metadata.get("controller_skill_hydration"):
+                return {"role": "user", "content": self.content}
             result["tool_call_id"] = self.metadata.get("tool_call_id", "fake_id")
             if "tool_name" in self.metadata:
                 result["name"] = self.metadata["tool_name"]

@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from pyclaw.tools.terminal_safety import (
     classify_terminal_command,
@@ -44,6 +45,8 @@ class ExecApprovalRequest:
     session_id: str = ""
     is_cron: bool = False
     mode: ExecApprovalMode | None = None
+    allow_artifact_side_effects: bool = False
+    artifact_roots: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
@@ -196,6 +199,22 @@ class ExecApprovalService:
                 "deterministic allowlist",
             )
 
+        if (
+            request.allow_artifact_side_effects
+            and self._is_artifact_scoped_terminal_command(
+                command,
+                artifact_roots=request.artifact_roots,
+                cwd=request.cwd,
+            )
+        ):
+            return self._approved_result(
+                request,
+                risk_level,
+                approval_key,
+                command_intents,
+                "artifact-scoped file delivery command",
+            )
+
         if should_auto_approve_terminal_command(command, request.latest_user_text):
             return self._approved_result(
                 request,
@@ -223,6 +242,8 @@ class ExecApprovalService:
         session_id: str = "",
         is_cron: bool = False,
         mode: ExecApprovalMode | str | None = None,
+        allow_artifact_side_effects: bool = False,
+        artifact_roots: Sequence[str] = (),
     ) -> tuple[list[dict[str, Any]], list[ExecApprovalResult]]:
         """Return tool calls with approved=True injected when policy allows it."""
         effective_mode = self._coerce_mode(mode) if mode is not None else self.mode
@@ -251,6 +272,8 @@ class ExecApprovalService:
                 session_id=session_id,
                 is_cron=is_cron,
                 mode=effective_mode,
+                allow_artifact_side_effects=allow_artifact_side_effects,
+                artifact_roots=tuple(str(root) for root in artifact_roots if str(root).strip()),
             )
             decision = self.review(request)
             decisions.append(decision)
@@ -305,6 +328,125 @@ class ExecApprovalService:
         if action:
             return f"terminal:semantic:{action}"
         return ""
+
+
+    def _is_artifact_scoped_terminal_command(
+        self,
+        command: str,
+        *,
+        artifact_roots: Sequence[str],
+        cwd: str = "",
+    ) -> bool:
+        """Return True for bounded artifact-production shell snippets.
+
+        This is the generic file-deliverable approval path: low/medium-risk
+        commands may be auto-approved only when every observed mutation/cd target
+        stays inside the controller-provided artifact root. It is deliberately
+        not PPT-specific and never permits install/process/destructive actions.
+        """
+        roots = tuple(
+            self._normalize_path(root, cwd)
+            for root in artifact_roots
+            if str(root).strip()
+        )
+        roots = tuple(root for root in roots if root)
+        if not command or not roots:
+            return False
+
+        intents = terminal_command_intents(command)
+        if intents & {"destructive_file", "process_control", "install", "git_push"}:
+            return False
+
+        saw_artifact_target = False
+        current_dir = self._normalize_cwd(cwd)
+        for parts in self._split_shell_segments(command):
+            if not parts or parts[0] == "__assignment__":
+                continue
+            executable = os.path.basename(parts[0]).lower()
+            if executable == "cd":
+                if len(parts) < 2:
+                    return False
+                target = self._normalize_path(parts[1], current_dir or cwd)
+                if not self._is_under_any_root(target, roots):
+                    return False
+                current_dir = target
+                saw_artifact_target = True
+                continue
+            if executable == "mkdir":
+                targets = [arg for arg in parts[1:] if not arg.startswith("-")]
+                if not targets:
+                    return False
+                if not all(self._is_under_any_root(self._normalize_path(target, current_dir or cwd), roots) for target in targets):
+                    return False
+                saw_artifact_target = True
+                continue
+            if executable == "touch":
+                targets = [arg for arg in parts[1:] if not arg.startswith("-")]
+                if not targets or not all(
+                    self._is_under_any_root(self._normalize_path(target, current_dir or cwd), roots)
+                    for target in targets
+                ):
+                    return False
+                saw_artifact_target = True
+                continue
+            if executable in {"cp", "mv"}:
+                non_flags = [arg for arg in parts[1:] if not arg.startswith("-")]
+                if len(non_flags) < 2:
+                    return False
+                target = self._normalize_path(non_flags[-1], current_dir or cwd)
+                if not self._is_under_any_root(target, roots):
+                    return False
+                saw_artifact_target = True
+                continue
+            if executable in {"python", "python3", "node", "bash", "sh"}:
+                # Running a generator is allowed only after cd'ing into the artifact root
+                # or when the snippet already has a concrete artifact mutation target.
+                if current_dir and self._is_under_any_root(current_dir, roots):
+                    saw_artifact_target = True
+                    continue
+                if "file_mutation" not in intents:
+                    return False
+                continue
+
+        redirect_targets = list(self._file_redirect_targets(command))
+        if redirect_targets:
+            if not all(
+                self._is_under_any_root(self._normalize_path(target, current_dir or cwd), roots)
+                for target in redirect_targets
+            ):
+                return False
+            saw_artifact_target = True
+
+        return saw_artifact_target
+
+    def _file_redirect_targets(self, command: str) -> Iterable[str]:
+        redirect_pattern = re.compile(r"(?P<fd>\d*)>>?\s*(?P<target>&\d+|[^\s|;&]+)")
+        for match in redirect_pattern.finditer(command):
+            target = match.group("target").strip().strip("'\"")
+            if not target or target.startswith("&"):
+                continue
+            expanded = os.path.expandvars(os.path.expanduser(target))
+            if expanded in {"/dev/null", os.devnull}:
+                continue
+            yield target
+
+    def _normalize_path(self, path: str, cwd: str = "") -> str:
+        expanded = os.path.expandvars(os.path.expanduser(str(path)))
+        if not os.path.isabs(expanded):
+            base = self._normalize_cwd(cwd) or os.getcwd()
+            expanded = os.path.join(base, expanded)
+        return os.path.realpath(expanded)
+
+    def _is_under_any_root(self, path: str, roots: Sequence[str]) -> bool:
+        if not path:
+            return False
+        for root in roots:
+            try:
+                if os.path.commonpath([path, root]) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _approved_result(
         self,

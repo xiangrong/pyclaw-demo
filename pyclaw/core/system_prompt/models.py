@@ -22,6 +22,8 @@ class LayerContext(BaseModel):
     current_objective: str = ""
     current_plan: str = ""
     coding_task_status: str = ""
+    active_skills_context: str = ""
+    deliverable_workspace_context: str = ""
     history_summary: str = ""
     semantic_memory: str = ""
     experience_memory: str = ""

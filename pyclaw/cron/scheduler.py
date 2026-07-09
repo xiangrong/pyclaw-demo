@@ -234,6 +234,12 @@ async def run_job_with_agent(
                 "total_timeout_seconds": CRON_TOTAL_TIMEOUT_SECONDS,
                 "inactivity_timeout_seconds": CRON_INACTIVITY_TIMEOUT_SECONDS,
                 "max_iterations": CRON_MAX_ITERATIONS,
+                # Cron tasks are synthetic wrapper executions and are delivered
+                # by the scheduler as text.  They must not enter the channel
+                # artifact-delivery completion workflow unless a future cron
+                # feature explicitly opts in; otherwise wrapper wording can be
+                # mistaken for a file/webpage request and synthesize index.html.
+                "disable_completion_contracts": True,
             },
         )
 
@@ -247,6 +253,7 @@ async def run_job_with_agent(
         session.metadata["inactivity_timeout_seconds"] = CRON_INACTIVITY_TIMEOUT_SECONDS
         session.metadata["max_iterations"] = max(int(session.metadata.get("max_iterations", 0) or 0), CRON_MAX_ITERATIONS)
         session.metadata["cron_job_id"] = job_id
+        session.metadata["disable_completion_contracts"] = True
 
         response = await agent.process_message(message)
 
