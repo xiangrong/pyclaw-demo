@@ -1,0 +1,29 @@
+pyclaw/core/agent.py
+  s_e52d1d09ffd352::t_a8db329816dc86 36,2397-2398,2651-2653,2657-2659,2763-2835
+pyclaw/tools/terminal.py
+  s_e52d1d09ffd352::t_298bdc48544ca6 11,68-71,73-74,76,78-85,88-91
+pyclaw/tools/terminal_safety.py
+  s_e52d1d09ffd352::t_812d2cf18a28c0 6,10-26,65-479,483-486,488,493,570
+tests/test_agent.py
+  s_e52d1d09ffd352::t_987f57ff62d1a5 4361-4380,11163-11278
+tests/test_terminal.py
+  s_e52d1d09ffd352::t_ddae68214721a6 4-9,49-97
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4128147fd9b070f163ea8a3dbbc5916b5352da62",
+  "prompts": {},
+  "sessions": {
+    "s_e52d1d09ffd352": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ebca1-b49a-7971-89ae-af44a7ff7d41",
+        "model": "unknown"
+      },
+      "human_author": "xiangrong <xrseu@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
