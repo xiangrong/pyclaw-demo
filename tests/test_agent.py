@@ -4358,6 +4358,26 @@ def test_read_only_diagnostics_with_stderr_redirect_are_navigation_not_side_effe
     assert agent._terminal_side_effect_call_key(json.dumps({"command": command})) is None
 
 
+def test_opencli_remote_query_is_navigation_not_side_effect():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    command = (
+        "opencli vephone pod-detail 7602589948898384666 -f json | "
+        "python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"node\"))' | head -30"
+    )
+
+    assert agent._looks_like_terminal_navigation(command)
+    assert agent._terminal_command_semantic_kind(json.dumps({"command": command})) == "navigation"
+    assert agent._terminal_side_effect_call_key(json.dumps({"command": command})) is None
+
+
+def test_opencli_browser_open_still_counts_as_side_effect():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    command = "opencli browser open https://example.com"
+
+    assert not agent._looks_like_terminal_navigation(command)
+    assert agent._terminal_side_effect_call_key(json.dumps({"command": command})) == "terminal:semantic:open"
+
+
 def test_direct_execution_of_changed_script_counts_as_validation_result():
     agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
     changed_files = {"/Users/bytedance/.pyclaw/skills/mac-lock-unlock/lock.sh"}
@@ -11140,3 +11160,119 @@ def test_cron_session_clears_stale_completion_contract_metadata(tmp_path):
     assert "current_completion_contract" not in session.metadata
     assert "last_incomplete_completion_contract" not in session.metadata
     assert "last_explicit_skill_completion_contract" not in session.metadata
+
+
+def test_operational_confirmation_does_not_resume_stale_skill_completion_contract(tmp_path):
+    """A generic approval for a Pod/image update must not revive old file gates."""
+    from pyclaw.core.artifacts import ArtifactManager
+    from pyclaw.core.completion_contract import CompletionContract
+
+    agent = Agent(AsyncMock(), MagicMock(), MagicMock())
+    agent.artifacts = ArtifactManager(root=str(tmp_path / "artifacts"))
+    stale = CompletionContract(
+        kind="file_deliverable",
+        task_text="走完整的 baoyu design skill 做一个关于 RAG 的幻灯片",
+        artifact_dir=str(tmp_path / "old-deck"),
+        required_evidence=("file_created", "send_file_to_user"),
+        source_message_id="old-skill-task",
+        task_fingerprint="old-skill-fingerprint",
+        required_skills=("baoyu-design",),
+    ).to_metadata()
+    session = Session(
+        session_id="s-pod-update-confirmation",
+        user_id="u1",
+        channel="feishu",
+        metadata={
+            "current_completion_contract": stale,
+            "last_incomplete_completion_contract": stale,
+            "last_explicit_skill_completion_contract": stale,
+        },
+    )
+    session.messages.extend([
+        Message(
+            id="m-pod-update",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="这个pod 7652273671583177522镜像给我升级成cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr20260721",
+        ),
+        Message(
+            id="m-confirm-pod-update",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="确认",
+        ),
+    ])
+
+    assert agent._infer_completion_contract(session) is None
+    assert "current_completion_contract" not in session.metadata
+    assert "last_incomplete_completion_contract" not in session.metadata
+    assert session.metadata["last_explicit_skill_completion_contract"] == stale
+
+
+def test_operational_success_final_not_rewritten_by_stale_skill_gate(tmp_path):
+    """Successful non-artifact tool work should be reported as done, not skill-failed."""
+    from pyclaw.core.artifacts import ArtifactManager
+    from pyclaw.core.completion_contract import CompletionContract
+
+    agent = Agent(AsyncMock(), MagicMock(), MagicMock())
+    agent.artifacts = ArtifactManager(root=str(tmp_path / "artifacts"))
+    stale = CompletionContract(
+        kind="file_deliverable",
+        task_text="走完整的 baoyu design skill 做一个关于 RAG 的幻灯片",
+        artifact_dir=str(tmp_path / "old-deck"),
+        required_evidence=("file_created", "send_file_to_user"),
+        source_message_id="old-skill-task",
+        task_fingerprint="old-skill-fingerprint",
+        required_skills=("baoyu-design",),
+    ).to_metadata()
+    session = Session(
+        session_id="s-pod-update-final",
+        user_id="u1",
+        channel="feishu",
+        metadata={
+            "current_completion_contract": stale,
+            "last_incomplete_completion_contract": stale,
+            "last_explicit_skill_completion_contract": stale,
+        },
+    )
+    session.messages.extend([
+        Message(
+            id="m-pod-update",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="这个pod 7652273671583177522镜像给我升级成cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr20260721",
+        ),
+        Message(
+            id="m-confirm-pod-update",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="确认",
+        ),
+    ])
+    pending_files: list[dict[str, str]] = []
+
+    final = agent._prepare_completion_contract_final_content(
+        session=session,
+        content="Pod 镜像已更新成功。目标镜像：cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr20260721。",
+        pending_files=pending_files,
+    )
+
+    assert "已更新成功" in final
+    assert "skill 工作流验收" not in final
+    assert pending_files == []

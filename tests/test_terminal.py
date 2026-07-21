@@ -1,7 +1,12 @@
 import pytest
 import os
 from pyclaw.tools.terminal import TerminalTool
-from pyclaw.tools.terminal_safety import should_auto_approve_terminal_command, terminal_command_intents
+from pyclaw.tools.terminal_safety import (
+    is_read_only_terminal_command,
+    iter_local_path_references,
+    should_auto_approve_terminal_command,
+    terminal_command_intents,
+)
 
 @pytest.mark.asyncio
 async def test_terminal_classification():
@@ -40,6 +45,55 @@ async def test_terminal_sandboxing():
     # 非法路径 - .. 跳出
     result = await tool.execute(command="ls ../")
     assert "⚠️ 拦截到尝试跳出工作目录的操作" in result.content
+
+
+def test_terminal_path_extractor_ignores_remote_paths_inside_quoted_payloads():
+    command = (
+        "cd ~/.pyclaw/skills/vephone-pod-exec && "
+        "export RUN_CMD='runcon u:r:su:s0 /system/bin/sh -c \"cat /proc/stat\"' && "
+        "python3 scripts/wss_run.py"
+    )
+
+    refs = iter_local_path_references(command, cwd=os.getcwd())
+    raw_paths = {ref.path for ref in refs}
+    resolved_paths = {ref.resolved_path for ref in refs}
+
+    assert "/system/bin/sh" not in raw_paths
+    assert "/proc/stat" not in raw_paths
+    assert "/system/bin/sh" not in resolved_paths
+    assert "/proc/stat" not in resolved_paths
+    assert "~/.pyclaw/skills/vephone-pod-exec" in raw_paths
+    assert "scripts/wss_run.py" in raw_paths
+
+
+@pytest.mark.asyncio
+async def test_terminal_allows_remote_paths_inside_python_code_string():
+    tool = TerminalTool()
+    tool.set_work_dir(os.getcwd())
+    command = 'python3 -c "EGRESS_CMD = \'runcon u:r:su:s0 /system/bin/sh -c \\\"cat /proc/stat\\\"\'; print(\'ok\')"'
+
+    result = await tool.execute(command=command, timeout=5)
+
+    assert result.success is True
+    assert "拦截到非法路径访问" not in result.content
+    assert "ok" in result.content
+
+
+def test_terminal_read_only_remote_cli_queries_do_not_need_approval():
+    direct_query = "opencli vephone pod-detail 7602589948898384666 -f json"
+    remote_query = "opencli vephone sn_exec_cmd --cmd 'kubectl get pods -A -o wide' 2>&1 | head -40"
+
+    assert is_read_only_terminal_command(direct_query) is True
+    assert is_read_only_terminal_command(remote_query) is True
+    assert TerminalTool()._classify_command(direct_query) == 1
+    assert TerminalTool()._classify_command(remote_query) == 1
+
+
+def test_terminal_remote_cli_mutating_payload_still_needs_approval():
+    command = "opencli vephone sn_exec_cmd --cmd 'kubectl delete pod demo'"
+
+    assert is_read_only_terminal_command(command) is False
+    assert TerminalTool()._classify_command(command) == 2
 
 @pytest.mark.asyncio
 async def test_terminal_hitl():

@@ -8,7 +8,7 @@ import shlex
 from pydantic import BaseModel, Field
 
 from .base import BaseTool, ToolResult
-from .terminal_safety import classify_terminal_command
+from .terminal_safety import classify_terminal_command, iter_local_path_references
 
 
 class TerminalArgs(BaseModel):
@@ -65,27 +65,31 @@ class TerminalTool(BaseTool):
         is_allowed_desktop_control = self._is_allowed_mac_desktop_control_command(command)
 
         # 1. 增强型高风险指令拦截 (Command Firewall)
-        # 拒绝任何包含 ~ 或绝对路径（且不在工作目录内）的指令
-        # 逻辑：查找指令中所有看起来像路径的部分
+        # 只校验 shell 语义上会访问本机文件系统的路径参数。不要对整条
+        # 命令做正则扫描，否则远端命令字符串（如 Android 的
+        # /system/bin/sh、Linux 的 /proc/stat）会被误判为本机越界访问，
+        # 诱导模型反复改写临时脚本来绕过误报。
         if not is_allowed_desktop_control:
-            # 匹配看起来像路径的字符串 (以 / 或 ~ 开头，或者包含 /)
-            path_patterns = re.findall(r"(?:^|\s)([/~][\w\.\-/]*)", command)
-            for p in path_patterns:
+            cwd = self.work_dir if self.work_dir and os.path.exists(self.work_dir) else os.getcwd()
+            for path_ref in iter_local_path_references(command, cwd=cwd):
                 try:
-                    # 尝试验证每一个潜在路径
-                    self.validate_path(p.strip())
+                    self.validate_path(path_ref.resolved_path)
                 except PermissionError as e:
+                    if path_ref.path == ".." or path_ref.path.startswith("../") or "/../" in path_ref.path:
+                        return ToolResult(
+                            success=False,
+                            content=(
+                                f"⚠️ 拦截到尝试跳出工作目录的操作: `{command}`。"
+                                f"路径: `{path_ref.path}`\n原因: {str(e)}"
+                            ),
+                        )
                     return ToolResult(
                         success=False,
-                        content=f"⚠️ 拦截到非法路径访问: `{p.strip()}`。\n指令: `{command}`\n原因: {str(e)}"
+                        content=(
+                            f"⚠️ 拦截到非法路径访问: `{path_ref.path}`。\n"
+                            f"指令: `{command}`\n原因: {str(e)}"
+                        ),
                     )
-
-        # 拒绝尝试跳出工作目录的操作 (如 cd ..)
-        if not is_allowed_desktop_control and ".." in command:
-            return ToolResult(
-                success=False,
-                content=f"⚠️ 拦截到尝试跳出工作目录的操作: `{command}`。请不要使用 `..`。"
-            )
 
         # 2. 风险等级分类处理
         level = self._classify_command(command)
@@ -112,7 +116,6 @@ class TerminalTool(BaseTool):
             )
 
         try:
-            import os
             cwd = self.work_dir if self.work_dir and os.path.exists(self.work_dir) else None
             
             proc = await asyncio.create_subprocess_shell(

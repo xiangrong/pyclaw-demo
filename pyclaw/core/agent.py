@@ -33,7 +33,7 @@ from pyclaw.core.completion_contract import (
     CompletionContractService,
     CompletionEvidence,
 )
-from pyclaw.tools.terminal_safety import primary_terminal_action
+from pyclaw.tools.terminal_safety import is_read_only_terminal_command, primary_terminal_action
 from pyclaw.tools.skill_activation import _available_skills_dirs, _discover_markdown_skills, resolve_markdown_skill
 
 
@@ -2394,6 +2394,8 @@ class Agent:
         """Return True for shell commands commonly used only to inspect code/files."""
         if not command:
             return False
+        if is_read_only_terminal_command(command):
+            return True
         # Pipes and stderr-to-/dev/null are common in read-only diagnostics
         # (`ioreg ... 2>/dev/null | grep foo`).  Other redirection, command
         # substitution, chaining, and backgrounding can hide writes, so keep
@@ -2646,9 +2648,15 @@ class Agent:
         task_text = self._latest_external_user_text(session)
         if self._completion_contract_completed_for_latest(session, task_text):
             return None
+        if self._is_non_artifact_completion_confirmation(session, task_text):
+            self._clear_active_completion_contract_metadata(session)
+            return None
         existing = self._current_completion_contract_from_metadata(session, task_text)
         if existing is not None:
             return existing
+        if self._is_non_artifact_completion_confirmation(session, task_text):
+            self._clear_active_completion_contract_metadata(session)
+            return None
         pending_context = self._pending_action_context_for_short_confirmation(session, task_text)
         if self._looks_like_polluted_task_context(pending_context):
             pending_context = ""
@@ -2751,6 +2759,79 @@ class Agent:
             "last_explicit_skill_completion_contract",
         ):
             metadata.pop(key, None)
+
+    def _clear_active_completion_contract_metadata(self, session: Session) -> None:
+        """Drop active artifact state without deleting durable explicit-skill history.
+
+        A short reply like ``确认`` or ``yes`` can confirm many different
+        pending actions.  When the immediately pending action is operational
+        (for example updating a Pod image) it must not resurrect an older file
+        or skill deliverable contract.  Keep the durable explicit-skill snapshot
+        so an explicit future artifact continuation such as ``继续生成 deck`` can
+        still resume it, but remove the active/unfinished slots for this turn.
+        """
+        metadata = getattr(session, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            return
+        metadata.pop("current_completion_contract", None)
+        metadata.pop("last_incomplete_completion_contract", None)
+
+    def _is_non_artifact_completion_confirmation(self, session: Session, latest_text: str) -> bool:
+        """Return True when a short confirmation belongs to a non-artifact task.
+
+        Completion contracts are controller-owned state for artifacts: files,
+        screenshots, recordings, and explicit skill deliverables.  They should
+        resume on artifact-specific continuations, but not on generic approvals
+        for unrelated operational work.  This mirrors Hermes/OpenClaw's task
+        boundary: a continuation must bind to the immediately pending objective,
+        not to stale session metadata.
+        """
+        latest = (latest_text or "").strip()
+        if not latest or not self._is_continue_request(latest):
+            return False
+        if self._should_treat_as_completion_contract_continuation(session, latest):
+            return False
+        return True
+
+    def _should_treat_as_completion_contract_continuation(self, session: Session, latest_text: str) -> bool:
+        """Return True if a short follow-up is actually about an artifact contract."""
+        latest = (latest_text or "").strip()
+        normalized = re.sub(r"\s+", " ", latest.lower())
+        if not normalized:
+            return False
+
+        if self._is_file_generation_confirmation(latest):
+            return True
+        if self._mentions_deliverable_artifact_target(latest):
+            return True
+
+        pending_context = self._pending_action_context_for_short_confirmation(session, latest)
+        if pending_context and self._looks_like_artifact_contract_context(pending_context):
+            return True
+
+        previous = self._previous_external_user_text_before_latest(session)
+        if previous:
+            return self._looks_like_artifact_contract_context(previous)
+
+        # When history compaction leaves only a bare continuation and durable
+        # controller metadata, allow explicit resume words to keep the artifact
+        # workflow alive.  Generic approvals such as ``确认``/``yes`` remain
+        # non-artifact unless the pending/previous context above proves
+        # otherwise.
+        return normalized in {"继续", "继续吧", "接着来", "go on", "continue", "resume"}
+
+    def _looks_like_artifact_contract_context(self, text: str) -> bool:
+        """Return True for text that can legitimately seed/resume an artifact contract."""
+        if not text:
+            return False
+        return self.completion_contracts.is_file_deliverable_request(text) or self._mentions_deliverable_artifact_target(text)
+
+    def _mentions_deliverable_artifact_target(self, text: str) -> bool:
+        normalized = (text or "").lower()
+        if not normalized:
+            return False
+        markers = getattr(self.completion_contracts, "FILE_TARGET_MARKERS", ())
+        return any(str(marker).lower() in normalized for marker in markers)
 
     def _explicit_safe_artifact_dir_from_task(self, task_text: str) -> str:
         """Return an explicitly requested artifact directory when it is safe.
