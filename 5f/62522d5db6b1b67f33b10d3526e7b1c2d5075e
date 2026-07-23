@@ -1,0 +1,25 @@
+pyclaw/core/agent.py
+  s_e52d1d09ffd352::t_372243ba4e66d6 3068-3077,3144-3190
+pyclaw/core/completion_contract.py
+  s_e52d1d09ffd352::t_00a8e7c975e90d 4,221-237,246-247,249-251,254,259-262,278-366
+tests/test_agent.py
+  s_e52d1d09ffd352::t_fdca867ffe73d3 2210-2303
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5f62522d5db6b1b67f33b10d3526e7b1c2d5075e",
+  "prompts": {},
+  "sessions": {
+    "s_e52d1d09ffd352": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ebca1-b49a-7971-89ae-af44a7ff7d41",
+        "model": "unknown"
+      },
+      "human_author": "xiangrong <xrseu@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
