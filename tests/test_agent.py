@@ -2207,6 +2207,100 @@ def test_completion_contract_infers_capture_and_artifact_dir():
     assert os.path.isabs(contract.artifact_dir)
 
 
+def test_completion_contract_ignores_pasted_cli_help_with_screenshot_command():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    session = MagicMock()
+    session.session_id = "s-opencli-help"
+    session.messages = [
+        Message(
+            id="u-opencli-help",
+            channel="feishu",
+            channel_user_id="u1",
+            session_id="s-opencli-help",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=(
+                "GXC6W3QKW9:~ bytedance$ opencli record --site vephone\n"
+                "error: unknown command 'record'\n"
+                "Usage: opencli [options] [command]\n\n"
+                "Commands:\n"
+                "  browser [options] analyze, click, network, open, screenshot, scroll, state\n"
+            ),
+        )
+    ]
+
+    assert agent._infer_completion_contract(session) is None
+
+
+def test_stale_capture_contract_does_not_rewrite_opencli_followup(tmp_path):
+    from pyclaw.core.completion_contract import CompletionContract
+
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    old_capture = CompletionContract(
+        kind="capture_artifact",
+        task_text="截个屏",
+        artifact_dir=str(tmp_path / "old-capture"),
+        required_evidence=("pending_files",),
+        source_message_id="old-capture-msg",
+        task_fingerprint=agent._task_fingerprint("截个屏"),
+    ).to_metadata()
+    session = Session(
+        session_id="s-stale-capture",
+        user_id="u1",
+        channel="feishu",
+        metadata={
+            "current_completion_contract": old_capture,
+            "last_incomplete_completion_contract": old_capture,
+        },
+    )
+    session.messages.append(Message(
+        id="u-opencli-help",
+        channel="feishu",
+        channel_user_id="u1",
+        user_id="u1",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content=(
+            "GXC6W3QKW9:~ bytedance$ opencli record --site vephone\n"
+            "error: unknown command 'record'\n"
+            "Usage: opencli [options] [command]\n\n"
+            "Commands:\n"
+            "  browser [options] analyze, click, network, open, screenshot, scroll, state\n"
+        ),
+    ))
+
+    final = agent._prepare_completion_contract_final_content(
+        session=session,
+        content="opencli 1.8.6 没有 record 命令，应使用 browser network 或 adapter 开发流程。",
+        pending_files=[],
+    )
+
+    assert "opencli 1.8.6" in final
+    assert "未观察到截图/拍照/录屏" not in final
+    assert "current_completion_contract" not in session.metadata
+    assert "last_incomplete_completion_contract" not in session.metadata
+
+
+def test_capture_diagnostic_question_is_not_a_capture_contract():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    session = MagicMock()
+    session.session_id = "s-capture-diagnostic"
+    session.messages = [
+        Message(
+            id="u-diagnostic",
+            channel="telegram",
+            channel_user_id="u1",
+            session_id="s-capture-diagnostic",
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="你改了什么导致我这个截图功能都不行了？",
+        )
+    ]
+
+    assert agent._infer_completion_contract(session) is None
+
+
 def test_short_ppt_confirmation_recovers_pending_action_context():
     agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
     session = MagicMock()

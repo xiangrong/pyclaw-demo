@@ -3065,6 +3065,16 @@ class Agent:
         latest_id = str(getattr(latest_msg, "id", "") or "")
         latest_fingerprint = self._task_fingerprint(latest)
 
+        if contract.kind == "capture_artifact" and not self._capture_contract_matches_latest_task(
+            session=session,
+            contract=contract,
+            latest=latest,
+            latest_id=latest_id,
+            latest_fingerprint=latest_fingerprint,
+        ):
+            self._drop_completion_contract_metadata_key(session, key, raw_contract)
+            return None
+
         if self._is_continue_request(latest) or self._is_file_generation_confirmation(latest):
             if self._is_artifact_continuation_signal(contract.task_text):
                 # Never resume a contract whose *objective* is itself a short
@@ -3130,6 +3140,53 @@ class Agent:
 
         session.metadata.pop(key, None)
         return None
+
+    def _drop_completion_contract_metadata_key(
+        self,
+        session: Session,
+        key: str,
+        raw_contract: dict[str, Any],
+    ) -> None:
+        """Remove a stale contract slot and aliases that point at the same data."""
+        if not isinstance(getattr(session, "metadata", None), dict):
+            return
+        session.metadata.pop(key, None)
+        for alias in ("current_completion_contract", "last_incomplete_completion_contract"):
+            if session.metadata.get(alias) == raw_contract:
+                session.metadata.pop(alias, None)
+
+    def _capture_contract_matches_latest_task(
+        self,
+        *,
+        session: Session,
+        contract: CompletionContract,
+        latest: str,
+        latest_id: str,
+        latest_fingerprint: str,
+    ) -> bool:
+        """Scope capture contracts to explicit capture turns only.
+
+        Capture words often appear in pasted CLI help (for example an OpenCLI
+        ``browser screenshot`` subcommand) or in troubleshooting questions.  A
+        persisted capture contract may therefore only survive when the latest
+        user task is itself a direct capture request for the same source message,
+        or a short continuation immediately following such a request.
+        """
+        if self.completion_contracts.is_capture_artifact_request(latest):
+            if contract.source_message_id and latest_id:
+                return latest_id == contract.source_message_id and (
+                    not contract.task_fingerprint or latest_fingerprint == contract.task_fingerprint
+                )
+            return bool(latest_fingerprint and latest_fingerprint == contract.task_fingerprint)
+
+        if self._is_continue_request(latest):
+            previous = self._previous_external_user_text_before_latest(session)
+            if not self.completion_contracts.is_capture_artifact_request(previous):
+                return False
+            previous_fingerprint = self._task_fingerprint(previous)
+            return bool(previous_fingerprint and previous_fingerprint == contract.task_fingerprint)
+
+        return False
 
     def _store_incomplete_completion_contract(self, session: Session, contract: CompletionContract) -> None:
         """Persist the active unfinished deliverable contract in both slots.

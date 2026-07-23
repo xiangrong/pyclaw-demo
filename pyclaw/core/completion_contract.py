@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 import time
 from typing import Any, Literal, Mapping, Optional
 
@@ -217,6 +218,23 @@ class CompletionContractService:
     CAPTURE_MARKERS = (
         "截屏", "截图", "截个屏", "拍照", "拍个照", "录屏", "screen shot", "screenshot", "photo", "record screen",
     )
+    CAPTURE_DIAGNOSTIC_MARKERS = (
+        "为什么", "为啥", "怎么", "问题", "不行", "失败", "报错", "错误", "日志", "历史",
+        "功能", "代码", "工具", "修复", "原因", "导致", "检查", "看看", "看下",
+        "why", "how", "error", "failed", "failure", "log", "history", "code", "tool", "fix", "debug",
+    )
+    CAPTURE_DIRECT_PATTERNS = (
+        r"\b(?:take|grab|capture|send|create)\s+(?:a\s+)?(?:screen\s*shot|screenshot)\b",
+        r"\b(?:record|capture)\s+(?:the\s+)?screen\b",
+        r"\b(?:take|snap|capture|send)\s+(?:a\s+)?photo\b",
+        r"\bscreenshot\s*(?:please|pls|now)?\s*$",
+    )
+    PASTED_OUTPUT_START_PATTERNS = (
+        r"^\s*(?:[\w.-]+@)?[\w.-]+:[^\n]*[$#]\s+\S+",
+        r"^\s*(?:error|usage|options|commands|stdout|stderr|traceback)\s*[:：]",
+        r"^\s*OBSERVATION\s+from\s+",
+        r"^\s*<error_context>",
+    )
 
     def infer(
         self,
@@ -225,18 +243,23 @@ class CompletionContractService:
         pending_context: str = "",
         artifact_dir: str,
     ) -> Optional[CompletionContract]:
-        combined = "\n".join(part for part in (task_text, pending_context) if part).strip()
-        if not combined:
+        intent_text = self._task_intent_text(task_text)
+        if not intent_text and self._looks_like_pasted_output(task_text):
             return None
-        normalized = combined.lower()
-        if any(marker in normalized for marker in self.CAPTURE_MARKERS):
+
+        capture_text = intent_text or task_text
+        if self.is_capture_artifact_request(capture_text):
             return CompletionContract(
                 kind="capture_artifact",
-                task_text=combined,
+                task_text=capture_text,
                 artifact_dir=artifact_dir,
                 required_evidence=("pending_files",),
                 max_repair_attempts=1,
             )
+
+        combined = "\n".join(part for part in (intent_text or task_text, pending_context) if part).strip()
+        if not combined:
+            return None
         if self.is_file_deliverable_request(combined):
             return CompletionContract(
                 kind="file_deliverable",
@@ -252,3 +275,92 @@ class CompletionContractService:
         return any(marker in normalized for marker in self.FILE_ACTION_MARKERS) and any(
             marker in normalized for marker in self.FILE_TARGET_MARKERS
         )
+
+    def is_capture_artifact_request(self, text: str) -> bool:
+        """Return True only for direct screenshot/photo/recording requests.
+
+        Tool help, command output, code snippets, and troubleshooting messages can
+        legitimately mention words like ``screenshot`` without asking the agent to
+        capture the user's screen.  Completion contracts are controller state, so
+        they must be anchored to user intent rather than keyword presence.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        normalized = re.sub(r"\s+", " ", raw.lower()).strip()
+        if not any(marker in normalized for marker in self.CAPTURE_MARKERS):
+            return False
+
+        direct = self._has_direct_capture_phrase(normalized)
+        chinese_direct_markers = (
+            "截个屏", "截张图", "截一张", "截一下", "截屏一下", "截图一下",
+            "拍个照", "拍一张", "拍照一下", "录个屏", "录一下", "录屏一下",
+        )
+        bare_chinese_commands = {"截屏", "截图", "拍照", "录屏"}
+        polite_chinese_commands = (
+            "帮我截屏", "帮我截图", "帮我拍照", "帮我录屏",
+            "给我截屏", "给我截图", "给我拍照", "给我录屏",
+            "请截屏", "请截图", "请拍照", "请录屏",
+            "麻烦截屏", "麻烦截图", "麻烦拍照", "麻烦录屏",
+        )
+        chinese_direct = (
+            any(marker in normalized for marker in chinese_direct_markers)
+            or normalized in bare_chinese_commands
+            or normalized.startswith(polite_chinese_commands)
+        )
+        if self._looks_like_pasted_output(raw) and not (direct or chinese_direct):
+            return False
+        if any(marker in normalized for marker in self.CAPTURE_DIAGNOSTIC_MARKERS) and not (direct or chinese_direct):
+            return False
+        if chinese_direct:
+            return True
+        return direct
+
+    def _has_direct_capture_phrase(self, normalized: str) -> bool:
+        if not normalized:
+            return False
+        return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in self.CAPTURE_DIRECT_PATTERNS)
+
+    def _task_intent_text(self, text: str) -> str:
+        """Extract user prose before pasted command output/help blocks.
+
+        A chat message can be a pure terminal paste (prompt, error, Usage,
+        Commands...), or prose followed by a paste.  Artifact contracts should be
+        inferred only from the prose part.  This keeps OpenCLI help containing a
+        ``screenshot`` subcommand from becoming a fake capture task.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        without_fences = re.sub(r"```.*?```", "", raw, flags=re.DOTALL).strip()
+        if not without_fences:
+            return ""
+
+        lines = without_fences.splitlines()
+        prose: list[str] = []
+        for line in lines:
+            if self._is_pasted_output_start_line(line):
+                break
+            prose.append(line)
+        candidate = "\n".join(prose).strip()
+        if candidate:
+            return candidate
+        if self._looks_like_pasted_output(without_fences):
+            return ""
+        return without_fences
+
+    def _looks_like_pasted_output(self, text: str) -> bool:
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        lowered = raw.lower()
+        if any(self._is_pasted_output_start_line(line) for line in raw.splitlines()[:5]):
+            return True
+        return bool(
+            len(raw) > 300
+            and "usage:" in lowered
+            and ("commands:" in lowered or "options:" in lowered)
+        )
+
+    def _is_pasted_output_start_line(self, line: str) -> bool:
+        return any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in self.PASTED_OUTPUT_START_PATTERNS)
