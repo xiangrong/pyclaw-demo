@@ -4736,29 +4736,149 @@ class Agent:
 
     def _is_transient_llm_error(self, error: Exception) -> bool:
         """Return True for temporary model/API failures worth retrying."""
+        return self._classify_llm_error(error) in {
+            "timeout",
+            "rate_limit",
+            "network",
+            "server",
+        }
+
+    def _classify_llm_error(self, error: Exception) -> str:
+        """Classify provider/model failures into stable user-facing categories."""
         error_text = f"{type(error).__name__}: {error}".lower()
-        transient_markers = (
+
+        auth_markers = (
+            "token expired",
+            "expired token",
+            "access token expired",
+            "refresh token expired",
+            "api token expired",
+            "api key expired",
+            "invalid api key",
+            "invalid_api_key",
+            "invalid token",
+            "unauthorized",
+            "unauthenticated",
+            "authentication",
+            "auth failed",
+            "permission denied",
+            "forbidden",
+            "401",
+            "403",
+            "token已过期",
+            "token 过期",
+            "凭证已过期",
+            "凭证过期",
+            "认证失败",
+            "鉴权失败",
+            "未授权",
+            "无权限",
+        )
+        if any(marker in error_text for marker in auth_markers):
+            return "auth"
+
+        context_markers = (
+            "context length",
+            "maximum context",
+            "max context",
+            "too many tokens",
+            "token limit",
+            "context_length_exceeded",
+            "input is too long",
+            "上下文过长",
+            "超过上下文",
+            "token 数超限",
+            "tokens 超限",
+        )
+        if any(marker in error_text for marker in context_markers):
+            return "context_length"
+
+        rate_limit_markers = (
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "429",
+            "quota",
+            "insufficient_quota",
+            "billing",
+            "限流",
+            "频率限制",
+            "额度不足",
+            "余额不足",
+        )
+        if any(marker in error_text for marker in rate_limit_markers):
+            return "rate_limit"
+
+        timeout_markers = (
             "timeout",
             "timed out",
             "request timed out",
-            "rate limit",
-            "temporarily unavailable",
+            "deadline exceeded",
+            "read timed out",
+            "请求超时",
+            "超时",
+        )
+        if any(marker in error_text for marker in timeout_markers):
+            return "timeout"
+
+        network_markers = (
             "connection",
+            "connection reset",
+            "connection refused",
+            "network",
+            "dns",
+            "name resolution",
+            "temporary failure",
+            "网络",
+            "连接失败",
+        )
+        if any(marker in error_text for marker in network_markers):
+            return "network"
+
+        server_markers = (
             "server error",
+            "internal server error",
+            "bad gateway",
+            "service unavailable",
+            "temporarily unavailable",
             "502",
             "503",
             "504",
         )
-        return any(marker in error_text for marker in transient_markers)
+        if any(marker in error_text for marker in server_markers):
+            return "server"
+
+        return "unknown"
 
     def _format_llm_error_for_user(self, error: Exception, session: Session) -> str:
         """Format final LLM errors without leaking raw provider text to chat channels."""
+        category = self._classify_llm_error(error)
         if session.channel == "cron":
-            return (
-                "⚠️ LLM 调用出错：模型请求连续超时，定时任务本次未生成有效内容。"
-                "系统已记录失败状态，避免投递不完整结果。"
+            cron_messages = {
+                "auth": "⚠️ LLM 调用出错：模型凭证已过期或认证失败，定时任务本次未生成有效内容。请刷新/更新模型 API Token 后重试。",
+                "context_length": "⚠️ LLM 调用出错：上下文过长，定时任务本次未生成有效内容。请压缩历史或开启新会话后重试。",
+                "rate_limit": "⚠️ LLM 调用出错：模型接口限流或额度不足，定时任务本次未生成有效内容。请稍后重试或检查额度配置。",
+                "timeout": "⚠️ LLM 调用出错：模型请求连续超时，定时任务本次未生成有效内容。系统已记录失败状态。",
+                "network": "⚠️ LLM 调用出错：模型服务网络连接异常，定时任务本次未生成有效内容。请稍后重试。",
+                "server": "⚠️ LLM 调用出错：模型服务暂时不可用，定时任务本次未生成有效内容。请稍后重试。",
+            }
+            return cron_messages.get(
+                category,
+                "⚠️ LLM 调用出错：模型调用失败，定时任务本次未生成有效内容。请检查模型服务配置后重试。",
             )
-        return "⚠️ 模型请求超时，刚才这次没有完成。请稍后重试，我不会继续重复执行副作用操作。"
+
+        chat_messages = {
+            "auth": "⚠️ 模型凭证已过期或认证失败，本次没有完成。请刷新/更新模型 API Token 后重试。",
+            "context_length": "⚠️ 上下文过长，本次没有完成。请开启新会话或压缩历史后重试。",
+            "rate_limit": "⚠️ 模型接口限流或额度不足，本次没有完成。请稍后重试或检查额度配置。",
+            "timeout": "⚠️ 模型请求超时，本次没有完成。请稍后重试。",
+            "network": "⚠️ 模型服务网络连接异常，本次没有完成。请稍后重试。",
+            "server": "⚠️ 模型服务暂时不可用，本次没有完成。请稍后重试。",
+        }
+        return chat_messages.get(
+            category,
+            "⚠️ 模型调用失败，本次没有完成。请稍后重试或检查模型服务配置。",
+        )
 
     def _should_require_source_extraction_before_final(
         self,

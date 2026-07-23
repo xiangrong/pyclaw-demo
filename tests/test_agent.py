@@ -2611,6 +2611,92 @@ async def test_cron_llm_timeout_returns_non_provider_error_after_retries(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_chat_llm_timeout_message_does_not_mention_side_effects(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = TimeoutError("Request timed out.")
+    monkeypatch.setattr("pyclaw.core.agent.asyncio.sleep", AsyncMock())
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-chat-llm-timeout"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {"llm_retry_attempts": 1}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-chat-llm-timeout", channel="feishu", channel_user_id="u1", session_id="s-chat-llm-timeout",
+        type=MessageType.TEXT, role=MessageRole.USER, content="opencli 怎么用？",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "模型请求超时" in response.content
+    assert "副作用" not in response.content
+    assert "不会继续重复执行" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_chat_llm_token_expired_message_is_auth_specific(monkeypatch):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    model.chat.side_effect = RuntimeError("401 token expired")
+    monkeypatch.setattr("pyclaw.core.agent.asyncio.sleep", AsyncMock())
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-chat-token-expired"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {"llm_retry_attempts": 1}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=10)
+    user_msg = Message(
+        id="m-chat-token-expired", channel="feishu", channel_user_id="u1", session_id="s-chat-token-expired",
+        type=MessageType.TEXT, role=MessageRole.USER, content="opencli 怎么用？",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert "凭证" in response.content
+    assert "过期" in response.content
+    assert "Token" in response.content
+    assert "副作用" not in response.content
+    assert "模型请求超时" not in response.content
+
+
+@pytest.mark.asyncio
 async def test_agent_forces_final_answer_after_successful_side_effect_tool():
     model = AsyncMock()
     tools = MagicMock()
@@ -4646,6 +4732,16 @@ def test_sanitize_user_facing_content_strips_side_effect_guardrail_prefixes():
     )
 
     assert cleaned == "已根据现有结果完成处理。"
+
+
+def test_sanitize_user_facing_content_keeps_chat_llm_error_message():
+    agent = Agent(MagicMock(), MagicMock(), MagicMock())
+
+    cleaned = agent._sanitize_user_facing_content(
+        "⚠️ 模型请求超时，本次没有完成。请稍后重试。"
+    )
+
+    assert cleaned == "⚠️ 模型请求超时，本次没有完成。请稍后重试。"
 
 
 @pytest.mark.asyncio
