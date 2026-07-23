@@ -1,0 +1,25 @@
+pyclaw/core/agent.py
+  s_e52d1d09ffd352::t_caba5f6b7d7aa2 4739-4747,4749-4812,4816-4824,4826-4838,4840-4843,4848-4851,4855,4857-4867,4869-4881
+pyclaw/core/public_sanitize.py
+  s_e52d1d09ffd352::t_d2a7569a28959a 27
+tests/test_agent.py
+  s_e52d1d09ffd352::t_0be4efbcad37ee 2613-2698,4737-4746
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6dae3415d2b40ff9b582a7c20db02cb6a8bbe172",
+  "prompts": {},
+  "sessions": {
+    "s_e52d1d09ffd352": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ebca1-b49a-7971-89ae-af44a7ff7d41",
+        "model": "unknown"
+      },
+      "human_author": "xiangrong <xrseu@163.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
