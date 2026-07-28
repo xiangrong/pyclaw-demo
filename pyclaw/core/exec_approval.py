@@ -13,6 +13,7 @@ from pyclaw.tools.terminal_safety import (
     classify_terminal_command,
     primary_terminal_action,
     should_auto_approve_terminal_command,
+    strip_shell_heredoc_bodies,
     terminal_command_intents,
 )
 
@@ -47,6 +48,8 @@ class ExecApprovalRequest:
     mode: ExecApprovalMode | None = None
     allow_artifact_side_effects: bool = False
     artifact_roots: tuple[str, ...] = ()
+    allow_runtime_scratch_side_effects: bool = False
+    runtime_scratch_roots: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
@@ -215,6 +218,22 @@ class ExecApprovalService:
                 "artifact-scoped file delivery command",
             )
 
+        if (
+            request.allow_runtime_scratch_side_effects
+            and self._is_runtime_scratch_terminal_command(
+                command,
+                runtime_roots=request.runtime_scratch_roots,
+                cwd=request.cwd,
+            )
+        ):
+            return self._approved_result(
+                request,
+                risk_level,
+                approval_key,
+                command_intents,
+                "operational runtime-scratch command",
+            )
+
         if should_auto_approve_terminal_command(command, request.latest_user_text):
             return self._approved_result(
                 request,
@@ -244,6 +263,8 @@ class ExecApprovalService:
         mode: ExecApprovalMode | str | None = None,
         allow_artifact_side_effects: bool = False,
         artifact_roots: Sequence[str] = (),
+        allow_runtime_scratch_side_effects: bool = False,
+        runtime_scratch_roots: Sequence[str] = (),
     ) -> tuple[list[dict[str, Any]], list[ExecApprovalResult]]:
         """Return tool calls with approved=True injected when policy allows it."""
         effective_mode = self._coerce_mode(mode) if mode is not None else self.mode
@@ -274,6 +295,8 @@ class ExecApprovalService:
                 mode=effective_mode,
                 allow_artifact_side_effects=allow_artifact_side_effects,
                 artifact_roots=tuple(str(root) for root in artifact_roots if str(root).strip()),
+                allow_runtime_scratch_side_effects=allow_runtime_scratch_side_effects,
+                runtime_scratch_roots=tuple(str(root) for root in runtime_scratch_roots if str(root).strip()),
             )
             decision = self.review(request)
             decisions.append(decision)
@@ -419,6 +442,137 @@ class ExecApprovalService:
 
         return saw_artifact_target
 
+    def _is_runtime_scratch_terminal_command(
+        self,
+        command: str,
+        *,
+        runtime_roots: Sequence[str],
+        cwd: str = "",
+    ) -> bool:
+        """Return True for bounded operational scratch-file shell snippets.
+
+        Batch/ops requests often need a tiny local materialization step before
+        the real remote work can run: write the user-provided IDs to
+        ``~/.pyclaw/*.txt``, create a log file, or launch a known batch script
+        whose output is redirected to ``~/.pyclaw/*.log``.  This is different
+        from arbitrary local mutation: every local target must stay inside the
+        runtime scratch root and the command must not contain destructive,
+        install, git, or process-control intent.
+        """
+        roots = tuple(
+            self._normalize_path(root, cwd)
+            for root in runtime_roots
+            if str(root).strip()
+        )
+        roots = tuple(root for root in roots if root)
+        if not command or not roots:
+            return False
+
+        # Runtime-scratch auto approval is intentionally narrower than
+        # "cwd happens to be under ~/.pyclaw".  The generated snippet must
+        # explicitly scope itself to the runtime area (for example
+        # ``cd ~/.pyclaw`` or redirection to ``$HOME/.pyclaw/foo.log``), so a
+        # source-repo write under ``~/.pyclaw/pyclaw-demo`` is not silently
+        # promoted just because this project lives inside the same parent dir.
+        if not self._has_explicit_runtime_scope(command):
+            return False
+
+        intents = terminal_command_intents(command)
+        if intents & {"destructive_file", "process_control", "install", "git_push", "git_commit"}:
+            return False
+
+        current_dir = self._normalize_cwd(cwd) or os.getcwd()
+        saw_runtime_target = False
+        saw_batch_execution = False
+
+        for parts in self._split_shell_segments(command):
+            if not parts or parts[0] == "__assignment__":
+                continue
+            executable = os.path.basename(parts[0]).lower()
+            args = parts[1:]
+
+            if executable == "cd":
+                if len(parts) < 2:
+                    return False
+                target = self._normalize_path(parts[1], current_dir or cwd)
+                if not self._is_under_any_root(target, roots):
+                    return False
+                current_dir = target
+                saw_runtime_target = True
+                continue
+
+            if executable == "mkdir":
+                targets = [arg for arg in args if not arg.startswith("-")]
+                if not targets or not all(
+                    self._is_under_any_root(self._normalize_path(target, current_dir or cwd), roots)
+                    for target in targets
+                ):
+                    return False
+                saw_runtime_target = True
+                continue
+
+            if executable in {"touch", "cat", "wc", "head", "tail", "ls", "tee"}:
+                targets = [arg for arg in args if not arg.startswith("-") and arg not in {"-"}]
+                for target in targets:
+                    if target in {"<<", "<<<"}:
+                        continue
+                    if self._looks_like_shell_heredoc_marker(target) or self._looks_like_inline_payload_token(target):
+                        continue
+                    normalized = self._normalize_path(target, current_dir or cwd)
+                    if not self._is_under_any_root(normalized, roots):
+                        return False
+                    saw_runtime_target = True
+                continue
+
+            if executable in {"python", "python3", "bash", "sh"}:
+                script = self._script_path_arg(args)
+                if script:
+                    script_path = self._normalize_path(script, current_dir or cwd)
+                    if not self._is_under_any_root(script_path, roots):
+                        return False
+                    saw_runtime_target = True
+                    saw_batch_execution = True
+                elif current_dir and self._is_under_any_root(current_dir, roots):
+                    saw_runtime_target = True
+                    saw_batch_execution = True
+                else:
+                    return False
+                continue
+
+            if executable in {"nohup", "setsid", "env"}:
+                if not current_dir or not self._is_under_any_root(current_dir, roots):
+                    return False
+                saw_runtime_target = True
+                saw_batch_execution = True
+                continue
+
+            # Read-only probes such as echo/printf/sleep are okay after the
+            # snippet has been scoped to the runtime directory.  Unknown local
+            # mutation executables are intentionally rejected.
+            if executable in {"echo", "printf", "sleep", "date", "ps", "grep", "rg"}:
+                continue
+
+        redirect_targets = list(self._file_redirect_targets(command))
+        for target in redirect_targets:
+            normalized = self._normalize_path(target, current_dir or cwd)
+            if not self._is_under_any_root(normalized, roots):
+                return False
+            saw_runtime_target = True
+
+        # Require an actual scratch mutation or scoped batch start.  Merely
+        # reading from the runtime directory is risk-level 1 and does not need
+        # this approval path.
+        return saw_runtime_target and (bool(redirect_targets) or saw_batch_execution or "file_mutation" in intents)
+
+    def _has_explicit_runtime_scope(self, command: str) -> bool:
+        normalized = command or ""
+        lowered = normalized.lower()
+        if any(marker in lowered for marker in ("~/.pyclaw", "$home/.pyclaw", "${home}/.pyclaw", "/.pyclaw/")):
+            return True
+        # Also allow commands that first bind a shell variable to a .pyclaw
+        # path and then write through that variable, e.g. F=~/.pyclaw/a.log.
+        return bool(re.search(r"\b[A-Za-z_]\w*=([\"']?)~?/[^\s\"']*\.pyclaw(?:/|\1)", normalized))
+
     def _file_redirect_targets(self, command: str) -> Iterable[str]:
         redirect_pattern = re.compile(r"(?P<fd>\d*)>>?\s*(?P<target>&\d+|[^\s|;&]+)")
         for match in redirect_pattern.finditer(command):
@@ -429,6 +583,32 @@ class ExecApprovalService:
             if expanded in {"/dev/null", os.devnull}:
                 continue
             yield target
+
+    def _script_path_arg(self, args: Sequence[str]) -> str:
+        skip_next = False
+        for arg in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg in {"-c", "-e", "-m"}:
+                skip_next = True
+                continue
+            if arg.startswith("-"):
+                continue
+            return arg
+        return ""
+
+    def _looks_like_shell_heredoc_marker(self, token: str) -> bool:
+        return bool(re.fullmatch(r"[A-Z_][A-Z0-9_]{0,31}", token or ""))
+
+    def _looks_like_inline_payload_token(self, token: str) -> bool:
+        if not token:
+            return True
+        if re.fullmatch(r"\d{6,}", token):
+            return True
+        if len(token) > 80:
+            return True
+        return False
 
     def _normalize_path(self, path: str, cwd: str = "") -> str:
         expanded = os.path.expandvars(os.path.expanduser(str(path)))
@@ -488,6 +668,11 @@ class ExecApprovalService:
     def _split_shell_segments(self, command: str) -> Iterable[list[str]]:
         import re
 
+        # Here-doc payloads are data, not shell arguments.  Without stripping
+        # them first, an operational command such as
+        # ``cat > pods.txt <<EOF ... EOF`` is split into thousands of bogus
+        # tokens and the runtime-scratch approval path becomes fragile.
+        command = strip_shell_heredoc_bodies(command)
         for segment in re.split(r"\s*(?:&&|\|\||;)\s*", command.strip()):
             if not segment:
                 continue

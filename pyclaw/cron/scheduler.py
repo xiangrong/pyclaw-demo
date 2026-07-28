@@ -521,6 +521,12 @@ def start_background_ticker(
                 tick(verbose=False, adapters=adapters, loop=loop, use_subprocess=False)
             except Exception as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
+            try:
+                monitor_coro = _tick_batch_monitors_async(agent, adapters)
+                monitor_future = asyncio.run_coroutine_threadsafe(monitor_coro, loop)
+                monitor_future.result(timeout=20)
+            except Exception as e:
+                logger.error("Batch monitor tick error: %s", e, exc_info=True)
             next_tick_at += interval
             now = time.monotonic()
             if next_tick_at <= now:
@@ -533,3 +539,9 @@ def start_background_ticker(
 
     thread = threading.Thread(target=tick_loop, daemon=True, name="pyclaw-cron-ticker")
     thread.start()
+
+
+async def _tick_batch_monitors_async(agent: Any, adapters: Optional[Dict[str, Any]] = None) -> int:
+    from pyclaw.core.batch_monitor import tick_batch_monitors
+
+    return await tick_batch_monitors(agent, adapters)

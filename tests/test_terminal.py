@@ -66,6 +66,26 @@ def test_terminal_path_extractor_ignores_remote_paths_inside_quoted_payloads():
     assert "scripts/wss_run.py" in raw_paths
 
 
+def test_terminal_path_extractor_ignores_heredoc_body_for_scratch_materialization():
+    command = (
+        "cd ~/.pyclaw && cat > pod_egress_61_batch.txt << 'EOF'\n"
+        "7663861888673078054\n"
+        "7663689872217266980\n"
+        "EOF\n"
+        "wc -l pod_egress_61_batch.txt"
+    )
+
+    refs = iter_local_path_references(command, cwd=os.getcwd())
+    raw_paths = [ref.path for ref in refs]
+
+    assert "~/.pyclaw" in raw_paths
+    assert "pod_egress_61_batch.txt" in raw_paths
+    assert "EOF" not in raw_paths
+    assert "7663861888673078054" not in raw_paths
+    assert "7663689872217266980" not in raw_paths
+    assert "<<" not in raw_paths
+
+
 @pytest.mark.asyncio
 async def test_terminal_allows_remote_paths_inside_python_code_string():
     tool = TerminalTool()
@@ -158,3 +178,39 @@ def test_terminal_safety_does_not_auto_approve_mismatched_or_high_risk_commands(
 
     assert should_auto_approve_terminal_command(screenshot_command, "查一下当前目录") is False
     assert should_auto_approve_terminal_command("rm -rf ~/.pyclaw/screenshots", "截屏") is False
+
+
+def test_terminal_safety_explicit_confirmation_allows_non_sensitive_level2_command():
+    command = 'mkdir -p ~/.pyclaw && python3 batch_query.py pods.txt > result.log 2>&1 & echo "PID:$!"'
+
+    assert should_auto_approve_terminal_command(command, "批准") is True
+    assert should_auto_approve_terminal_command("kill -9 12345", "批准") is False
+
+
+def test_terminal_truncation_preserves_batch_completion_tail():
+    tool = TerminalTool()
+    progress = "\n".join(
+        f"[{i}/62] 查询 766605128019{i:04d}... ✓ 111.32.192.161 | AS9808 China Mobile"
+        for i in range(1, 63)
+    )
+    output = (
+        "Command: tail -120 ~/.pyclaw/pod_egress_61.log\n"
+        "Exit code: 0\n\n"
+        "STDOUT:\n"
+        f"{progress}\n"
+        "\n查询完成！成功: 61, 失败: 1\n"
+        "运营商分布统计:\n"
+        "  AS9808 China Mobile Communications Group Co., Ltd.: 39 台\n"
+        "地域分布统计:\n"
+        "  BeijingBeijing: 39 台\n"
+        "完整结果已保存到:\n"
+        "  CSV:  pod_egress_61_wss_results.csv\n"
+    )
+
+    truncated = tool._truncate_output(output, max_chars=1200)
+
+    assert len(truncated) <= 1400
+    assert "Command: tail -120" in truncated
+    assert "查询完成！成功: 61, 失败: 1" in truncated
+    assert "运营商分布统计" in truncated
+    assert "pod_egress_61_wss_results.csv" in truncated

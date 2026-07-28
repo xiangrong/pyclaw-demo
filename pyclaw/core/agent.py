@@ -21,6 +21,7 @@ from pyclaw.core.system_prompt.models import LayerContext
 from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
 from pyclaw.core.public_sanitize import sanitize_user_facing_content
 from pyclaw.core.exec_approval import ExecApprovalMode, ExecApprovalService
+from pyclaw.core.batch_execution import BatchExecutionService
 from pyclaw.core.artifacts import ArtifactManager
 from pyclaw.core.artifact_acceptance import ArtifactAcceptanceResult, ArtifactAcceptanceService
 from pyclaw.core.artifact_synthesis import ArtifactSynthesisService, SynthesisQuality
@@ -117,6 +118,7 @@ class Agent:
         self._last_activity_session_id = ""
         self.answer_quality_gate = AnswerQualityGate()
         self.exec_approval = exec_approval_service or ExecApprovalService(exec_approval_mode)
+        self.batch_execution = BatchExecutionService()
         self.artifacts = ArtifactManager()
         self.artifact_acceptance = ArtifactAcceptanceService()
         self.artifact_synthesis = ArtifactSynthesisService()
@@ -148,6 +150,7 @@ class Agent:
             return
 
         defaults = [
+            "~/.pyclaw",
             "~/.pyclaw/screenshots",
             "~/.pyclaw/photos",
             "~/.pyclaw/recordings",
@@ -840,6 +843,15 @@ class Agent:
                         if tool_call_id:
                             pending_side_effect_keys_by_call_id[tool_call_id] = side_effect_key
                     if not filtered_tool_calls:
+                        if self._should_repair_repeated_batch_side_effects(
+                            session,
+                            skipped_side_effect_calls or repeated_side_effect_calls,
+                        ):
+                            await self._request_repeated_batch_side_effect_repair(
+                                session,
+                                skipped_side_effect_calls or repeated_side_effect_calls,
+                            )
+                            continue
                         completion_contract = self._infer_completion_contract(session)
                         controller_final = self._controller_finalize_explicit_skill_deliverable_if_ready(
                             session=session,
@@ -1167,8 +1179,16 @@ class Agent:
                 # 更新连续失败计数
                 if any_failure:
                     consecutive_failures += 1
+                    if self._should_repair_blocked_operational_materialization(session):
+                        await self._request_blocked_operational_materialization_repair(session)
+                        consecutive_failures = 0
+                        continue
                     if self._should_pivot_after_terminal_approval_failures(session):
                         await self._request_terminal_approval_failure_repair(session)
+                        consecutive_failures = 0
+                        continue
+                    if self._should_pivot_after_terminal_batch_timeouts(session):
+                        await self._request_terminal_batch_timeout_repair(session)
                         consecutive_failures = 0
                         continue
                     if consecutive_failures >= self.max_consecutive_failures:
@@ -1242,7 +1262,17 @@ class Agent:
                     final_content = self._sanitize_user_facing_content(final_content)
                     self._touch_activity("capture_artifact_delivered", session)
                     return final_content, pending_files
-                elif is_cron_session and successful_side_effect_calls:
+                if active_contract is None:
+                    await self._register_operational_batch_monitor_if_needed(session)
+                    if self._should_request_operational_progress_poll(session):
+                        await self._request_operational_progress_poll(session)
+                        continue
+                    operational_final = self._operational_terminal_final_from_observations(session)
+                    if operational_final.strip():
+                        operational_final = self._sanitize_user_facing_content(operational_final)
+                        self._touch_activity("operational_batch_finalized_after_tool_observation", session)
+                        return operational_final, pending_files
+                if is_cron_session and successful_side_effect_calls:
                     await self._request_final_answer_without_tools(
                         session,
                         (
@@ -1268,6 +1298,35 @@ class Agent:
                 continue
 
             # 没有工具调用，返回最终汇总结果
+            if self._infer_completion_contract(session) is None:
+                if (
+                    not is_final_iteration
+                    and not force_final_answer
+                    and not soft_deadline_reached
+                    and self._should_repair_operational_no_evidence_final(session, content)
+                ):
+                    if content.strip() and all_responses and all_responses[-1] == content:
+                        all_responses.pop()
+                    await self._request_operational_no_evidence_repair(session)
+                    continue
+                if (
+                    self._should_request_operational_progress_poll(session)
+                    and not is_final_iteration
+                    and not force_final_answer
+                    and not soft_deadline_reached
+                ):
+                    if content.strip() and all_responses and all_responses[-1] == content:
+                        all_responses.pop()
+                    await self._request_operational_progress_poll(session)
+                    continue
+                operational_final = self._operational_terminal_final_from_observations(session)
+                if operational_final.strip():
+                    if content.strip() and all_responses and all_responses[-1] == content:
+                        all_responses.pop()
+                    operational_final = self._sanitize_user_facing_content(operational_final)
+                    self._touch_activity("operational_batch_finalized_without_extra_llm", session)
+                    return operational_final, pending_files
+
             if self._should_require_source_extraction_before_final(
                 session=session,
                 tool_name_counts=tool_name_counts,
@@ -1777,6 +1836,8 @@ class Agent:
         """
         if is_cron_session:
             return self._get_session_int(session, "repeated_tool_limit", default)
+        if self.batch_execution.is_operational_task(self._latest_external_user_text(session)):
+            return self._get_session_int(session, "operational_repeated_tool_limit", 32)
         if self._is_coding_task(self._effective_coding_task_text(session)):
             return self._get_session_int(session, "coding_repeated_tool_limit", 24)
         return self._get_session_int(session, "repeated_tool_limit", default)
@@ -1789,6 +1850,8 @@ class Agent:
         """
         if tool_name.startswith("activate_skill:"):
             return min(base_limit, self._get_session_int(session, "activate_skill_repeat_limit", 2))
+        if tool_name == "terminal_navigation" and self.batch_execution.is_operational_task(self._latest_external_user_text(session)):
+            return max(base_limit, self._get_session_int(session, "operational_terminal_poll_limit", 32))
         if tool_name == "read_file" and self._is_coding_task(self._effective_coding_task_text(session)):
             return max(base_limit, self._get_session_int(session, "coding_read_file_limit", 32))
         return base_limit
@@ -2081,14 +2144,29 @@ class Agent:
         if not text:
             return False
         normalized = text.lower()
+        if self._is_operational_query_task(normalized):
+            return False
         keywords = (
             "code", "coding", "bug", "fix", "implement", "implementation", "refactor",
             "patch", "diff", "test", "tests", "compile", "build", "repo", "repository",
             "github", "pr", "pull request", "功能", "实现", "修复", "改代码", "补丁",
-            "重构", "测试", "编译", "项目", "代码", "仓库", "工程", "脚本", "文件",
+            "重构", "测试", "编译", "项目", "代码", "仓库", "工程",
             ".py", ".sh", ".js", ".ts", ".java", ".kt",
         )
-        return any(keyword in normalized for keyword in keywords)
+        if any(keyword in normalized for keyword in keywords):
+            return True
+        file_or_script_markers = ("脚本", "文件", "script", "file")
+        coding_action_markers = (
+            "修改", "改", "修", "修复", "实现", "新增", "删除", "编辑", "调试", "写一个", "写个",
+            "modify", "edit", "fix", "implement", "debug", "create",
+        )
+        return any(marker in normalized for marker in file_or_script_markers) and any(
+            marker in normalized for marker in coding_action_markers
+        )
+
+    def _is_operational_query_task(self, text: str) -> bool:
+        """Return True for operational CLI/batch tasks that are not code work."""
+        return self.batch_execution.is_operational_task(text)
 
     def _is_implementation_request(self, text: str) -> bool:
         """Return True when the user likely expects file changes, not only explanation."""
@@ -2245,12 +2323,12 @@ class Agent:
 
             if success and name in {"edit_file", "write_file"}:
                 file_path = self._extract_changed_file_path(content)
-                if file_path:
+                if file_path and self._should_track_coding_changed_file(file_path):
                     changed_files.add(file_path)
 
             if success and name == "copy_file":
                 file_path = self._extract_changed_file_path(content)
-                if file_path:
+                if file_path and self._should_track_coding_changed_file(file_path):
                     changed_files.add(file_path)
 
             if name == "terminal":
@@ -2264,6 +2342,14 @@ class Agent:
                     validation_results.append(result_text)
                     if self._looks_like_build_command(command or content):
                         build_results.append(result_text)
+
+    def _should_track_coding_changed_file(self, path: str) -> bool:
+        """Return True when a written file should count as source-code progress."""
+        return not self._is_operational_runtime_path(path)
+
+    def _is_operational_runtime_path(self, path: str) -> bool:
+        """Return True for PyClaw runtime scratch files outside this repo."""
+        return self.batch_execution.is_runtime_scratch_path(path, repo_root=self.work_dir)
 
     def _extract_changed_file_path(self, content: str) -> str:
         for pattern in (r"File edited:\s*(.+)", r"File written:\s*(.+)", r"File copied:\s*.+?\s*->\s*(.+)"):
@@ -2531,6 +2617,138 @@ class Agent:
             if "检测到有副作用的指令" in content and "approved=True" in content:
                 failures += 1
         return failures >= 2
+
+    def _should_repair_blocked_operational_materialization(self, session: Session) -> bool:
+        return self.batch_execution.should_repair_blocked_runtime_materialization(
+            self.batch_execution.terminal_messages_since_latest_user(session),
+            latest_task=self._latest_external_user_text(session),
+        )
+
+    async def _request_blocked_operational_materialization_repair(self, session: Session) -> None:
+        content = self.batch_execution.runtime_materialization_repair_notice()
+        reminder = Message(
+            id=f"terminal-batch-materialization-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _should_pivot_after_terminal_batch_timeouts(self, session: Session) -> bool:
+        """Return True after a long-running batch command times out once."""
+        return self.batch_execution.should_pivot_after_terminal_timeouts(
+            self.batch_execution.terminal_messages_since_latest_user(session),
+            latest_task=self._latest_external_user_text(session),
+        )
+
+    def _looks_like_batch_terminal_command(self, command: str, task_text: str = "") -> bool:
+        """Infer whether a terminal command is a long-running batch operation."""
+        return self.batch_execution.looks_like_batch_terminal_command(command, task_text=task_text)
+
+    async def _request_terminal_batch_timeout_repair(self, session: Session) -> None:
+        content = self.batch_execution.timeout_repair_notice()
+        reminder = Message(
+            id=f"terminal-batch-timeout-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _should_repair_repeated_batch_side_effects(self, session: Session, side_effect_keys: list[str]) -> bool:
+        return self.batch_execution.should_repair_repeated_side_effects(
+            self.batch_execution.terminal_messages_since_latest_user(session),
+            latest_task=self._latest_external_user_text(session),
+            side_effect_keys=side_effect_keys,
+        )
+
+    async def _request_repeated_batch_side_effect_repair(self, session: Session, side_effect_keys: list[str]) -> None:
+        content = self.batch_execution.repeated_side_effect_repair_notice(side_effect_keys)
+        reminder = Message(
+            id=f"terminal-batch-repeat-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _should_request_operational_progress_poll(self, session: Session) -> bool:
+        """Return True when a batch task has only partial progress and should keep polling."""
+        return self.batch_execution.should_request_progress_poll(
+            self.batch_execution.terminal_messages_since_latest_user(session),
+            latest_task=self._latest_external_user_text(session),
+            prior_notice_count=self.batch_execution.progress_poll_notice_count(session),
+        )
+
+    async def _request_operational_progress_poll(self, session: Session) -> None:
+        terminal_messages = self.batch_execution.terminal_messages_since_latest_user(session)
+        evidence = self.batch_execution.evidence_from_terminal_messages(terminal_messages)
+        content = self.batch_execution.progress_poll_notice(evidence)
+        reminder = Message(
+            id=f"terminal-batch-progress-poll-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _should_repair_operational_no_evidence_final(self, session: Session, content: str) -> bool:
+        latest_task = self._latest_external_user_text(session)
+        if not self.batch_execution.requires_tool_execution(latest_task):
+            return False
+        if self.batch_execution.evidence_messages_since_latest_user(session):
+            return False
+        if self.batch_execution.no_evidence_repair_notice_count(session) >= 2:
+            return False
+        return self.batch_execution.looks_like_plan_without_evidence(content)
+
+    async def _request_operational_no_evidence_repair(self, session: Session) -> None:
+        content = self.batch_execution.no_evidence_repair_notice()
+        reminder = Message(
+            id=f"terminal-batch-no-evidence-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    async def _register_operational_batch_monitor_if_needed(self, session: Session) -> None:
+        latest_task = self._latest_external_user_text(session)
+        if not self.batch_execution.is_operational_task(latest_task):
+            return
+        terminal_messages = self.batch_execution.terminal_messages_since_latest_user(session)
+        evidence = self.batch_execution.evidence_from_terminal_messages(terminal_messages)
+        if not evidence.has_durable_start or evidence.is_complete:
+            return
+        from pyclaw.core.batch_monitor import BatchMonitorService
+
+        changed = BatchMonitorService(self.batch_execution).register_from_session(
+            session=session,
+            latest_task=latest_task,
+            evidence=evidence,
+        )
+        if changed:
+            await self._persist_session_metadata(session)
 
     async def _request_terminal_approval_failure_repair(self, session: Session) -> None:
         contract = self._infer_completion_contract(session)
@@ -4567,6 +4785,10 @@ class Agent:
                 return content
             return ""
 
+        operational_final = self._operational_terminal_final_from_observations(session)
+        if operational_final:
+            return operational_final
+
         if changed_files or validation_results or build_results:
             content = fallback_content or "已完成本轮操作。"
             return self._prepare_coding_final_content(
@@ -4578,6 +4800,13 @@ class Agent:
                 coding_task_status=coding_task_status,
             )
         return ""
+
+    def _operational_terminal_final_from_observations(self, session: Session) -> str:
+        """Synthesize a safe final for operational tasks from observed evidence."""
+        return self.batch_execution.final_from_observations(
+            latest_task=self._latest_external_user_text(session),
+            terminal_messages=self.batch_execution.evidence_messages_since_latest_user(session),
+        )
 
     async def _request_build_repair(self, session: Session) -> None:
         reminder = Message(
@@ -5339,6 +5568,8 @@ class Agent:
         completion_contract = self._infer_completion_contract(session)
         artifact_roots: tuple[str, ...] = ()
         allow_artifact_side_effects = False
+        runtime_scratch_roots: tuple[str, ...] = ()
+        allow_runtime_scratch_side_effects = False
         if completion_contract and completion_contract.kind == "file_deliverable":
             allow_artifact_side_effects = True
             artifact_roots = (
@@ -5346,6 +5577,9 @@ class Agent:
                 self.artifacts.root,
                 self.artifacts.root_path(),
             )
+        if self.batch_execution.is_operational_task(latest_user_text):
+            allow_runtime_scratch_side_effects = True
+            runtime_scratch_roots = self._operational_runtime_scratch_roots()
         updated_calls, decisions = self.exec_approval.approve_tool_calls(
             tool_calls,
             latest_user_text=latest_user_text,
@@ -5355,6 +5589,8 @@ class Agent:
             is_cron=getattr(session, "channel", "") == "cron",
             allow_artifact_side_effects=allow_artifact_side_effects,
             artifact_roots=artifact_roots,
+            allow_runtime_scratch_side_effects=allow_runtime_scratch_side_effects,
+            runtime_scratch_roots=runtime_scratch_roots,
         )
         if decisions:
             metadata = getattr(session, "metadata", None)
@@ -5370,6 +5606,15 @@ class Agent:
                     for decision in decisions
                 ]
         return updated_calls
+
+    def _operational_runtime_scratch_roots(self) -> tuple[str, ...]:
+        roots = {
+            os.path.abspath(os.path.expanduser("~/.pyclaw")),
+        }
+        work_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(self.work_dir)))
+        if work_dir.endswith("/.pyclaw") or "/.pyclaw/" in work_dir:
+            roots.add(work_dir)
+        return tuple(sorted(roots))
 
     # Backwards-compatible wrapper for older tests and integrations.
     def _auto_approve_explicit_terminal_calls(

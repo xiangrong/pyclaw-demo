@@ -128,3 +128,68 @@ def test_exec_approval_side_effect_key_normalizes_semantic_desktop_actions():
 
     assert service.side_effect_key("terminal", first) == "terminal:semantic:capture_photo"
     assert service.side_effect_key("terminal", variant) == "terminal:semantic:capture_photo"
+
+
+def test_exec_approval_auto_allows_confirmed_batch_execution():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+    command = (
+        'cd ~/.pyclaw && python3 batch_egress_wss_serial.py pod_egress_61.txt '
+        '> pod_egress_61.log 2>&1 & echo "PID:$!"'
+    )
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": command},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="批准",
+        )
+    )
+
+    assert decision.decision == ExecApprovalDecision.ALLOW
+    assert decision.approved_arguments is not None
+    assert decision.approved_arguments["approved"] is True
+
+
+def test_exec_approval_confirmation_does_not_allow_process_control_without_specific_intent():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": "kill -9 12345"},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="批准",
+        )
+    )
+
+    assert decision.decision != ExecApprovalDecision.ALLOW
+    assert decision.approved_arguments is None
+
+
+
+def test_exec_approval_auto_allows_operational_runtime_scratch_heredoc():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+    command = (
+        "cd ~/.pyclaw && cat > pod_egress_61_batch.txt << 'EOF'\n"
+        "7663861888673078054\n"
+        "7663689872217266980\n"
+        "EOF\n"
+        "wc -l pod_egress_61_batch.txt"
+    )
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": command},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="查下这些pod的出口ip和对应的运营商",
+            allow_runtime_scratch_side_effects=True,
+            runtime_scratch_roots=("~/.pyclaw",),
+        )
+    )
+
+    assert decision.decision == ExecApprovalDecision.ALLOW
+    assert decision.reason == "operational runtime-scratch command"
+    assert decision.approved_arguments is not None
+    assert decision.approved_arguments["approved"] is True

@@ -213,6 +213,70 @@ class SessionManager:
             self._sessions[key] = session
             return session
 
+    async def list_sessions_with_metadata_key(self, key: str) -> list[Session]:
+        """Return sessions whose metadata contains ``key``.
+
+        Long-running controller state (for example durable batch monitors) is
+        stored in session metadata.  The background ticker needs to recover it
+        after process restarts, so this method loads matching sessions together
+        with their canonical plus legacy message history.
+        """
+        if not key:
+            return []
+
+        matches: list[Session] = []
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM sessions WHERE metadata LIKE ? ORDER BY updated_at DESC",
+                (f'%"{key}"%',),
+            ) as cursor:
+                rows = [row async for row in cursor]
+
+            for row in rows:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except json.JSONDecodeError:
+                    continue
+                if key not in metadata:
+                    continue
+
+                session_id = row["session_id"]
+                channel = row["channel"]
+                user_id = row["user_id"]
+                storage_ids = self._message_storage_ids(session_id, channel, user_id)
+                placeholders = ", ".join("?" for _ in storage_ids)
+                messages: list[Message] = []
+                async with db.execute(
+                    f"SELECT * FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp ASC",
+                    tuple(storage_ids),
+                ) as msg_cursor:
+                    async for msg_row in msg_cursor:
+                        messages.append(Message(
+                            id=msg_row["id"],
+                            channel=msg_row["channel"],
+                            channel_user_id=msg_row["channel_user_id"],
+                            user_id=msg_row["user_id"],
+                            session_id=msg_row["session_id"],
+                            type=MessageType(msg_row["type"]),
+                            role=MessageRole(msg_row["role"]),
+                            content=msg_row["content"],
+                            timestamp=datetime.fromisoformat(msg_row["timestamp"]),
+                            metadata=json.loads(msg_row["metadata"] or "{}"),
+                        ))
+
+                session = Session(
+                    session_id=session_id,
+                    user_id=user_id,
+                    channel=channel,
+                    messages=messages,
+                    metadata=metadata,
+                )
+                self._sessions[f"{channel}:{user_id}"] = session
+                matches.append(session)
+
+        return matches
+
     async def create_session(self, session_id: str, user_id: str = "default", channel: str = "internal") -> Session:
         """强制创建一个指定ID的会话（主要用于 Cron 等场景）"""
         async with aiosqlite.connect(self.db_path) as db:

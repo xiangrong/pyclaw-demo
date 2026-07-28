@@ -62,9 +62,15 @@ BROAD_EXECUTION_KEYWORDS = (
     "执行", "运行", "跑一下", "跑", "开跑", "do it", "run it", "execute", "go ahead",
 )
 
+EXPLICIT_APPROVAL_KEYWORDS = (
+    "批准", "同意", "可以", "确认", "继续", "允许", "授权", "准许", "approved", "approve",
+    "yes", "ok", "okay", "confirmed", "confirm", "go ahead", "proceed", "continue", "run it",
+)
+
 _SHELL_OPERATORS = {"&&", "||", ";", "|"}
 _REDIRECT_OPERATORS = {">", ">>", "<"}
 _FD_REDIRECT_OPERATORS = {">&", "<&"}
+_HEREDOC_OPERATORS = {"<<", "<<-"}
 
 _LOCAL_PATH_COMMANDS = {
     "cd", "ls", "cat", "head", "tail", "wc", "file", "stat", "less", "more", "tree",
@@ -80,7 +86,7 @@ _SCRIPT_COMMANDS = {"python", "python3", "bash", "sh", "zsh", "node", "ruby", "p
 
 _REMOTE_CLI_HEADS = {"opencli", "ssh", "kubectl", "adb"}
 _READ_ONLY_HEADS = {
-    "pwd", "date", "echo", "printf", "true", "false", "test", "which", "command", "type",
+    "pwd", "date", "echo", "printf", "true", "false", "test", "which", "command", "type", "sleep",
     "rg", "grep", "egrep", "fgrep", "find", "sed", "head", "tail", "cat", "wc", "ls", "tree",
     "ioreg", "ps", "lsof", "df", "du", "stat", "file", "jq",
     "python", "python3",
@@ -98,9 +104,52 @@ _MUTATE_LIKE_WORDS = {
 }
 
 
+def strip_shell_heredoc_bodies(command: str) -> str:
+    """Return ``command`` with here-doc payload lines removed.
+
+    Shell here-doc bodies are data, not executable arguments.  A model may use
+    ``cat > file << 'EOF'`` to materialize a runtime list; the safety parser
+    must validate ``file`` but must not treat each body line (or the ``EOF``
+    delimiter) as a host path/argument.  This lightweight preprocessor keeps
+    the command line containing ``<< EOF`` and drops all following lines until
+    the delimiter.  A semicolon is appended to the here-doc command line so the
+    next real shell line is parsed as a separate command, mirroring shell
+    newline command boundaries after the delimiter.
+    """
+    if not command or "<<" not in command:
+        return command or ""
+
+    def markers_in_line(line: str) -> list[str]:
+        markers: list[str] = []
+        for match in re.finditer(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]{0,63})\1", line):
+            markers.append(match.group(2))
+        return markers
+
+    output_lines: list[str] = []
+    pending_markers: list[str] = []
+    for line in command.splitlines():
+        if pending_markers:
+            stripped = line.strip()
+            if stripped in pending_markers:
+                pending_markers.remove(stripped)
+            continue
+
+        line_markers = markers_in_line(line)
+        if line_markers:
+            # Parser-only separator: the body terminator's newline ends this
+            # command before any following line such as ``wc -l file``.
+            output_lines.append(f"{line} ;")
+            pending_markers.extend(line_markers)
+        else:
+            output_lines.append(line)
+
+    return "\n".join(output_lines)
+
+
 def _tokenize_shell(command: str) -> list[str]:
     if not command:
         return []
+    command = strip_shell_heredoc_bodies(command)
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
         lexer.whitespace_split = True
@@ -215,6 +264,9 @@ def _strip_redirections(segment: list[str]) -> list[str]:
     while index < len(segment):
         token = segment[index]
         if token in _REDIRECT_OPERATORS or token in _FD_REDIRECT_OPERATORS:
+            index += 2
+            continue
+        if token in _HEREDOC_OPERATORS:
             index += 2
             continue
         # shlex separates `2>/dev/null` into `2`, `>`, `/dev/null`.  The
@@ -513,6 +565,7 @@ def classify_terminal_command(command: str) -> int:
 
 def _split_shell_segments(command: str) -> list[list[str]]:
     segments: list[list[str]] = []
+    command = strip_shell_heredoc_bodies(command)
     for segment in re.split(r"\s*(?:&&|\|\||;)\s*", command.strip()):
         if not segment:
             continue
@@ -583,6 +636,8 @@ def user_terminal_intents(text: str) -> set[str]:
     }
     if any(keyword in normalized for keyword in BROAD_EXECUTION_KEYWORDS):
         intents.add("broad_execution")
+    if any(keyword in normalized for keyword in EXPLICIT_APPROVAL_KEYWORDS):
+        intents.add("explicit_execution_approval")
     return intents
 
 
@@ -611,8 +666,11 @@ def should_auto_approve_terminal_command(command: str, latest_user_text: str) ->
     if direct_intents:
         return True
 
+    if "explicit_execution_approval" in user_intents:
+        return not (command_intents & sensitive_intents)
+
     if "broad_execution" in user_intents:
-        return not (command_intents & {"destructive_file", "process_control", "install", "git_push"})
+        return not (command_intents & sensitive_intents)
 
     return False
 

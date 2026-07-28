@@ -140,15 +140,37 @@ class TerminalTool(BaseTool):
             if stderr:
                 output += f"\nSTDERR:\n{stderr}\n"
 
-            return ToolResult(success=exit_code == 0, content=output[:4000])
+            return ToolResult(success=exit_code == 0, content=self._truncate_output(output))
 
         except asyncio.TimeoutError:
             return ToolResult(
                 success=False,
-                content=f"Command timed out after {timeout} seconds",
+                content=f"Command: {command}\nCommand timed out after {timeout} seconds",
             )
         except Exception as e:
             return ToolResult(
                 success=False,
                 content=f"Error executing command: {str(e)}",
             )
+
+    def _truncate_output(self, output: str, max_chars: int = 8000) -> str:
+        """Bound terminal output while preserving completion evidence.
+
+        Long-running batch commands usually print the important summary at the
+        end of the log (success/failure counts, result paths, distribution
+        tables).  Returning only ``output[:4000]`` made the controller see rows
+        like ``[42/62] ...`` while silently dropping the final ``查询完成``
+        section.  Keep both the command header/front and the tail so the agent
+        can make a controller-owned final decision from concrete evidence.
+        """
+        if len(output) <= max_chars:
+            return output
+
+        keep_front = max_chars // 2
+        keep_back = max_chars - keep_front
+        omitted = len(output) - keep_front - keep_back
+        return (
+            output[:keep_front]
+            + f"\n\n... output truncated, omitted about {omitted} characters; preserving tail ...\n\n"
+            + output[-keep_back:]
+        )

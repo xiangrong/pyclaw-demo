@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pyclaw.core.session import Session, Message, MessageRole, MessageType, SessionManager
 
@@ -149,3 +151,73 @@ async def test_session_manager_loads_and_clears_legacy_channel_storage_id(tmp_pa
 
     assert reset_session.messages == []
     assert reset_session.metadata == {}
+
+
+@pytest.mark.asyncio
+async def test_session_manager_lists_sessions_by_metadata_key_with_messages(tmp_path):
+    db_file = tmp_path / "test.db"
+    manager = SessionManager(db_path=str(db_file))
+    await manager.init_db()
+
+    session = await manager.get_or_create(channel="telegram", user_id="u42")
+    user_msg = Message(
+        id="tg_user_1",
+        channel="telegram",
+        channel_user_id="u42",
+        user_id="u42",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="批量查询这些pod的出口ip",
+    )
+    await manager.save_message(session, user_msg)
+    session.metadata["active_batch_monitor"] = {
+        "session_id": session.session_id,
+        "channel": "telegram",
+        "channel_user_id": "u42",
+        "latest_task": "批量查询这些pod的出口ip",
+        "pid": "1234",
+        "log_path": "/tmp/pyclaw-batch.log",
+        "result_path": "",
+        "created_at": "2026-07-27T00:00:00+00:00",
+        "last_progress": "",
+        "checks": 0,
+        "delivered": False,
+    }
+
+    async with manager.db_connect() as db:
+        await db.execute(
+            "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+            (json.dumps(session.metadata), session.session_id),
+        )
+        await db.commit()
+
+    manager._sessions.clear()
+    matches = await manager.list_sessions_with_metadata_key("active_batch_monitor")
+
+    assert len(matches) == 1
+    loaded = matches[0]
+    assert loaded.session_id == session.session_id
+    assert loaded.channel == "telegram"
+    assert loaded.user_id == "u42"
+    assert loaded.metadata["active_batch_monitor"]["pid"] == "1234"
+    assert [m.content for m in loaded.messages] == ["批量查询这些pod的出口ip"]
+    assert manager.get_by_id(session.session_id) is loaded
+
+
+@pytest.mark.asyncio
+async def test_session_manager_list_sessions_by_metadata_key_ignores_substrings(tmp_path):
+    db_file = tmp_path / "test.db"
+    manager = SessionManager(db_path=str(db_file))
+    await manager.init_db()
+
+    session = await manager.get_or_create(channel="feishu", user_id="ou_user")
+    session.metadata["not_active_batch_monitor"] = {"pid": "wrong"}
+    async with manager.db_connect() as db:
+        await db.execute(
+            "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+            (json.dumps(session.metadata), session.session_id),
+        )
+        await db.commit()
+
+    assert await manager.list_sessions_with_metadata_key("active_batch_monitor") == []

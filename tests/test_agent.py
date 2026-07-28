@@ -4028,8 +4028,10 @@ def test_agent_configures_default_capture_artifact_paths_on_terminal_tools():
 
     Agent(AsyncMock(), registry, AsyncMock(), work_dir="/tmp/pyclaw-work")
 
+    assert "~/.pyclaw" in registry.allowed_paths
     assert "~/.pyclaw/screenshots" in registry.allowed_paths
     assert "~/.pyclaw/photos" in registry.allowed_paths
+    assert "~/.pyclaw" in terminal.allowed_paths
     assert "~/.pyclaw/recordings" in terminal.allowed_paths
 
 
@@ -11466,3 +11468,900 @@ def test_operational_success_final_not_rewritten_by_stale_skill_gate(tmp_path):
     assert "已更新成功" in final
     assert "skill 工作流验收" not in final
     assert pending_files == []
+
+
+def test_operational_pod_batch_query_is_not_coding_task():
+    agent = Agent(AsyncMock(), MagicMock(), MagicMock())
+
+    assert not agent._is_coding_task("查下这些pod的出口ip，可以写成文件批量跑")
+    assert not agent._is_coding_task("这个pod镜像给我升级成cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:latest")
+
+
+def test_runtime_pyclaw_operational_file_not_tracked_as_coding_change():
+    agent = Agent(AsyncMock(), MagicMock(), MagicMock(), work_dir="/Users/bytedance/.pyclaw/pyclaw-demo")
+    changed_files: set[str] = set()
+
+    agent._record_coding_tool_effects(
+        tool_results=[{
+            "name": "write_file",
+            "success": True,
+            "content": "File written: /Users/bytedance/.pyclaw/pod_models_61.txt",
+            "metadata": {},
+        }],
+        changed_files=changed_files,
+        validation_results=[],
+        build_results=[],
+    )
+
+    assert changed_files == set()
+
+
+def test_agent_injects_approval_for_operational_runtime_scratch_materialization():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock(), work_dir="/Users/bytedance/.pyclaw/pyclaw-demo")
+    session = Session(session_id="s-pod-egress-materialize", user_id="u1", channel="feishu")
+    session.messages.append(
+        Message(
+            id="u-pod-egress-materialize",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="查下这些pod的出口ip和对应的运营商\n7663861888673078054\n7663689872217266980",
+        )
+    )
+    command = (
+        "cd ~/.pyclaw && cat > pod_egress_61_batch.txt << 'EOF'\n"
+        "7663861888673078054\n"
+        "7663689872217266980\n"
+        "EOF\n"
+        "wc -l pod_egress_61_batch.txt"
+    )
+    tool_calls = [{
+        "id": "materialize-pods",
+        "function": {"name": "terminal", "arguments": json.dumps({"command": command}, ensure_ascii=False)},
+    }]
+
+    updated = agent._apply_exec_approval_to_tool_calls(tool_calls, session=session)
+    args = json.loads(updated[0]["function"]["arguments"])
+
+    assert args["approved"] is True
+    assert session.metadata["last_exec_approval_decisions"][0]["reason"] == "operational runtime-scratch command"
+
+
+@pytest.mark.asyncio
+async def test_terminal_batch_timeout_pivot_requests_background_evidence():
+    sessions = AsyncMock()
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    agent = Agent(AsyncMock(), MagicMock(), sessions)
+    session = Session(session_id="s-batch-timeout", user_id="u1", channel="feishu")
+    session.messages.extend([
+        Message(
+            id="u-batch-timeout",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="查下这些pod的出口ip，批量跑一下",
+        ),
+        Message(
+            id="t-batch-timeout",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.TOOL,
+            metadata={"tool_name": "terminal"},
+            content=(
+                "<error_context>\nOBSERVATION from terminal (FAILED):\n"
+                "Command: cd ~/.pyclaw && python3 batch_egress_wss_serial.py pod_egress_61.txt > pod_egress_61.log 2>&1\n"
+                "Command timed out after 30 seconds\n</error_context>"
+            ),
+        ),
+    ])
+
+    assert agent._should_pivot_after_terminal_batch_timeouts(session)
+    await agent._request_terminal_batch_timeout_repair(session)
+
+    notice = session.messages[-1].content
+    assert "Do not rerun the same synchronous command" in notice
+    assert "do not merely increase timeout" in notice
+    assert "PID" in notice
+    assert "log" in notice
+
+
+@pytest.mark.asyncio
+async def test_repeated_batch_side_effects_get_status_repair_not_final_spam():
+    sessions = AsyncMock()
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    agent = Agent(AsyncMock(), MagicMock(), sessions)
+    session = Session(session_id="s-batch-repeat", user_id="u1", channel="feishu")
+    session.messages.extend([
+        Message(
+            id="u-batch-repeat",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="批量查询这些pod的机型",
+        ),
+        Message(
+            id="t-batch-repeat",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.TOOL,
+            metadata={"tool_name": "terminal"},
+            content=(
+                "OBSERVATION from terminal:\nCommand: cd ~/.pyclaw && python3 batch_pod_models.py pod_models_62.txt > pod_models_62.log 2>&1 & echo PID:$!\n"
+                "Exit code: 0\nSTDOUT:\nPID:12345\n"
+            ),
+        ),
+    ])
+
+    keys = ["terminal:mutation:redirect:pod_models_62.log:abc123"]
+    assert agent._should_repair_repeated_batch_side_effects(session, keys)
+    await agent._request_repeated_batch_side_effect_repair(session, keys)
+
+    assert "poll status/log/result files" in session.messages[-1].content
+    assert "Do not repeat the batch command" in session.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_agent_finalizes_operational_batch_from_terminal_evidence_without_second_llm():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    command = "python3 batch_update_images.py pods.txt > ~/.pyclaw/image_update.log 2>&1"
+    model.chat.return_value = {
+        "content": "开始批量更新镜像。",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "batch1",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": command, "approved": True}),
+            },
+        }],
+    }
+    tools.execute_tool_calls.return_value = [{
+        "role": "tool",
+        "tool_call_id": "batch1",
+        "name": "terminal",
+        "content": (
+            f"Command: {command}\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "total=3 success=3 failed=0\n"
+            "result=/Users/bytedance/.pyclaw/image_update_result.csv\n"
+        ),
+        "success": True,
+        "metadata": {},
+    }]
+
+    sessions = AsyncMock()
+    session = Session(session_id="s-batch-final", user_id="u1", channel="feishu")
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-batch-final",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="批量更新这些pod镜像并给我汇总结果",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert model.chat.call_count == 1
+    assert tools.execute_tool_calls.call_count == 1
+    assert "批量任务已有结果输出" in response.content
+    assert "success=3" in response.content
+    assert "结果文件" in response.content
+    assert "skill 工作流验收" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_polls_operational_batch_progress_before_finalizing():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "查看批量查询日志进度。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "tail1",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "tail -20 ~/.pyclaw/pod_egress_61.log"}),
+                },
+            }],
+        },
+        {
+            "content": "继续轮询已有日志。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "tail2",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "tail -20 ~/.pyclaw/pod_egress_61.log"}),
+                },
+            }],
+        },
+        {
+            "content": "继续轮询已有日志。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "tail3",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "tail -20 ~/.pyclaw/pod_egress_61.log"}),
+                },
+            }],
+        },
+        {
+            "content": "继续轮询已有日志。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "tail4",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "tail -40 ~/.pyclaw/pod_egress_61.log"}),
+                },
+            }],
+        },
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{
+            "role": "tool",
+            "tool_call_id": "tail1",
+            "name": "terminal",
+            "content": (
+                "Command: tail -20 ~/.pyclaw/pod_egress_61.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "[3/62] 查询 7663861888673045286...\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }],
+        [{
+            "role": "tool",
+            "tool_call_id": "tail2",
+            "name": "terminal",
+            "content": (
+                "Command: tail -20 ~/.pyclaw/pod_egress_61.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "[4/62] 查询 7664890516131257131...\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }],
+        [{
+            "role": "tool",
+            "tool_call_id": "tail3",
+            "name": "terminal",
+            "content": (
+                "Command: tail -20 ~/.pyclaw/pod_egress_61.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "[5/62] 查询 7664890516131224363...\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }],
+        [{
+            "role": "tool",
+            "tool_call_id": "tail4",
+            "name": "terminal",
+            "content": (
+                "Command: tail -40 ~/.pyclaw/pod_egress_61.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "查询完成\n"
+                "总数: 62\n"
+                "成功: 58\n"
+                "失败: 4\n"
+                "结果文件: /Users/bytedance/.pyclaw/pod_egress_61_result.csv\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }],
+    ]
+
+    sessions = AsyncMock()
+    session = Session(session_id="s-batch-progress-poll", user_id="u1", channel="feishu")
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-batch-progress-poll",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="查下这些pod的出口ip和对应的运营商",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 4
+    assert sum(
+        1 for msg in session.messages
+        if "NOTICE: A batch/operational task is still in progress" in str(msg.content)
+    ) == 3
+    assert "批量任务已有结果输出" in response.content
+    assert "总数=62" in response.content
+    assert "成功=58" in response.content
+    assert "失败=4" in response.content
+    assert "仍在执行中" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_final_answer_partial_operational_progress_without_tool_call():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    model.chat.side_effect = [
+        {
+            "content": "先查看批量查询日志进度。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "tail1",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "tail -20 ~/.pyclaw/pod_egress_61.log"}),
+                },
+            }],
+        },
+        {
+            "content": "批量任务已有结果输出：3/62] 查询 7663861888673045286...",
+            "__tool_calls__": False,
+        },
+        {
+            "content": "继续轮询已有日志直到完成。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "tail2",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": "tail -40 ~/.pyclaw/pod_egress_61.log"}),
+                },
+            }],
+        },
+    ]
+    tools.execute_tool_calls.side_effect = [
+        [{
+            "role": "tool",
+            "tool_call_id": "tail1",
+            "name": "terminal",
+            "content": (
+                "Command: tail -20 ~/.pyclaw/pod_egress_61.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "开始查询 62 台Pod的出口IP及运营商...\n"
+                "[1/62] 查询 7663861888673078054...\n"
+                "[2/62] 查询 7663689872217266980...\n"
+                "[3/62] 查询 7663861888673045286...\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }],
+        [{
+            "role": "tool",
+            "tool_call_id": "tail2",
+            "name": "terminal",
+            "content": (
+                "Command: tail -40 ~/.pyclaw/pod_egress_61.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "查询完成\n"
+                "总数: 62\n"
+                "成功: 61\n"
+                "失败: 1\n"
+                "结果文件: /Users/bytedance/.pyclaw/pod_egress_61_results.csv\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }],
+    ]
+
+    sessions = AsyncMock()
+    session = Session(session_id="s-batch-partial-no-tool", user_id="u1", channel="feishu")
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-batch-partial-no-tool",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="查下这些pod的出口ip和对应的运营商",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert tools.execute_tool_calls.call_count == 2
+    assert model.chat.call_count == 3
+    assert "批量任务已有结果输出" in response.content
+    assert "总数=62" in response.content
+    assert "成功=61" in response.content
+    assert "失败=1" in response.content
+    assert "3/62" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_agent_exec_approval_reaches_tool_executor_and_finalizes_pod_batch_distribution():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    pod_ids = "\n".join([
+        "7663861888673078054",
+        "7663689872217266980",
+        "7663861888673045286",
+        "7664890516131257131",
+    ])
+    command = (
+        "cd ~/.pyclaw && cat > pod_egress_61_batch.txt << 'EOF'\n"
+        f"{pod_ids}\n"
+        "EOF\n"
+        "wc -l pod_egress_61_batch.txt"
+    )
+    model.chat.return_value = {
+        "content": "我先把 pod 列表落到运行目录，然后执行批量查询。",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "materialize-pod-egress",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": command}, ensure_ascii=False),
+            },
+        }],
+    }
+
+    async def execute_tool_calls(payload):
+        parsed = json.loads(payload)
+        tool_call = parsed["tool_calls"][0]
+        args = json.loads(tool_call["function"]["arguments"])
+        assert args["approved"] is True
+        assert "7663861888673078054" in args["command"]
+        return [{
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "name": "terminal",
+            "content": (
+                f"Command: {args['command']}\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "[62/62] 查询 7663027791235210003... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                "\n"
+                "查询完成！成功: 61, 失败: 1\n"
+                "\n"
+                "运营商分布统计:\n"
+                "  AS9808 China Mobile Communications Group Co., Ltd.: 39 台\n"
+                "  AS4837 CHINA UNICOM China169 Backbone: 22 台\n"
+                "\n"
+                "地域分布统计:\n"
+                "  BeijingBeijing: 39 台\n"
+                "  TianjinTianjin: 22 台\n"
+                "\n"
+                "完整结果已保存到:\n"
+                "  JSON: pod_egress_61_wss_results.json\n"
+                "  CSV:  pod_egress_61_wss_results.csv\n"
+                "日志：/Users/bytedance/.pyclaw/pod_egress_61.log\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }]
+
+    tools.execute_tool_calls.side_effect = execute_tool_calls
+
+    sessions = AsyncMock()
+    session = Session(session_id="s-pod-egress-e2e", user_id="u1", channel="feishu")
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=30)
+    user_msg = Message(
+        id="m-pod-egress-e2e",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content=(
+            "查下这些pod的出口ip和对应的运营商\n"
+            "7663861888673078054\n"
+            "7663689872217266980\n"
+            "7663861888673045286\n"
+            "7664890516131257131"
+        ),
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert model.chat.call_count == 1
+    assert tools.execute_tool_calls.call_count == 1
+    assert "批量任务已有结果输出" in response.content
+    assert "成功: 61" in response.content
+    assert "失败: 1" in response.content
+    assert "/Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv" in response.content
+    assert "AS9808 China Mobile Communications Group Co., Ltd.: 39 台" in response.content
+    assert "AS4837 CHINA UNICOM China169 Backbone: 22 台" in response.content
+    assert "BeijingBeijing: 39 台" in response.content
+    assert "TianjinTianjin: 22 台" in response.content
+    forbidden = ("approved=True", "NOTICE", "guardrail", "副作用工具重复调用", "请确认授权")
+    assert not any(token in response.content for token in forbidden)
+
+
+@pytest.mark.asyncio
+async def test_agent_exact_62_pod_egress_task_materializes_once_and_finalizes_from_evidence():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    pod_ids = [
+        "7663861888673078054",
+        "7663689872217266980",
+        "7663861888673045286",
+        "7664890516131257131",
+        "7664890516131224363",
+        "7664890516131666731",
+        "7663861888673094438",
+        "7664890516131814187",
+        "7663861888673241894",
+        "7664890516131371819",
+        "7664890516131519275",
+        "7663861888673291046",
+        "7664890516131355435",
+        "7663689796888042246",
+        "7664890516131781419",
+        "7664890516131683115",
+        "7664890516131240747",
+        "7663027791235242771",
+        "7664890516131765035",
+        "7664890516131617579",
+        "7663689796887878406",
+        "7664890516131273515",
+        "7663861888673225510",
+        "7663861888673143590",
+        "7663861888673258278",
+        "7666051280192232218",
+        "7666051280192035610",
+        "7666051310478891785",
+        "7666051280192166682",
+        "7666051280192051994",
+        "7666051310479072009",
+        "7666051310478875401",
+        "7666051310478793481",
+        "7666051310478809865",
+        "7666051280192101146",
+        "7666051280192297754",
+        "7666051280192412442",
+        "7666051310478973705",
+        "7666051280192084762",
+        "7666051310479006473",
+        "7666051310478760713",
+        "7666051280192314138",
+        "7666051280192428826",
+        "7666051280192330522",
+        "7666051310478711561",
+        "7666051280192150298",
+        "7666051310478940937",
+        "7666051280192215834",
+        "7666051310478859017",
+        "7666051280192379674",
+        "7666051310479088393",
+        "7666051280192264986",
+        "7666051310478990089",
+        "7666051280192183066",
+        "7666051310479039241",
+        "7666051310479022857",
+        "7666051310478695177",
+        "7666051280192199450",
+        "7666051310478957321",
+        "7666051310478744329",
+        "7666051310478727945",
+        "7663027791235210003",
+    ]
+    assert len(pod_ids) == 62
+
+    list_body = "\n".join(pod_ids)
+    command = (
+        "cd ~/.pyclaw && cat > pod_egress_61.txt << 'EOF'\n"
+        f"{list_body}\n"
+        "EOF\n"
+        "nohup python3 batch_egress_wss_serial.py pod_egress_61.txt > pod_egress_61.log 2>&1 < /dev/null & "
+        "echo \"PID=$! LOG=/Users/bytedance/.pyclaw/pod_egress_61.log\""
+    )
+    model.chat.return_value = {
+        "content": "我会把列表物化到运行目录，后台启动一次批量查询，然后根据日志汇总结果。",
+        "__tool_calls__": True,
+        "tool_calls": [{
+            "id": "exact-pod-egress-62",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": command}, ensure_ascii=False),
+            },
+        }],
+    }
+
+    async def execute_tool_calls(payload):
+        parsed = json.loads(payload)
+        tool_call = parsed["tool_calls"][0]
+        args = json.loads(tool_call["function"]["arguments"])
+        observed_command = args["command"]
+        assert args["approved"] is True
+        assert observed_command.count("\n766") == 62
+        assert "< /dev/null" in observed_command
+        assert "PID=$! LOG=" in observed_command
+        return [{
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "name": "terminal",
+            "content": (
+                f"Command: {observed_command}\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "PID=74830 LOG=/Users/bytedance/.pyclaw/pod_egress_61.log\n"
+                "[62/62] 查询 7663027791235210003... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                "\n"
+                "======================================================================\n"
+                "查询完成！成功: 61, 失败: 1\n"
+                "======================================================================\n"
+                "\n"
+                "运营商分布统计:\n"
+                "  AS9808 China Mobile Communications Group Co., Ltd.: 39 台\n"
+                "  AS4837 CHINA UNICOM China169 Backbone: 22 台\n"
+                "\n"
+                "地域分布统计:\n"
+                "  BeijingBeijing: 39 台\n"
+                "  TianjinTianjin: 22 台\n"
+                "\n"
+                "完整结果已保存到:\n"
+                "  JSON: pod_egress_61_wss_results.json\n"
+                "  CSV:  pod_egress_61_wss_results.csv\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }]
+
+    tools.execute_tool_calls.side_effect = execute_tool_calls
+
+    sessions = AsyncMock()
+    session = Session(session_id="s-exact-pod-egress-62", user_id="u1", channel="telegram")
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=90)
+    user_msg = Message(
+        id="m-exact-pod-egress-62",
+        channel="telegram",
+        channel_user_id="6724389039",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="查下这些pod的出口ip和对应的运营商\n" + list_body,
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert model.chat.call_count == 1
+    assert tools.execute_tool_calls.call_count == 1
+    assert "批量任务已有结果输出" in response.content
+    assert "成功: 61" in response.content
+    assert "失败: 1" in response.content
+    assert "PID：74830" in response.content
+    assert "日志：/Users/bytedance/.pyclaw/pod_egress_61.log" in response.content
+    assert "结果文件：/Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv" in response.content
+    assert "AS9808 China Mobile Communications Group Co., Ltd.: 39 台" in response.content
+    assert "AS4837 CHINA UNICOM China169 Backbone: 22 台" in response.content
+    assert "BeijingBeijing: 39 台" in response.content
+    assert "TianjinTianjin: 22 台" in response.content
+    forbidden = ("approved=True", "NOTICE", "guardrail", "副作用工具重复调用", "请确认授权")
+    assert not any(token in response.content for token in forbidden)
+
+
+@pytest.mark.asyncio
+async def test_agent_operational_batch_plan_without_tools_is_not_final():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock(return_value=[
+        {
+            "role": "tool",
+            "tool_call_id": "terminal1",
+            "name": "terminal",
+            "content": (
+                "Command: tail -80 ~/.pyclaw/pod_models.log\n"
+                "Exit code: 0\n"
+                "STDOUT:\n"
+                "查询完成\n"
+                "总数: 3\n"
+                "成功: 3\n"
+                "失败: 0\n"
+                "机型分布统计:\n"
+                "  Pixel 7: 2 台\n"
+                "  Pixel 8: 1 台\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }
+    ])
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = [{"name": "terminal", "description": "run", "parameters": {}}]
+
+    model.chat.side_effect = [
+        {"content": "用户要求查询大量Pod机型。按照标准化流程，先将Pod ID保存到文件，再执行批量查询。", "__tool_calls__": False},
+        {
+            "content": "开始执行批量查询",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "terminal1",
+                "function": {"name": "terminal", "arguments": json.dumps({"command": "tail -80 ~/.pyclaw/pod_models.log"})},
+            }],
+        },
+    ]
+
+    sessions = AsyncMock()
+    session = MagicMock()
+    session.session_id = "s-operational-no-evidence"
+    session.channel = "feishu"
+    session.channel_user_id = "u1"
+    session.user_id = "u1"
+    session.messages = []
+    session.metadata = {}
+    session.get_history.side_effect = lambda limit=10: [m.to_llm_format() for m in session.messages]
+
+    async def save_msg_side_effect(sess, msg):
+        if msg not in sess.messages:
+            sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=8)
+    user_msg = Message(
+        id="m-operational-no-evidence",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id="s-operational-no-evidence",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="批量查询这些pod的机型\n7663027791235341075\n7663689872217266980\n7663861888673078054",
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert model.chat.call_count == 2
+    tools.execute_tool_calls.assert_awaited_once()
+    assert "标准化流程" not in response.content
+    assert "批量任务已有结果输出" in response.content
+    assert "总数=3" in response.content
+    assert "机型分布" in response.content
+    assert any("requires concrete tool evidence" in m.content for m in session.messages)
+
+
+def test_agent_finalizes_operational_batch_from_read_file_evidence_without_second_prompt():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+    sessions = AsyncMock()
+    agent = Agent(model, tools, sessions)
+
+    session = Session(session_id="s-read-file-batch-final", user_id="u1", channel="feishu")
+    session.messages.extend([
+        Message(
+            id="u-read-file-batch-final",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="批量查询这些pod的机型\n7663027791235341075\n7663689796887255814\n7663689725312064292",
+        ),
+        Message(
+            id="tool-read-file-batch-final",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.TOOL,
+            metadata={"tool_name": "read_file"},
+            content=(
+                "OBSERVATION from read_file:\n"
+                "File: /Users/bytedance/.pyclaw/pod_models_151_results.json (5 lines)\n"
+                "\n"
+                "{\n"
+                "  \"7663027791235341075\": \"PHW110\",\n"
+                "  \"7663689796887255814\": \"M2011K2C\",\n"
+                "  \"7663689725312064292\": \"FAILED_TO_GET_WSS\"\n"
+                "}\n"
+            ),
+        ),
+    ])
+
+    final = agent._operational_terminal_final_from_observations(session)
+
+    assert "Pod机型批量查询完成报告" in final
+    assert "总查询量：3 台" in final
+    assert "查询成功：2 台" in final
+    assert "PHW110" in final
+    assert not agent._should_repair_operational_no_evidence_final(session, "我来整理报告")
