@@ -463,6 +463,53 @@ def test_batch_execution_blocked_runtime_materialization_does_not_ask_user_confi
     ) == ""
 
 
+def test_batch_execution_repairs_absolute_runtime_materialization_for_generic_task():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "<error_context>\n"
+            "OBSERVATION from terminal (FAILED):\n"
+            "⚠️ 检测到有副作用的指令: `cd /Users/bytedance/.pyclaw && cat > device_status_input_3.txt << 'EOF'\n"
+            "1234567890123\n"
+            "1234567890124\n"
+            "EOF\n"
+            "wc -l device_status_input_3.txt`\n"
+            "为了安全起见，请在对话中先询问用户是否允许执行该操作，并在工具调用中添加 `approved=True` 参数。\n"
+            "</error_context>"
+        )
+    ]
+
+    assert service.should_repair_blocked_runtime_materialization(
+        messages,
+        latest_task="查询这批设备的状态",
+    )
+    assert service.final_from_observations(
+        latest_task="查询这批设备的状态",
+        terminal_messages=messages,
+    ) == ""
+
+
+def test_batch_execution_rejects_pyclaw_prefix_confusion_for_runtime_materialization():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "<error_context>\n"
+            "OBSERVATION from terminal (FAILED):\n"
+            "⚠️ 检测到有副作用的指令: `cd /Users/bytedance/.pyclaw-demo && cat > device_status_input_3.txt << 'EOF'\n"
+            "1234567890123\n"
+            "EOF\n"
+            "wc -l device_status_input_3.txt`\n"
+            "为了安全起见，请在对话中先询问用户是否允许执行该操作，并在工具调用中添加 `approved=True` 参数。\n"
+            "</error_context>"
+        )
+    ]
+
+    assert not service.should_repair_blocked_runtime_materialization(
+        messages,
+        latest_task="查询这批设备的状态",
+    )
+
+
 def test_batch_execution_reads_recent_terminal_messages_since_user_boundary():
     service = BatchExecutionService()
     session = Session(session_id="s1", user_id="u1", channel="feishu")

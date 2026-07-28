@@ -23,6 +23,7 @@ from pyclaw.core.operational_contract import (
     facet_label,
     infer_operational_task_contract,
 )
+from pyclaw.core.runtime_scratch import has_explicit_runtime_scratch_scope
 
 
 @dataclass(frozen=True)
@@ -1736,8 +1737,7 @@ class BatchExecutionService:
             return False
         if any(marker in normalized for marker in ("rm ", "rm -", "kill ", "pkill", "git push", "git commit", " install ", "brew install", "npm install", "pip install")):
             return False
-        has_runtime_root = "~/.pyclaw" in normalized or "/.pyclaw/" in normalized or "cd ~/.pyclaw" in normalized
-        if not has_runtime_root:
+        if not has_explicit_runtime_scratch_scope(command):
             return False
         if re.search(r"(?:cat|tee)\s*(?:>|>>)?\s*[^\n;&|]*\.(?:txt|csv|json|log)\b", normalized):
             return True

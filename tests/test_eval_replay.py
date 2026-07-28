@@ -128,6 +128,47 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="absolute-runtime-materialization-approval-block-repairs",
+            category="runtime_materialization",
+            input={
+                "latest_task": "查询这批设备的状态\n1234567890123\n1234567890124",
+                "observation": (
+                    "<error_context>\n"
+                    "OBSERVATION from terminal (FAILED):\n"
+                    "⚠️ 检测到有副作用的指令: `cd /Users/bytedance/.pyclaw && cat > device_status_input_3.txt << 'EOF'\n"
+                    "1234567890123\n"
+                    "1234567890124\n"
+                    "EOF\n"
+                    "wc -l device_status_input_3.txt`\n"
+                    "为了安全起见，请在对话中先询问用户是否允许执行该操作，并在工具调用中添加 `approved=True` 参数。\n"
+                    "</error_context>"
+                ),
+            },
+            expected={
+                "should_repair": True,
+                "final_empty": True,
+                "not_contains": ["批量任务未执行", "检查运行环境或授权策略后重试"],
+            },
+        ),
+        ReplayCase(
+            name="runtime-materialization-rejects-pyclaw-prefix-confusion",
+            category="runtime_materialization",
+            input={
+                "latest_task": "查询这批设备的状态\n1234567890123",
+                "observation": (
+                    "<error_context>\n"
+                    "OBSERVATION from terminal (FAILED):\n"
+                    "⚠️ 检测到有副作用的指令: `cd /Users/bytedance/.pyclaw-demo && cat > device_status_input_3.txt << 'EOF'\n"
+                    "1234567890123\n"
+                    "EOF\n"
+                    "wc -l device_status_input_3.txt`\n"
+                    "为了安全起见，请在对话中先询问用户是否允许执行该操作，并在工具调用中添加 `approved=True` 参数。\n"
+                    "</error_context>"
+                ),
+            },
+            expected={"should_repair": False},
+        ),
+        ReplayCase(
             name="single-operational-detail-is-not-batch-progress",
             category="operational_contract",
             input={

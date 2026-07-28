@@ -193,3 +193,78 @@ def test_exec_approval_auto_allows_operational_runtime_scratch_heredoc():
     assert decision.reason == "operational runtime-scratch command"
     assert decision.approved_arguments is not None
     assert decision.approved_arguments["approved"] is True
+
+
+def test_exec_approval_auto_allows_absolute_runtime_scratch_heredoc():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+    command = (
+        "cd /Users/bytedance/.pyclaw && cat > device_status_input_3.txt << 'EOF'\n"
+        "1234567890123\n"
+        "1234567890124\n"
+        "EOF\n"
+        "wc -l device_status_input_3.txt"
+    )
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": command},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="查询这批设备的状态",
+            allow_runtime_scratch_side_effects=True,
+            runtime_scratch_roots=("/Users/bytedance/.pyclaw",),
+        )
+    )
+
+    assert decision.decision == ExecApprovalDecision.ALLOW
+    assert decision.reason == "operational runtime-scratch command"
+    assert decision.approved_arguments is not None
+    assert decision.approved_arguments["approved"] is True
+
+
+def test_exec_approval_rejects_pyclaw_prefix_confusion_for_runtime_scope():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+    command = (
+        "cd /Users/bytedance/.pyclaw-demo && cat > device_status_input_3.txt << 'EOF'\n"
+        "1234567890123\n"
+        "EOF\n"
+        "wc -l device_status_input_3.txt"
+    )
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": command},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="查询这批设备的状态",
+            allow_runtime_scratch_side_effects=True,
+            runtime_scratch_roots=("/Users/bytedance/.pyclaw",),
+        )
+    )
+
+    assert decision.decision != ExecApprovalDecision.ALLOW
+    assert decision.approved_arguments is None
+
+
+def test_exec_approval_runtime_scratch_does_not_allow_source_repo_mutation():
+    service = ExecApprovalService(ExecApprovalMode.AUTO)
+    command = (
+        "cd /Users/bytedance/.pyclaw/pyclaw-demo && cat > device_status_input_3.txt << 'EOF'\n"
+        "1234567890123\n"
+        "EOF\n"
+        "wc -l device_status_input_3.txt"
+    )
+
+    decision = service.review(
+        ExecApprovalRequest(
+            tool_name="terminal",
+            arguments={"command": command},
+            cwd="/Users/bytedance/.pyclaw/pyclaw-demo",
+            latest_user_text="查询这批设备的状态",
+            allow_runtime_scratch_side_effects=True,
+            runtime_scratch_roots=("/Users/bytedance/.pyclaw",),
+        )
+    )
+
+    assert decision.decision != ExecApprovalDecision.ALLOW
+    assert decision.approved_arguments is None

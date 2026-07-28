@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Optional, Sequence
 
+from pyclaw.core.runtime_scratch import has_explicit_runtime_scratch_scope
 from pyclaw.tools.terminal_safety import (
     classify_terminal_command,
     primary_terminal_action,
@@ -467,6 +468,7 @@ class ExecApprovalService:
         roots = tuple(root for root in roots if root)
         if not command or not roots:
             return False
+        excluded_roots = self._runtime_scratch_excluded_roots(cwd, roots)
 
         # Runtime-scratch auto approval is intentionally narrower than
         # "cwd happens to be under ~/.pyclaw".  The generated snippet must
@@ -495,7 +497,7 @@ class ExecApprovalService:
                 if len(parts) < 2:
                     return False
                 target = self._normalize_path(parts[1], current_dir or cwd)
-                if not self._is_under_any_root(target, roots):
+                if not self._is_allowed_runtime_scratch_path(target, roots, excluded_roots):
                     return False
                 current_dir = target
                 saw_runtime_target = True
@@ -504,7 +506,11 @@ class ExecApprovalService:
             if executable == "mkdir":
                 targets = [arg for arg in args if not arg.startswith("-")]
                 if not targets or not all(
-                    self._is_under_any_root(self._normalize_path(target, current_dir or cwd), roots)
+                    self._is_allowed_runtime_scratch_path(
+                        self._normalize_path(target, current_dir or cwd),
+                        roots,
+                        excluded_roots,
+                    )
                     for target in targets
                 ):
                     return False
@@ -519,7 +525,7 @@ class ExecApprovalService:
                     if self._looks_like_shell_heredoc_marker(target) or self._looks_like_inline_payload_token(target):
                         continue
                     normalized = self._normalize_path(target, current_dir or cwd)
-                    if not self._is_under_any_root(normalized, roots):
+                    if not self._is_allowed_runtime_scratch_path(normalized, roots, excluded_roots):
                         return False
                     saw_runtime_target = True
                 continue
@@ -528,11 +534,11 @@ class ExecApprovalService:
                 script = self._script_path_arg(args)
                 if script:
                     script_path = self._normalize_path(script, current_dir or cwd)
-                    if not self._is_under_any_root(script_path, roots):
+                    if not self._is_allowed_runtime_scratch_path(script_path, roots, excluded_roots):
                         return False
                     saw_runtime_target = True
                     saw_batch_execution = True
-                elif current_dir and self._is_under_any_root(current_dir, roots):
+                elif current_dir and self._is_allowed_runtime_scratch_path(current_dir, roots, excluded_roots):
                     saw_runtime_target = True
                     saw_batch_execution = True
                 else:
@@ -540,7 +546,7 @@ class ExecApprovalService:
                 continue
 
             if executable in {"nohup", "setsid", "env"}:
-                if not current_dir or not self._is_under_any_root(current_dir, roots):
+                if not current_dir or not self._is_allowed_runtime_scratch_path(current_dir, roots, excluded_roots):
                     return False
                 saw_runtime_target = True
                 saw_batch_execution = True
@@ -555,7 +561,7 @@ class ExecApprovalService:
         redirect_targets = list(self._file_redirect_targets(command))
         for target in redirect_targets:
             normalized = self._normalize_path(target, current_dir or cwd)
-            if not self._is_under_any_root(normalized, roots):
+            if not self._is_allowed_runtime_scratch_path(normalized, roots, excluded_roots):
                 return False
             saw_runtime_target = True
 
@@ -565,13 +571,36 @@ class ExecApprovalService:
         return saw_runtime_target and (bool(redirect_targets) or saw_batch_execution or "file_mutation" in intents)
 
     def _has_explicit_runtime_scope(self, command: str) -> bool:
-        normalized = command or ""
-        lowered = normalized.lower()
-        if any(marker in lowered for marker in ("~/.pyclaw", "$home/.pyclaw", "${home}/.pyclaw", "/.pyclaw/")):
-            return True
-        # Also allow commands that first bind a shell variable to a .pyclaw
-        # path and then write through that variable, e.g. F=~/.pyclaw/a.log.
-        return bool(re.search(r"\b[A-Za-z_]\w*=([\"']?)~?/[^\s\"']*\.pyclaw(?:/|\1)", normalized))
+        return has_explicit_runtime_scratch_scope(command)
+
+    def _runtime_scratch_excluded_roots(self, cwd: str, roots: Sequence[str]) -> tuple[str, ...]:
+        """Exclude the source workspace when it lives under ``~/.pyclaw``.
+
+        PyClaw's own demo repo commonly lives at ``~/.pyclaw/pyclaw-demo``.
+        Runtime-scratch auto-approval must not turn an operational query into a
+        silently approved source-repo mutation just because the repo is nested
+        below the runtime home.
+        """
+        current = self._normalize_cwd(cwd)
+        if not current:
+            return ()
+        for root in roots:
+            try:
+                if os.path.commonpath([current, root]) == root and current != root:
+                    return (current,)
+            except ValueError:
+                continue
+        return ()
+
+    def _is_allowed_runtime_scratch_path(
+        self,
+        path: str,
+        roots: Sequence[str],
+        excluded_roots: Sequence[str],
+    ) -> bool:
+        if not self._is_under_any_root(path, roots):
+            return False
+        return not self._is_under_any_root(path, excluded_roots)
 
     def _file_redirect_targets(self, command: str) -> Iterable[str]:
         redirect_pattern = re.compile(r"(?P<fd>\d*)>>?\s*(?P<target>&\d+|[^\s|;&]+)")

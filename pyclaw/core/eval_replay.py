@@ -44,6 +44,7 @@ class GoldenReplaySuite:
         self._evaluators: dict[str, Callable[[ReplayCase], ReplayResult]] = {
             "batch_task": self._eval_batch_task,
             "pod_query": self._eval_pod_query,
+            "runtime_materialization": self._eval_runtime_materialization,
             "operational_contract": self._eval_operational_contract,
             "code_modification": self._eval_code_modification,
             "file_delivery": self._eval_file_delivery,
@@ -82,6 +83,29 @@ class GoldenReplaySuite:
 
     def _eval_pod_query(self, case: ReplayCase) -> ReplayResult:
         return self._eval_batch_task(case)
+
+    def _eval_runtime_materialization(self, case: ReplayCase) -> ReplayResult:
+        message = _tool_message(str(case.input.get("observation", "")), tool_name="terminal")
+        latest_task = str(case.input.get("latest_task", ""))
+        final = self.batch_execution.final_from_observations(latest_task=latest_task, terminal_messages=[message])
+        should_repair = self.batch_execution.should_repair_blocked_runtime_materialization(
+            [message],
+            latest_task=latest_task,
+        )
+        observed = {"final": final, "should_repair": should_repair}
+        expected = case.expected
+        mismatches: list[str] = []
+        if "should_repair" in expected and should_repair != bool(expected["should_repair"]):
+            mismatches.append(f"should_repair: observed={should_repair!r} expected={expected['should_repair']!r}")
+        if expected.get("final_empty") is True and final.strip():
+            mismatches.append("expected empty final")
+        missing = [text for text in expected.get("contains", []) if str(text) not in final]
+        forbidden = [text for text in expected.get("not_contains", []) if str(text) in final]
+        if missing:
+            mismatches.append("missing expected text: " + ", ".join(missing))
+        if forbidden:
+            mismatches.append("found forbidden text: " + ", ".join(forbidden))
+        return ReplayResult(case.name, case.category, not mismatches, "; ".join(mismatches), observed)
 
     def _eval_operational_contract(self, case: ReplayCase) -> ReplayResult:
         raw_observations = case.input.get("observations")

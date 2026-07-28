@@ -11530,6 +11530,40 @@ def test_agent_injects_approval_for_operational_runtime_scratch_materialization(
     assert session.metadata["last_exec_approval_decisions"][0]["reason"] == "operational runtime-scratch command"
 
 
+def test_agent_injects_approval_for_absolute_runtime_scratch_materialization():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock(), work_dir="/Users/bytedance/.pyclaw/pyclaw-demo")
+    session = Session(session_id="s-device-status-materialize", user_id="u1", channel="feishu")
+    session.messages.append(
+        Message(
+            id="u-device-status-materialize",
+            channel="feishu",
+            channel_user_id="u1",
+            user_id="u1",
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content="查询这批设备的状态\n1234567890123\n1234567890124",
+        )
+    )
+    command = (
+        "cd /Users/bytedance/.pyclaw && cat > device_status_input_3.txt << 'EOF'\n"
+        "1234567890123\n"
+        "1234567890124\n"
+        "EOF\n"
+        "wc -l device_status_input_3.txt"
+    )
+    tool_calls = [{
+        "id": "materialize-devices",
+        "function": {"name": "terminal", "arguments": json.dumps({"command": command}, ensure_ascii=False)},
+    }]
+
+    updated = agent._apply_exec_approval_to_tool_calls(tool_calls, session=session)
+    args = json.loads(updated[0]["function"]["arguments"])
+
+    assert args["approved"] is True
+    assert session.metadata["last_exec_approval_decisions"][0]["reason"] == "operational runtime-scratch command"
+
+
 @pytest.mark.asyncio
 async def test_terminal_batch_timeout_pivot_requests_background_evidence():
     sessions = AsyncMock()
