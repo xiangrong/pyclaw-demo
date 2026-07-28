@@ -60,3 +60,29 @@ def test_durable_task_engine_ignores_completion_markers_inside_command_script():
     assert evidence.stats_line == ""
     assert evidence.completion_line == ""
     assert evidence.status == "starting"
+
+
+def test_durable_task_engine_does_not_treat_resource_status_running_as_task_progress():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "OBSERVATION from terminal:\n"
+        "Command: opencli vephone detail 7667227403697724170 --env prod\n"
+        "Exit code: 0\n"
+        "STDOUT:\n"
+        "PodID: 7667227403697724170\n"
+        "Status: running\n"
+        "Image: cr.example/app:latest\n"
+    )
+
+    assert evidence.running_line == ""
+    assert evidence.is_in_progress is False
+    assert evidence.status == "unknown"
+
+
+def test_durable_task_engine_keeps_explicit_process_running_evidence():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text("batch job still running pid=12345\n")
+
+    assert evidence.running_line == "batch job still running pid=12345"
+    assert evidence.is_in_progress is True
+    assert evidence.status == "running"

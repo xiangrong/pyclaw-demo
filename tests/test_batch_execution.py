@@ -71,6 +71,55 @@ def test_batch_execution_classifies_generic_operational_batch_without_pod():
     )
 
 
+def test_single_operational_detail_query_does_not_emit_batch_in_progress():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: opencli vephone detail 7667227403697724170 --env prod\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "PodID: 7667227403697724170\n"
+            "Status: running\n"
+            "Image: cr.example/app:latest\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="查询7667227403697724170这个pod详细信息",
+        terminal_messages=messages,
+    )
+    evidence = service.evidence_from_terminal_messages(messages)
+
+    assert service.is_operational_task("查询7667227403697724170这个pod详细信息")
+    assert evidence.running_line == ""
+    assert not service._is_batch_context(
+        latest_task="查询7667227403697724170这个pod详细信息",
+        command_text="opencli vephone detail 7667227403697724170 --env prod",
+        joined=messages[0].content,
+    )
+    assert final == ""
+
+
+def test_single_operational_detail_query_does_not_request_progress_poll():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: opencli device inspect device-123 --format json\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "{\"id\": \"device-123\", \"status\": \"running\", \"version\": \"v1\"}\n"
+        )
+    ]
+
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task="查询 device-123 这个设备的详细信息",
+        prior_notice_count=0,
+    )
+
+
 def test_batch_execution_does_not_classify_desktop_one_shot_as_batch():
     service = BatchExecutionService()
 

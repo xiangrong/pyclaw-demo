@@ -128,6 +128,26 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="single-operational-detail-is-not-batch-progress",
+            category="operational_contract",
+            input={
+                "latest_task": "查询7667227403697724170这个pod详细信息",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: opencli vephone detail 7667227403697724170 --env prod\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "PodID: 7667227403697724170\n"
+                    "Status: running\n"
+                    "Image: cr.example/app:latest\n"
+                ),
+            },
+            expected={
+                "final_empty": True,
+                "not_contains": ["批量任务仍在执行中", "不会把部分进度当成最终结果"],
+            },
+        ),
+        ReplayCase(
             name="history-composite-pod-query-model-only-needs-egress",
             category="operational_contract",
             input={

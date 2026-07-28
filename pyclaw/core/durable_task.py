@@ -109,7 +109,18 @@ class DurableTaskEngine:
         re.compile(r"(?:进度|progress)\s*[:：]?\s*(?P<current>\d+)\s*/\s*(?P<total>\d+)[^\n]{0,180}", re.IGNORECASE),
     )
     RUNNING_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"\b(?:running|in\s+progress)\b[^\n]{0,180}", re.IGNORECASE),
+        re.compile(
+            r"\b(?:job|task|batch|process|pid|script|command)\b[^\n]{0,100}\b(?:running|in\s+progress)\b[^\n]{0,80}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:still|currently)\s+(?:running|in\s+progress)\b[^\n]{0,180}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:running|in\s+progress)\b[^\n]{0,100}\b(?:job|task|batch|process|pid|script|command)\b[^\n]{0,80}",
+            re.IGNORECASE,
+        ),
         re.compile(r"(?:仍在执行|正在执行|运行中|仍在运行|后台执行中)[^\n]{0,180}"),
         re.compile(r"\b(?:python(?:3)?|bash|sh)\b[^\n]*(?:batch|bulk|query|egress|pod|pods)[^\n]*(?:\.py|\.sh|\.txt)?", re.IGNORECASE),
     )

@@ -70,9 +70,14 @@ class BatchExecutionService:
     """
 
     BATCH_MARKERS: tuple[str, ...] = (
-        "批量", "这些", "列表", "全部", "逐个", "串行", "并行", "多条", "多个",
+        "批量", "这些", "这批", "列表", "全部", "逐个", "串行", "并行", "多条", "多个",
         "batch", "bulk", "serial", "parallel", "all", "list", "lists", "query",
         "queries", "while read", "xargs", "for ", "foreach", "mapfile", "batch_",
+    )
+    MULTI_ITEM_MARKERS: tuple[str, ...] = (
+        "批量", "这些", "这批", "列表", "全部", "逐个", "串行", "并行", "多条", "多个",
+        "batch", "bulk", "serial", "parallel", "all", "list", "lists",
+        "while read", "xargs", "for ", "foreach", "mapfile", "batch_",
     )
     QUERY_MARKERS: tuple[str, ...] = (
         "查询", "查下", "查一下", "查", "看下", "看一下", "导出", "写成文件",
@@ -163,12 +168,13 @@ class BatchExecutionService:
         """Infer whether a shell command is a long-running batch operation."""
         combined = f"{command or ''}\n{task_text or ''}\n{' '.join(side_effect_keys)}".lower()
         command_scope = f"{command or ''}\n{' '.join(side_effect_keys)}".lower()
+        task_scope = (task_text or "").lower()
         if not combined.strip():
             return False
         if any(marker in combined for marker in self.DESKTOP_ONE_SHOT_MARKERS):
             return False
 
-        batch_signal = any(marker in combined for marker in self.BATCH_MARKERS)
+        multi_item_signal = any(marker in combined for marker in self.MULTI_ITEM_MARKERS)
         query_signal = any(marker in combined for marker in self.QUERY_MARKERS)
         operational_signal = any(marker in command_scope for marker in self.OPERATIONAL_MARKERS)
         action_signal = any(marker in command_scope for marker in self.ACTION_MARKERS)
@@ -179,12 +185,15 @@ class BatchExecutionService:
         script_batch_signal = bool(re.search(r"(?:^|[/\s])(?:batch|bulk|query|update)[\w.-]*\.(?:py|sh)\b", command_scope))
         loop_batch_signal = bool(re.search(r"\b(?:while\s+read|for\s+\w+\s+in|xargs|parallel)\b", command_scope))
         task_operational = self.is_operational_task(task_text)
+        task_batch_signal = self._task_requires_batch_context(task_scope)
 
-        if task_operational and (runtime_signal or durable_signal or operational_signal or action_signal or script_batch_signal or loop_batch_signal):
+        if loop_batch_signal or script_batch_signal:
+            return bool(runtime_signal or durable_signal or operational_signal or action_signal or task_operational)
+        if durable_signal and (multi_item_signal or (task_batch_signal and (operational_signal or action_signal or runtime_signal))):
             return True
-        if (batch_signal or query_signal or script_batch_signal or loop_batch_signal) and (operational_signal or action_signal) and (runtime_signal or durable_signal):
+        if task_batch_signal and (runtime_signal or durable_signal or operational_signal or action_signal):
             return True
-        if (script_batch_signal or loop_batch_signal) and (runtime_signal or durable_signal):
+        if multi_item_signal and (operational_signal or action_signal or query_signal) and (runtime_signal or durable_signal):
             return True
         return False
 
@@ -565,8 +574,6 @@ class BatchExecutionService:
             if (getattr(msg, "metadata", {}) or {}).get("tool_name") == "terminal"
         ]
         command_text = "\n".join(self.extract_terminal_command(str(getattr(msg, "content", "") or "")) for msg in terminal_only)
-        if not self._is_batch_context(latest_task=latest_task, command_text=command_text, joined=joined):
-            return ""
 
         evidence = self.evidence_from_messages(evidence_messages)
         gate = self.evaluate_operational_contract(latest_task=latest_task, terminal_messages=evidence_messages)
@@ -576,6 +583,9 @@ class BatchExecutionService:
             if gate.needs_repair:
                 if self._should_block_final_for_operational_contract(gate, evidence):
                     return ""
+
+        if not self._is_batch_context(latest_task=latest_task, command_text=command_text, joined=joined):
+            return ""
 
         if evidence.structured_report:
             return evidence.structured_report
@@ -1660,10 +1670,31 @@ class BatchExecutionService:
 
     def _is_batch_context(self, *, latest_task: str, command_text: str, joined: str) -> bool:
         task_text = latest_task or ""
-        return (
-            self.is_operational_task(task_text)
-            or self.looks_like_batch_terminal_command(command_text or joined, task_text=task_text)
-        )
+        contract = self.infer_contract(task_text)
+        if contract is not None and contract.requires_file_batch:
+            return True
+        if self.looks_like_batch_terminal_command(command_text, task_text=task_text):
+            return True
+        evidence = self.evidence_from_text(joined)
+        joined_scope = (joined or "").lower()
+        if evidence.progress_total > 1:
+            return True
+        if evidence.has_durable_start and self._task_requires_batch_context(task_text):
+            return True
+        if evidence.has_durable_start and any(marker in joined_scope for marker in self.MULTI_ITEM_MARKERS):
+            return True
+        if evidence.running_line and any(marker in joined_scope for marker in self.MULTI_ITEM_MARKERS):
+            return True
+        return False
+
+    def _task_requires_batch_context(self, task_text: str) -> bool:
+        normalized = (task_text or "").lower()
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in self.MULTI_ITEM_MARKERS):
+            return True
+        targets = re.findall(r"(?<!\d)\d{12,}(?!\d)", task_text or "")
+        return len(set(targets)) > 1
 
     def _evidence_suffix(self, evidence: BatchEvidence) -> str:
         parts: list[str] = []

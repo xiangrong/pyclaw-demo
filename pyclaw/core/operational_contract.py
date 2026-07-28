@@ -117,7 +117,7 @@ def infer_operational_task_contract(text: str) -> OperationalTaskContract | None
     if not normalized.strip():
         return None
 
-    targets = tuple(dict.fromkeys(re.findall(r"\b\d{12,}\b", raw_task)))
+    targets = tuple(dict.fromkeys(re.findall(r"(?<!\d)\d{12,}(?!\d)", raw_task)))
     required_facets: list[str] = []
 
     if _mentions_model(normalized):
@@ -191,7 +191,7 @@ def _mentions_image_update(normalized: str) -> bool:
 def _mentions_batch(normalized: str) -> bool:
     return any(
         marker in normalized
-        for marker in ("批量", "这些", "列表", "全部", "逐个", "多个", "batch", "bulk", "all", "list")
+        for marker in ("批量", "这些", "这批", "列表", "全部", "逐个", "多个", "batch", "bulk", "all", "list")
     )
 
 
