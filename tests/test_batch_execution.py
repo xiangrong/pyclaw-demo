@@ -17,6 +17,36 @@ def _terminal_message(content: str) -> Message:
     )
 
 
+def _structured_terminal_message(*, command: str, stdout: str = "", stderr: str = "") -> Message:
+    content = (
+        "OBSERVATION from terminal:\n"
+        f"Command: {command}\n"
+        "Exit code: 0\n\n"
+        f"STDOUT:\n{stdout}"
+    )
+    if stderr:
+        content += f"STDERR:\n{stderr}"
+    return Message(
+        id="tool-structured-1",
+        channel="feishu",
+        channel_user_id="u1",
+        user_id="u1",
+        session_id="s1",
+        type=MessageType.TEXT,
+        role=MessageRole.TOOL,
+        metadata={
+            "tool_name": "terminal",
+            "tool_result_structured": {
+                "command": command,
+                "exit_code": 0,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+        },
+        content=content,
+    )
+
+
 def _read_file_message(content: str, *, message_id: str = "read-file-1") -> Message:
     return Message(
         id=message_id,
@@ -115,6 +145,100 @@ def test_batch_execution_progress_line_is_not_treated_as_completed_stats():
     assert "批量任务已有结果输出" not in final
     assert "仍在执行中" in final
     assert "3/62" in final
+
+
+def test_batch_execution_does_not_complete_from_nohup_wrapper_command_text():
+    service = BatchExecutionService()
+    command = (
+        "nohup bash -c '\n"
+        "cd /Users/bytedance/.pyclaw\n"
+        "echo \"=== 开始批量出口IP查询 ===\"\n"
+        "python3 batch_egress_wss_serial.py pod_egress_9_new.txt\n"
+        "echo \"=== 查询完成 ===\"\n"
+        "echo \"完成时间: $(date)\"\n"
+        "' > /Users/bytedance/.pyclaw/batch_query_egress_9pods.log 2>&1 < /dev/null & "
+        "echo \"PID=$! LOG=/Users/bytedance/.pyclaw/batch_query_egress_9pods.log\""
+    )
+    messages = [
+        _structured_terminal_message(
+            command=command,
+            stdout="PID=30411 LOG=/Users/bytedance/.pyclaw/batch_query_egress_9pods.log\n",
+        )
+    ]
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(
+        latest_task="查下这些pod的出口ip",
+        terminal_messages=messages,
+    )
+
+    assert evidence.pid == "30411"
+    assert evidence.log_path == "/Users/bytedance/.pyclaw/batch_query_egress_9pods.log"
+    assert evidence.completion_line == ""
+    assert evidence.stats_line == ""
+    assert "批量任务已在后台启动" in final
+    assert "批量任务已执行完成" not in final
+    assert "关键输出" not in final
+
+
+def test_batch_execution_ignores_shell_variable_stats_inside_nohup_command_text():
+    service = BatchExecutionService()
+    command = (
+        "nohup bash -c '\n"
+        "SUCCESS=0\n"
+        "FAILED=0\n"
+        "for pod in 1 2 3 4; do\n"
+        "  SUCCESS=$((SUCCESS + 1))\n"
+        "done\n"
+        "echo \"=== 批量升级完成 ===\"\n"
+        "echo \"成功: $SUCCESS 台\"\n"
+        "echo \"失败: $FAILED 台\"\n"
+        "' > /Users/bytedance/.pyclaw/batch_update_image_4pods.log 2>&1 < /dev/null & "
+        "echo \"PID=$! LOG=/Users/bytedance/.pyclaw/batch_update_image_4pods.log\""
+    )
+    messages = [
+        _structured_terminal_message(
+            command=command,
+            stdout="PID=63919 LOG=/Users/bytedance/.pyclaw/batch_update_image_4pods.log\n",
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="批量升级这些pod镜像",
+        terminal_messages=messages,
+    )
+
+    assert "SUCCESS=$((SUCCESS + 1))" not in final
+    assert "批量任务已有结果输出" not in final
+    assert "批量任务已在后台启动" in final
+
+
+def test_batch_execution_partial_egress_log_stays_in_progress():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -220 /Users/bytedance/.pyclaw/batch_query_egress_9pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "=== 开始批量出口IP查询 ===\n"
+            "Pod数量: 9台\n"
+            "开始查询 9 台Pod的出口IP及运营商...\n"
+            "[1/9] 查询 7667116783811681066... ✓ 117.149.248.168 | AS56041 China Mobile | ShanghaiShanghai\n"
+            "[2/9] 查询 7667116783811615530... ✓ 117.149.248.168 | AS56041 China Mobile | ShanghaiShanghai\n"
+            "[3/9] 查询 7667116783811599146... ✓ 117.149.248.168 | AS56041 China Mobile | ShanghaiShanghai\n"
+            "[4/9] 查询 7667116783811697450...\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="查下这些pod的出口ip",
+        terminal_messages=messages,
+    )
+
+    assert "仍在执行中" in final
+    assert "4/9" in final
+    assert "已执行完成" not in final
 
 
 def test_batch_execution_requests_bounded_poll_for_partial_progress():
@@ -452,6 +576,126 @@ def test_batch_execution_final_includes_pod_model_detail_rows_from_terminal_log(
     assert "pod_models_9_new_results.json" in final
     assert "| taurus | 9 台 | 100.0% |" in final
     assert "批量任务已执行完成：查询完成" not in final
+
+
+def test_batch_execution_final_includes_generic_batch_detail_rows_from_terminal_log():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -120 /Users/bytedance/.pyclaw/service_health.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始批量检查 4 个服务...\n"
+            "[1/4] user-api: OK 200\n"
+            "[2/4] pay-api: FAILED 503\n"
+            "[3/4] search-api -> OK 200\n"
+            "[4/4] https://example.com/health => OK 200\n"
+            "处理完成！成功: 3, 失败: 1\n"
+            "完整结果已保存到: service_health_results.json\n"
+        )
+    ]
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(
+        latest_task="批量检查这些服务的健康状态",
+        terminal_messages=messages,
+    )
+
+    assert evidence.item_results == (
+        "user-api: OK 200",
+        "pay-api: FAILED 503",
+        "search-api: OK 200",
+        "https://example.com/health: OK 200",
+    )
+    assert evidence.result_distribution == ("OK 200: 3 条",)
+    assert "## ✅ 批量任务完成报告" in final
+    assert "### 📋 明细" in final
+    assert "| user-api | OK 200 |" in final
+    assert "| pay-api | FAILED 503 |" in final
+    assert "| search-api | OK 200 |" in final
+    assert "| https://example.com/health | OK 200 |" in final
+    assert "处理成功：3 条" in final
+    assert "处理失败：1 条" in final
+    assert "| OK 200 | 3 条 | 75.0% |" in final
+    assert "批量任务已执行完成" not in final
+
+
+def test_batch_execution_generic_parser_does_not_split_url_scheme():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -80 /Users/bytedance/.pyclaw/url_health.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "[1/2] https://example.com/login OK 200\n"
+            "[2/2] http://example.org/health FAILED 500\n"
+            "处理完成！成功: 1, 失败: 1\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="批量检查这些url的状态",
+        terminal_messages=messages,
+    )
+
+    assert "| https://example.com/login | OK 200 |" in final
+    assert "| http://example.org/health | FAILED 500 |" in final
+
+
+def test_batch_execution_finalizes_generic_json_read_file_result():
+    service = BatchExecutionService()
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/service_versions.json (5 lines)\n"
+            "\n"
+            "{\n"
+            "  \"user-api\": \"v1.2.3\",\n"
+            "  \"pay-api\": \"FAILED_TO_QUERY\",\n"
+            "  \"search-api\": {\"status\": \"v2.0.0\"}\n"
+            "}\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="批量查询这些服务的版本",
+        terminal_messages=messages,
+    )
+
+    assert "## ✅ 批量任务完成报告" in final
+    assert "总处理量：3 条" in final
+    assert "处理成功：2 条" in final
+    assert "处理失败：1 条" in final
+    assert "| user-api | v1.2.3 |" in final
+    assert "| pay-api | FAILED_TO_QUERY |" in final
+    assert "| search-api | v2.0.0 |" in final
+
+
+def test_batch_execution_finalizes_generic_csv_read_file_result():
+    service = BatchExecutionService()
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/account_status.csv (4 lines)\n"
+            "\n"
+            "账号,状态\n"
+            "alice,active\n"
+            "bob,disabled\n"
+            "carol,active\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="批量查询这些账号状态",
+        terminal_messages=messages,
+    )
+
+    assert "## ✅ 批量任务完成报告" in final
+    assert "| alice | active |" in final
+    assert "| bob | disabled |" in final
+    assert "| active | 2 条 | 66.7% |" in final
 
 
 def test_batch_execution_finalizes_pod_model_json_read_file_result():

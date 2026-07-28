@@ -70,6 +70,64 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="generic-batch-detail-rows-are-delivered",
+            category="batch_task",
+            input={
+                "latest_task": "批量检查这些服务的健康状态",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: tail -120 /Users/bytedance/.pyclaw/service_health.log\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始批量检查 4 个服务...\n"
+                    "[1/4] user-api: OK 200\n"
+                    "[2/4] pay-api: FAILED 503\n"
+                    "[3/4] search-api -> OK 200\n"
+                    "[4/4] https://example.com/health => OK 200\n"
+                    "处理完成！成功: 3, 失败: 1\n"
+                    "完整结果已保存到: service_health_results.json\n"
+                ),
+            },
+            expected={
+                "contains": [
+                    "## ✅ 批量任务完成报告",
+                    "### 📋 明细",
+                    "| user-api | OK 200 |",
+                    "| pay-api | FAILED 503 |",
+                    "| search-api | OK 200 |",
+                    "| https://example.com/health | OK 200 |",
+                    "处理成功：3 条",
+                    "处理失败：1 条",
+                    "| OK 200 | 3 条 | 75.0% |",
+                ]
+            },
+        ),
+        ReplayCase(
+            name="background-start-command-is-not-completion",
+            category="batch_task",
+            input={
+                "latest_task": "查下这些pod的出口ip",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: nohup bash -c '\n"
+                    "echo \"=== 开始批量出口IP查询 ===\"\n"
+                    "python3 batch_egress_wss_serial.py pod_egress_9_new.txt\n"
+                    "echo \"=== 查询完成 ===\"\n"
+                    "echo \"完成时间: $(date)\"\n"
+                    "' > /Users/bytedance/.pyclaw/batch_query_egress_9pods.log 2>&1 < /dev/null & "
+                    "echo \"PID=$! LOG=/Users/bytedance/.pyclaw/batch_query_egress_9pods.log\"\n"
+                    "Exit code: 0\n"
+                    "\n"
+                    "STDOUT:\n"
+                    "PID=30411 LOG=/Users/bytedance/.pyclaw/batch_query_egress_9pods.log\n"
+                ),
+            },
+            expected={
+                "contains": ["批量任务已在后台启动", "尚未观察到完成汇总", "PID：30411"],
+                "not_contains": ["批量任务已执行完成", "关键输出"],
+            },
+        ),
+        ReplayCase(
             name="code-change-needs-validation",
             category="code_modification",
             input={"changed_files": ["pyclaw/tools/base.py"], "validation_results": []},

@@ -120,14 +120,18 @@ class DurableTaskEngine:
 
     def evidence_from_text(self, text: str) -> DurableTaskEvidence:
         content = text or ""
-        pid = self._last_match(content, r"\b(?:PID|pid|进程)\b[:：=]?\s*(\d+)")
-        log_path = self._last_path(content, ("log",))
-        result_path = self._last_result_path(content, log_path=log_path)
-        stats_line = self._first_pattern_line(content, self.STATS_PATTERNS) or self._multiline_stats_summary(content)
-        completion_line = self._first_pattern_line(content, self.COMPLETION_PATTERNS)
-        progress_line, progress_current, progress_total = self._last_progress(content)
-        running_line = self._first_pattern_line(content, self.RUNNING_PATTERNS)
-        error_line = self._first_pattern_line(content, self.ERROR_PATTERNS)
+        observable_content = self.observable_output_text(content)
+        pid = self._last_match(observable_content, r"\b(?:PID|pid|进程)\b[:：=]?\s*(\d+)") or self._last_match(
+            content,
+            r"\b(?:PID|pid|进程)\b[:：=]?\s*(\d+)",
+        )
+        log_path = self._last_path(observable_content, ("log",)) or self._last_path(content, ("log",))
+        result_path = self._last_result_path(observable_content, log_path=log_path)
+        stats_line = self._first_pattern_line(observable_content, self.STATS_PATTERNS) or self._multiline_stats_summary(observable_content)
+        completion_line = self._first_pattern_line(observable_content, self.COMPLETION_PATTERNS)
+        progress_line, progress_current, progress_total = self._last_progress(observable_content)
+        running_line = self._first_pattern_line(observable_content, self.RUNNING_PATTERNS)
+        error_line = self._first_pattern_line(observable_content, self.ERROR_PATTERNS)
         if error_line and self._line_is_non_terminal_timeout(error_line):
             error_line = ""
         return DurableTaskEvidence(
@@ -143,7 +147,7 @@ class DurableTaskEngine:
             progress_total=progress_total,
             running_line=running_line,
             error_line=error_line,
-            output_excerpt=self._output_excerpt(content),
+            output_excerpt=self._output_excerpt(observable_content),
         )
 
     def evidence_from_messages(self, messages: Sequence[object], *, limit: int = 12) -> DurableTaskEvidence:
@@ -163,17 +167,100 @@ class DurableTaskEngine:
                 stdout = str(structured.get("stdout") or "")
                 stderr = str(structured.get("stderr") or "")
                 if command:
-                    chunks.append(f"Command: {command}")
+                    chunks.append(f"Command: {self.compact_command_for_evidence(command)}")
                 if stdout:
-                    chunks.append(stdout)
+                    chunks.append(f"STDOUT:\n{stdout}")
                 if stderr:
-                    chunks.append(stderr)
+                    chunks.append(f"STDERR:\n{stderr}")
                 if metadata.get("tool_result_error_code") == "timeout":
                     timeout = structured.get("timeout") or ""
                     chunks.append(f"Command timed out after {timeout} seconds".strip())
                 continue
             chunks.append(str(getattr(msg, "content", "") or ""))
         return self.evidence_from_text("\n".join(chunks))
+
+    def observable_output_text(self, content: str) -> str:
+        """Return execution output with terminal command/script wrappers removed.
+
+        Durable completion must be based on observed stdout/stderr, log tails, or
+        result-file contents.  A common background pattern embeds lines like
+        ``echo "=== 查询完成 ==="`` inside the shell script passed to ``nohup``;
+        those script lines are not evidence that the job has finished.  This
+        helper keeps PID/log discovery available from the full observation while
+        preventing command text from satisfying completion/statistics regexes.
+        """
+        text = content or ""
+        if not text:
+            return ""
+
+        lines = text.splitlines()
+        captured_blocks: list[str] = []
+        current: list[str] = []
+        capturing = False
+        saw_output_marker = False
+
+        def flush_current() -> None:
+            nonlocal current
+            if current:
+                captured_blocks.append("\n".join(current))
+                current = []
+
+        for raw in lines:
+            stripped = raw.strip()
+            if stripped.startswith("OBSERVATION from read_file"):
+                flush_current()
+                capturing = False
+                captured_blocks.append(raw)
+                continue
+            if stripped.startswith(("OBSERVATION from ", "<error_context", "</error_context")):
+                flush_current()
+                capturing = False
+                continue
+            if stripped in {"STDOUT:", "STDERR:"}:
+                flush_current()
+                capturing = True
+                saw_output_marker = True
+                continue
+            if stripped.startswith("File:"):
+                if capturing:
+                    flush_current()
+                    capturing = False
+                captured_blocks.append(raw)
+                continue
+            if stripped.startswith(("Command:", "Exit code:", "NOTICE:")):
+                if capturing:
+                    flush_current()
+                capturing = False
+                continue
+            if capturing:
+                current.append(raw)
+        flush_current()
+
+        if saw_output_marker:
+            return "\n".join(block for block in captured_blocks if block.strip())
+
+        return self._strip_command_blocks(text)
+
+    def _strip_command_blocks(self, content: str) -> str:
+        lines: list[str] = []
+        skipping_command = False
+        for raw in (content or "").splitlines():
+            stripped = raw.strip()
+            if stripped.startswith("Command:"):
+                skipping_command = True
+                continue
+            if skipping_command:
+                if stripped.startswith(("Exit code:", "STDOUT:", "STDERR:", "OBSERVATION from ")):
+                    skipping_command = False
+                else:
+                    continue
+            if stripped.startswith(("OBSERVATION from terminal", "Exit code:", "STDOUT:", "STDERR:", "NOTICE:", "<error_context", "</error_context")):
+                continue
+            lines.append(raw)
+        return "\n".join(lines)
+
+    def compact_command_for_evidence(self, command: str) -> str:
+        return re.sub(r"\s+", " ", str(command or "")).strip()
 
     def last_result_path(self, content: str, *, log_path: str = "") -> str:
         """Return the most likely durable task result path from tool output."""

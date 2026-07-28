@@ -32,3 +32,31 @@ def test_durable_task_engine_public_helpers_extract_result_and_stats():
         "LOG=/tmp/jobs/pod.log\n输出文件: pod_query_results.csv\n",
         log_path="/tmp/jobs/pod.log",
     ) == "/tmp/jobs/pod_query_results.csv"
+
+
+def test_durable_task_engine_ignores_completion_markers_inside_command_script():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "OBSERVATION from terminal:\n"
+        "Command: nohup bash -c '\n"
+        "echo \"=== 开始批量查询 ===\"\n"
+        "SUCCESS=0\n"
+        "FAILED=0\n"
+        "SUCCESS=$((SUCCESS + 1))\n"
+        "echo \"=== 查询完成 ===\"\n"
+        "echo \"完成时间: $(date)\"\n"
+        "echo \"成功: $SUCCESS 台\"\n"
+        "echo \"失败: $FAILED 台\"\n"
+        "' > /Users/bytedance/.pyclaw/batch.log 2>&1 < /dev/null & "
+        "echo \"PID=$! LOG=/Users/bytedance/.pyclaw/batch.log\"\n"
+        "Exit code: 0\n"
+        "\n"
+        "STDOUT:\n"
+        "PID=30411 LOG=/Users/bytedance/.pyclaw/batch.log\n"
+    )
+
+    assert evidence.pid == "30411"
+    assert evidence.log_path == "/Users/bytedance/.pyclaw/batch.log"
+    assert evidence.stats_line == ""
+    assert evidence.completion_line == ""
+    assert evidence.status == "starting"

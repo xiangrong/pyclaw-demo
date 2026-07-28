@@ -42,6 +42,7 @@ class GoldenReplaySuite:
     def __init__(self, batch_execution: BatchExecutionService | None = None) -> None:
         self.batch_execution = batch_execution or BatchExecutionService()
         self._evaluators: dict[str, Callable[[ReplayCase], ReplayResult]] = {
+            "batch_task": self._eval_batch_task,
             "pod_query": self._eval_pod_query,
             "code_modification": self._eval_code_modification,
             "file_delivery": self._eval_file_delivery,
@@ -59,7 +60,7 @@ class GoldenReplaySuite:
             results.append(evaluator(case))
         return results
 
-    def _eval_pod_query(self, case: ReplayCase) -> ReplayResult:
+    def _eval_batch_task(self, case: ReplayCase) -> ReplayResult:
         message = _tool_message(str(case.input.get("observation", "")), tool_name=str(case.input.get("tool_name", "terminal")))
         final = self.batch_execution.final_from_observations(
             latest_task=str(case.input.get("latest_task", "")),
@@ -68,9 +69,18 @@ class GoldenReplaySuite:
         observed = {"final": final}
         expectations = case.expected
         missing = [text for text in expectations.get("contains", []) if str(text) not in final]
-        passed = bool(final.strip()) and not missing
-        details = "" if passed else "missing expected text: " + ", ".join(missing)
+        forbidden = [text for text in expectations.get("not_contains", []) if str(text) in final]
+        passed = bool(final.strip()) and not missing and not forbidden
+        details_parts: list[str] = []
+        if missing:
+            details_parts.append("missing expected text: " + ", ".join(missing))
+        if forbidden:
+            details_parts.append("found forbidden text: " + ", ".join(forbidden))
+        details = "; ".join(details_parts)
         return ReplayResult(case.name, case.category, passed, details, observed)
+
+    def _eval_pod_query(self, case: ReplayCase) -> ReplayResult:
+        return self._eval_batch_task(case)
 
     def _eval_code_modification(self, case: ReplayCase) -> ReplayResult:
         changed_files = set(str(item) for item in case.input.get("changed_files", []) if str(item).strip())

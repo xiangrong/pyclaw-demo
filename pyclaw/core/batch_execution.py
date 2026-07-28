@@ -27,6 +27,8 @@ class BatchEvidence(DurableTaskEvidence):
     ip_distribution: tuple[str, ...] = ()
     model_distribution: tuple[str, ...] = ()
     model_items: tuple[str, ...] = ()
+    result_distribution: tuple[str, ...] = ()
+    item_results: tuple[str, ...] = ()
     structured_report: str = ""
 
     @property
@@ -69,6 +71,8 @@ class BatchExecutionService:
         "deployment", "deploy", "daemonset", "statefulset", "service", "ingress",
         "容器", "实例", "image", "registry", "harbor", "cr.volces", "docker", "helm",
         "adb", "device", "devices", "设备", "serial", "端口", "接口", "环境", "灰度",
+        "服务", "域名", "网址", "url", "endpoint", "api", "账号", "账户",
+        "订单", "工单", "job", "jobs", "worker", "健康检查",
     )
     ACTION_MARKERS: tuple[str, ...] = (
         "更新", "升级", "替换", "改成", "设置", "回滚", "发布", "重启", "扩容", "缩容",
@@ -440,21 +444,25 @@ class BatchExecutionService:
             stdout = str(structured.get("stdout") or "")
             stderr = str(structured.get("stderr") or "")
             if command:
-                chunks.append(f"Command: {command}")
+                chunks.append(f"Command: {self._compact_command_for_evidence(command)}")
             if stdout:
-                chunks.append(stdout)
+                chunks.append(f"STDOUT:\n{stdout}")
             if stderr:
-                chunks.append(stderr)
+                chunks.append(f"STDERR:\n{stderr}")
         return self.evidence_from_text("\n".join(chunks))
+
+    def _compact_command_for_evidence(self, command: str) -> str:
+        return self.durable.compact_command_for_evidence(command)
 
     def evidence_from_text(self, text: str) -> BatchEvidence:
         content = text or ""
+        observable_content = self.durable.observable_output_text(content)
         durable = self.durable.evidence_from_text(content)
         result_path = durable.result_path
         stats_line = durable.stats_line
         completion_line = durable.completion_line
         operator_distribution = self._distribution_section(
-            content,
+            observable_content,
             (
                 "运营商分布统计",
                 "运营商统计",
@@ -465,7 +473,7 @@ class BatchExecutionService:
             ),
         )
         region_distribution = self._distribution_section(
-            content,
+            observable_content,
             (
                 "地域分布统计",
                 "地域统计",
@@ -476,7 +484,7 @@ class BatchExecutionService:
             ),
         )
         model_distribution = self._distribution_section(
-            content,
+            observable_content,
             (
                 "机型分布统计",
                 "机型统计",
@@ -488,7 +496,7 @@ class BatchExecutionService:
                 "device model distribution",
             ),
         )
-        structured = self._structured_result_evidence(content, result_path_hint=result_path)
+        structured = self._structured_result_evidence(observable_content, result_path_hint=result_path)
         if structured:
             if not result_path:
                 result_path = str(structured.get("result_path") or "")
@@ -499,6 +507,8 @@ class BatchExecutionService:
             model_distribution = model_distribution or tuple(structured.get("model_distribution") or ())
         ip_distribution = tuple(structured.get("ip_distribution") or ()) if structured else ()
         model_items = tuple(structured.get("model_items") or ()) if structured else ()
+        result_distribution = tuple(structured.get("result_distribution") or ()) if structured else ()
+        item_results = tuple(structured.get("item_results") or ()) if structured else ()
         structured_report = str(structured.get("structured_report") or "") if structured else ""
         return BatchEvidence(
             timed_out=durable.timed_out,
@@ -518,6 +528,8 @@ class BatchExecutionService:
             ip_distribution=ip_distribution,
             model_distribution=model_distribution,
             model_items=model_items,
+            result_distribution=result_distribution,
+            item_results=item_results,
             structured_report=structured_report,
             output_excerpt=durable.output_excerpt,
         )
@@ -583,6 +595,23 @@ class BatchExecutionService:
             if result_path_hint:
                 result_paths.append(result_path_hint)
             return self._model_mapping_evidence(simple_mapping, result_paths=result_paths)
+
+        generic_mapping = self._generic_value_mapping(mapping)
+        if generic_mapping and paths:
+            return self._generic_item_results_evidence(
+                [{"item": item, "result": result} for item, result in generic_mapping.items()],
+                result_paths=paths,
+            )
+
+        generic_csv_items, generic_csv_paths = self._generic_csv_item_results_from_read_files(content)
+        if generic_csv_items:
+            result_paths = generic_csv_paths or ([result_path_hint] if result_path_hint else [])
+            return self._generic_item_results_evidence(generic_csv_items, result_paths=result_paths)
+
+        generic_items = self._generic_item_results_from_terminal_rows(content)
+        if generic_items and self._text_has_completion_evidence(content):
+            result_paths = [result_path_hint] if result_path_hint else []
+            return self._generic_item_results_evidence(generic_items, result_paths=result_paths)
         return {}
 
     def _json_mappings_from_read_files(self, content: str) -> tuple[dict[str, Any], list[str]]:
@@ -639,6 +668,109 @@ class BatchExecutionService:
                 result[str(key)] = str(value).strip()
         return result
 
+    def _generic_value_mapping(self, mapping: dict[str, Any]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for key, value in mapping.items():
+            item = str(key or "").strip()
+            if not item or self._looks_like_pod_id(item):
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                value_text = str(value).strip()
+            elif isinstance(value, dict):
+                value_text = self._dict_get(
+                    value,
+                    (
+                        "结果", "状态", "健康状态", "版本", "镜像", "机型", "值",
+                        "result", "status", "state", "health", "version", "image", "model", "value",
+                    ),
+                )
+            else:
+                value_text = ""
+            if value_text:
+                result[item] = value_text[:260]
+        return result
+
+    def _generic_csv_item_results_from_read_files(self, content: str) -> tuple[list[dict[str, str]], list[str]]:
+        items: list[dict[str, str]] = []
+        paths: list[str] = []
+        for path, body in self._read_file_blocks(content):
+            rows = self._parse_csv_rows_from_body(body)
+            if not rows:
+                continue
+            parsed = self._generic_item_results_from_csv_rows(rows)
+            if not parsed:
+                continue
+            items.extend(parsed)
+            if path:
+                paths.append(path)
+        return items, paths
+
+    def _parse_csv_rows_from_body(self, body: str) -> list[dict[str, str]]:
+        lines = [line for line in (body or "").splitlines() if line.strip() and not line.strip().startswith("```")]
+        if not lines or "," not in lines[0]:
+            return []
+        try:
+            reader = csv.reader(io.StringIO("\n".join(lines)))
+            headers = [str(header or "").strip() for header in next(reader, [])]
+            if len(headers) < 2:
+                return []
+            rows: list[dict[str, str]] = []
+            for values in reader:
+                values = [str(value or "").strip() for value in values]
+                if len(values) < len(headers):
+                    values.extend([""] * (len(headers) - len(values)))
+                if len(values) > len(headers):
+                    values = list(values[:len(headers) - 1]) + [",".join(values[len(headers) - 1:])]
+                row = dict(zip(headers, values))
+                if any(row.values()):
+                    rows.append(row)
+            return rows
+        except csv.Error:
+            return []
+
+    def _generic_item_results_from_csv_rows(self, rows: Sequence[dict[str, str]]) -> list[dict[str, str]]:
+        if not rows:
+            return []
+        headers = list(rows[0].keys())
+        item_header = self._choose_header(
+            headers,
+            (
+                "项目", "名称", "服务", "域名", "网址", "接口", "账号", "用户", "订单", "工单", "任务",
+                "item", "name", "service", "url", "endpoint", "api", "account", "user", "order", "ticket", "job",
+                "id", "serial", "device",
+            ),
+        ) or headers[0]
+        result_header = self._choose_header(
+            headers,
+            (
+                "结果", "状态", "健康状态", "版本", "镜像", "机型", "值",
+                "result", "status", "state", "health", "version", "image", "model", "value",
+            ),
+        )
+        if not result_header or result_header == item_header:
+            result_header = next((header for header in reversed(headers) if header != item_header), "")
+        if not result_header:
+            return []
+
+        items: list[dict[str, str]] = []
+        for row in rows:
+            item = self._row_get(row, (item_header,))
+            result = self._row_get(row, (result_header,))
+            if item and result and not self._looks_like_pod_id(item):
+                items.append({"item": item[:180], "result": result[:260]})
+        return items
+
+    def _choose_header(self, headers: Sequence[str], candidates: Sequence[str]) -> str:
+        lowered = {str(header).strip().lower(): str(header) for header in headers}
+        for candidate in candidates:
+            candidate_text = str(candidate).strip()
+            if candidate_text in headers:
+                return candidate_text
+            match = lowered.get(candidate_text.lower())
+            if match:
+                return match
+        return ""
+
     def _model_pairs_from_terminal_rows(self, content: str) -> dict[str, str]:
         pairs: dict[str, str] = {}
         pattern = re.compile(
@@ -650,6 +782,150 @@ class BatchExecutionService:
             if model:
                 pairs[match.group("pod")] = model[:120]
         return pairs
+
+    def _generic_item_results_from_terminal_rows(self, content: str) -> list[dict[str, str]]:
+        """Extract item-level results from common ``[i/n] item: value`` logs.
+
+        This is intentionally domain-neutral.  It catches completed batch logs
+        for URLs, services, device serials, images, jobs, etc. without baking in
+        pod-specific assumptions.  Pod model rows are handled by the more
+        specific parser above so existing specialized reports stay stable.
+        """
+        rows: list[dict[str, str]] = []
+        pattern = re.compile(r"^\s*\[\s*(?P<index>\d+)\s*/\s*(?P<total>\d+)\s*\]\s*(?P<body>.+?)\s*$")
+        for raw in (content or "").splitlines():
+            match = pattern.match(raw)
+            if not match:
+                continue
+            body = match.group("body").strip()
+            parsed = self._parse_generic_item_result_body(body)
+            if not parsed:
+                continue
+            item, result = parsed
+            if self._looks_like_pod_id(item):
+                # Pod/domain-specific rows keep their existing specialized
+                # reports.  This generic path is for non-pod batch tasks.
+                continue
+            rows.append({
+                "index": match.group("index"),
+                "total": match.group("total"),
+                "item": item[:180],
+                "result": result[:260],
+            })
+        return rows
+
+    def _parse_generic_item_result_body(self, body: str) -> tuple[str, str] | None:
+        text = (body or "").strip()
+        if not text:
+            return None
+        text = re.sub(r"^(?:查询|检查|处理|更新|执行|导出|验证)\s+", "", text).strip()
+        text = text.replace("...", " … ").replace("…", " … ")
+
+        for delimiter in (" => ", " -> ", "："):
+            if delimiter not in text:
+                continue
+            left, right = text.split(delimiter, 1)
+            item = self._clean_generic_item(left)
+            result = self._clean_generic_result(right)
+            if item and result:
+                return item, result
+
+        colon_split = self._split_generic_colon_result(text)
+        if colon_split:
+            item, result = colon_split
+            if item and result:
+                return item, result
+
+        success_match = re.match(r"(?P<item>.+?)\s*(?:\s+…\s+|\s+)✓\s*(?P<result>.+)$", text)
+        if success_match:
+            item = self._clean_generic_item(success_match.group("item"))
+            result = self._clean_generic_result(success_match.group("result"))
+            if item and result:
+                return item, result
+
+        status_match = re.match(r"(?P<item>.+?)\s+(?P<result>OK|PASS|PASSED|SUCCESS|DONE|FAILED|FAIL|ERROR|TIMEOUT|SKIPPED)\b(?P<tail>.*)$", text, re.IGNORECASE)
+        if status_match:
+            item = self._clean_generic_item(status_match.group("item"))
+            result = self._clean_generic_result((status_match.group("result") + status_match.group("tail")).strip())
+            if item and result:
+                return item, result
+        return None
+
+    def _clean_generic_item(self, value: str) -> str:
+        cleaned = str(value or "").strip().strip("`'\"")
+        cleaned = cleaned.rstrip(" .…\t")
+        return cleaned.strip()
+
+    def _split_generic_colon_result(self, text: str) -> tuple[str, str] | None:
+        for match in re.finditer(r":\s+", text or ""):
+            left = text[:match.start()]
+            right = text[match.end():]
+            # Do not split URI schemes such as ``https://host OK``.
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", left.strip()) and right.startswith("//"):
+                continue
+            item = self._clean_generic_item(left)
+            result = self._clean_generic_result(right)
+            if item and result:
+                return item, result
+        return None
+
+    def _clean_generic_result(self, value: str) -> str:
+        cleaned = str(value or "").strip().strip("`'\"")
+        cleaned = cleaned.lstrip(". …\t")
+        return cleaned.strip()
+
+    def _escape_markdown_table_cell(self, value: str) -> str:
+        return str(value or "").replace("\n", " ").replace("|", r"\|").strip()
+
+    def _generic_item_results_evidence(self, rows: Sequence[dict[str, str]], *, result_paths: Sequence[str]) -> dict[str, Any]:
+        normalized_rows: list[dict[str, str]] = []
+        for row in rows:
+            item = str(row.get("item") or "").strip()
+            result = str(row.get("result") or "").strip()
+            if item and result:
+                normalized_rows.append({"item": item, "result": result})
+
+        total = len(normalized_rows)
+        failed_items = [row for row in normalized_rows if self._is_failed_value(row["result"])]
+        success = total - len(failed_items)
+        distribution = Counter(row["result"] for row in normalized_rows if not self._is_failed_value(row["result"]))
+        result_distribution = tuple(f"{result}: {count} 条" for result, count in distribution.most_common())
+        unique_paths = list(dict.fromkeys(str(path) for path in result_paths if path))
+
+        report_lines = [
+            "## ✅ 批量任务完成报告",
+            "",
+            "### 📊 总体执行情况",
+            f"- 总处理量：{total} 条",
+            f"- 处理成功：{success} 条",
+            f"- 处理失败：{len(failed_items)} 条",
+        ]
+        if unique_paths:
+            report_lines.append("- 结果文件：" + "，".join(unique_paths))
+
+        report_lines.extend(["", "### 📋 明细", "| 项目 | 结果 |", "|---|---|"])
+        for row in normalized_rows:
+            report_lines.append(f"| {self._escape_markdown_table_cell(row['item'])} | {self._escape_markdown_table_cell(row['result'])} |")
+
+        if distribution:
+            report_lines.extend(["", "### 📈 结果分布", "| 结果 | 数量 | 占比 |", "|---|---:|---:|"])
+            for result, count in distribution.most_common():
+                pct = (count / total * 100) if total else 0.0
+                report_lines.append(f"| {self._escape_markdown_table_cell(result)} | {count} 条 | {pct:.1f}% |")
+
+        if failed_items:
+            report_lines.extend(["", "### ⚠️ 未成功项", "| 项目 | 结果 |", "|---|---|"])
+            for row in failed_items[:30]:
+                report_lines.append(f"| {self._escape_markdown_table_cell(row['item'])} | {self._escape_markdown_table_cell(row['result'])} |")
+
+        return {
+            "stats_line": f"总数={total} 成功={success} 失败={len(failed_items)}",
+            "completion_line": "处理完成",
+            "result_path": unique_paths[-1] if unique_paths else "",
+            "result_distribution": result_distribution,
+            "item_results": tuple(f"{row['item']}: {row['result']}" for row in normalized_rows),
+            "structured_report": "\n".join(report_lines),
+        }
 
     def _model_mapping_evidence(self, mapping: dict[str, str], *, result_paths: Sequence[str]) -> dict[str, Any]:
         normalized_mapping: dict[str, str] = {}
