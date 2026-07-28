@@ -44,6 +44,7 @@ class GoldenReplaySuite:
         self._evaluators: dict[str, Callable[[ReplayCase], ReplayResult]] = {
             "batch_task": self._eval_batch_task,
             "pod_query": self._eval_pod_query,
+            "operational_contract": self._eval_operational_contract,
             "code_modification": self._eval_code_modification,
             "file_delivery": self._eval_file_delivery,
             "sandbox_block": self._eval_sandbox_block,
@@ -81,6 +82,46 @@ class GoldenReplaySuite:
 
     def _eval_pod_query(self, case: ReplayCase) -> ReplayResult:
         return self._eval_batch_task(case)
+
+    def _eval_operational_contract(self, case: ReplayCase) -> ReplayResult:
+        raw_observations = case.input.get("observations")
+        if raw_observations is None:
+            raw_observations = [case.input.get("observation", "")]
+        messages = [
+            _tool_message(str(observation), tool_name=str(case.input.get("tool_name", "terminal")))
+            for observation in raw_observations
+        ]
+        latest_task = str(case.input.get("latest_task", ""))
+        final = self.batch_execution.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+        decision = self.batch_execution.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+        observed = {
+            "final": final,
+            "ready": decision.ready,
+            "needs_repair": decision.needs_repair,
+            "missing_facets": list(decision.missing_facets),
+            "retryable_failed_items": {key: list(value) for key, value in decision.retryable_failed_items.items()},
+            "reason": decision.reason,
+        }
+        expected = case.expected
+        mismatches: list[str] = []
+        for key in ("ready", "needs_repair", "reason"):
+            if key in expected and observed[key] != expected[key]:
+                mismatches.append(f"{key}: observed={observed[key]!r} expected={expected[key]!r}")
+        if "missing_facets" in expected and observed["missing_facets"] != expected["missing_facets"]:
+            mismatches.append(
+                f"missing_facets: observed={observed['missing_facets']!r} expected={expected['missing_facets']!r}"
+            )
+        if "retryable_failed_items" in expected and observed["retryable_failed_items"] != expected["retryable_failed_items"]:
+            mismatches.append("retryable_failed_items mismatch")
+        missing = [text for text in expected.get("contains", []) if str(text) not in final]
+        forbidden = [text for text in expected.get("not_contains", []) if str(text) in final]
+        if missing:
+            mismatches.append("missing expected text: " + ", ".join(missing))
+        if forbidden:
+            mismatches.append("found forbidden text: " + ", ".join(forbidden))
+        if expected.get("final_empty") is True and final.strip():
+            mismatches.append("expected empty final")
+        return ReplayResult(case.name, case.category, not mismatches, "; ".join(mismatches), observed)
 
     def _eval_code_modification(self, case: ReplayCase) -> ReplayResult:
         changed_files = set(str(item) for item in case.input.get("changed_files", []) if str(item).strip())

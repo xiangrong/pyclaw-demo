@@ -708,7 +708,7 @@ def test_batch_execution_finalizes_pod_model_json_read_file_result():
             "{\n"
             "  \"7663027791235341075\": \"PHW110\",\n"
             "  \"7663689796887255814\": \"M2011K2C\",\n"
-            "  \"7663689725312064292\": \"FAILED_TO_GET_WSS\"\n"
+            "  \"7663689725312064292\": \"22127RK46C\"\n"
             "}\n"
         )
     ]
@@ -720,11 +720,11 @@ def test_batch_execution_finalizes_pod_model_json_read_file_result():
 
     assert "Pod机型批量查询完成报告" in final
     assert "总查询量：3 台" in final
-    assert "查询成功：2 台" in final
-    assert "查询失败：1 台" in final
+    assert "查询成功：3 台" in final
+    assert "查询失败：0 台" in final
     assert "PHW110" in final
     assert "M2011K2C" in final
-    assert "FAILED_TO_GET_WSS" in final
+    assert "22127RK46C" in final
 
 
 def test_batch_execution_merges_retry_json_read_file_over_failed_main_result():
@@ -787,3 +787,215 @@ def test_batch_execution_finalizes_pod_egress_csv_read_file_result():
     assert "60.28.201.5" in final
     assert "111.32.192.161" in final
     assert "125.39.37.181" in final
+
+
+def test_operational_contract_blocks_composite_pod_query_with_only_model_evidence():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -200 /Users/bytedance/.pyclaw/batch_query_model_9pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 9 台Pod的机型...\n"
+            "[1/9] 7667116783811730218: taurus\n"
+            "[2/9] 7667116783811713834: taurus\n"
+            "[3/9] 7667116783811648298: taurus\n"
+            "[4/9] 7667116783811697450: taurus\n"
+            "[5/9] 7667116783811681066: taurus\n"
+            "[6/9] 7667116783811664682: taurus\n"
+            "[7/9] 7667116783811631914: taurus\n"
+            "[8/9] 7667116783811599146: taurus\n"
+            "[9/9] 7667116783811615530: taurus\n"
+            "查询完成！成功: 9, 失败: 0\n"
+            "机型分布:\n"
+            "  taurus: 9 台\n"
+            "完整结果已保存到: pod_models_9_new_results.json\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task=(
+            "查下这些pod的机型和出口ip\n"
+            "7667116783811681066\n7667116783811615530\n7667116783811599146\n"
+            "7667116783811697450\n7667116783811730218\n7667116783811631914\n"
+            "7667116783811713834\n7667116783811664682\n7667116783811648298"
+        ),
+        terminal_messages=messages,
+    )
+    decision = service.evaluate_operational_contract(
+        latest_task="查下这些pod的机型和出口ip",
+        terminal_messages=messages,
+    )
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.missing_facets == ("pod_egress",)
+    assert "Pod出口IP/运营商" in service.operational_contract_repair_notice(decision)
+
+
+def test_operational_contract_blocks_composite_pod_query_with_only_egress_evidence():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -50 /Users/bytedance/.pyclaw/batch_query_egress_9pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "=== 开始批量出口IP查询 ===\n"
+            "Pod数量: 9台\n"
+            "开始查询 9 台Pod的出口IP及运营商...\n"
+            "查询完成！成功: 9, 失败: 0\n"
+            "运营商分布统计:\n"
+            "  AS56041 China Mobile communications corporation: 9 台\n"
+            "地域分布统计:\n"
+            "  ShanghaiShanghai: 9 台\n"
+            "结果文件: /Users/bytedance/.pyclaw/pod_egress_9_new_wss_results.csv\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="查下这些pod的机型和出口ip\n7667116783811681066\n7667116783811615530",
+        terminal_messages=messages,
+    )
+    decision = service.evaluate_operational_contract(
+        latest_task="查下这些pod的机型和出口ip",
+        terminal_messages=messages,
+    )
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.missing_facets == ("pod_model",)
+
+
+def test_operational_contract_combines_model_and_egress_evidence_before_final():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -200 /Users/bytedance/.pyclaw/batch_query_model_2pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 2 台Pod的机型...\n"
+            "[1/2] 7667116783811730218: taurus\n"
+            "[2/2] 7667116783811713834: taurus\n"
+            "查询完成！成功: 2, 失败: 0\n"
+            "完整结果已保存到: pod_models_2_results.json\n"
+        ),
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -50 /Users/bytedance/.pyclaw/batch_query_egress_2pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 2 台Pod的出口IP及运营商...\n"
+            "查询完成！成功: 2, 失败: 0\n"
+            "运营商分布统计:\n"
+            "  AS56041 China Mobile communications corporation: 2 台\n"
+            "地域分布统计:\n"
+            "  ShanghaiShanghai: 2 台\n"
+            "结果文件: /Users/bytedance/.pyclaw/pod_egress_2_wss_results.csv\n"
+        ),
+    ]
+
+    final = service.final_from_observations(
+        latest_task="查下这些pod的机型和出口ip\n7667116783811730218\n7667116783811713834",
+        terminal_messages=messages,
+    )
+
+    assert "Operational任务完成报告" in final
+    assert "Pod机型" in final
+    assert "Pod出口IP/运营商" in final
+    assert "Pod机型批量查询完成报告" in final
+    assert "Pod出口IP/运营商批量查询完成报告" in final
+    assert "pod_models_2_results.json" in final
+    assert "pod_egress_2_wss_results.csv" in final
+
+
+def test_operational_contract_requires_retry_for_retryable_item_failures():
+    service = BatchExecutionService()
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/pod_models_25_results.json (5 lines)\n"
+            "\n"
+            "{\n"
+            "  \"7663027791235308307\": \"22127RK46C\",\n"
+            "  \"7663689872217430820\": \"FAILED_TO_GET_WSS\",\n"
+            "  \"7663689796887780102\": \"FAILED_TO_GET_WSS\"\n"
+            "}\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="查下这批pod的机型\n7663027791235308307\n7663689872217430820\n7663689796887780102",
+        terminal_messages=messages,
+    )
+    decision = service.evaluate_operational_contract(
+        latest_task="查下这批pod的机型",
+        terminal_messages=messages,
+    )
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.retryable_failed_items["pod_model"] == (
+        "7663689872217430820",
+        "7663689796887780102",
+    )
+    assert "Retry required" in service.operational_contract_repair_notice(decision)
+
+
+def test_operational_contract_does_not_treat_failed_wss_as_egress_evidence():
+    service = BatchExecutionService()
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/pod_models_25_results.json (5 lines)\n"
+            "\n"
+            "{\n"
+            "  \"7663027791235308307\": \"22127RK46C\",\n"
+            "  \"7663689872217430820\": \"FAILED_TO_GET_WSS\"\n"
+            "}\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="查下这些pod的机型和出口ip\n7663027791235308307\n7663689872217430820",
+        terminal_messages=messages,
+    )
+    decision = service.evaluate_operational_contract(
+        latest_task="查下这些pod的机型和出口ip",
+        terminal_messages=messages,
+    )
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.missing_facets == ("pod_egress",)
+    assert decision.retryable_failed_items["pod_model"] == ("7663689872217430820",)
+    assert set(decision.ledger.facets) == {"pod_model"}
+
+
+def test_operational_contract_renders_update_image_as_submitted_not_completed():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: opencli vephone update-image 7602589948898417434 --image cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr202607273 --env prod -f json 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "[\n"
+            "  {\"field\": \"环境\", \"value\": \"线上\"},\n"
+            "  {\"field\": \"Response\", \"value\": \"{\\\"BaseResp\\\":{\\\"StatusCode\\\":0,\\\"StatusMessage\\\":\\\"\\\"},\\\"RequestId\\\":\\\"202607272252076EDBF38393F45F4BD23B\\\"}\"}\n"
+            "]\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task="7602589948898417434 升级镜像 cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr202607273",
+        terminal_messages=messages,
+    )
+
+    assert "Pod镜像升级请求已提交成功" in final
+    assert "升级请求提交结果" not in final
+    assert "升级已完成" not in final
+    assert "未观察到后续验证证据" in final
+    assert "202607272252076EDBF38393F45F4BD23B" in final

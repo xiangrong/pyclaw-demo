@@ -12352,7 +12352,7 @@ def test_agent_finalizes_operational_batch_from_read_file_evidence_without_secon
                 "{\n"
                 "  \"7663027791235341075\": \"PHW110\",\n"
                 "  \"7663689796887255814\": \"M2011K2C\",\n"
-                "  \"7663689725312064292\": \"FAILED_TO_GET_WSS\"\n"
+                "  \"7663689725312064292\": \"22127RK46C\"\n"
                 "}\n"
             ),
         ),
@@ -12362,6 +12362,6 @@ def test_agent_finalizes_operational_batch_from_read_file_evidence_without_secon
 
     assert "Pod机型批量查询完成报告" in final
     assert "总查询量：3 台" in final
-    assert "查询成功：2 台" in final
+    assert "查询成功：3 台" in final
     assert "PHW110" in final
     assert not agent._should_repair_operational_no_evidence_final(session, "我来整理报告")

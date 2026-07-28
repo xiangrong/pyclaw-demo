@@ -1273,6 +1273,14 @@ class Agent:
                     if self._should_request_operational_progress_poll(session):
                         await self._request_operational_progress_poll(session)
                         continue
+                    if (
+                        not is_final_iteration
+                        and not force_final_answer
+                        and not soft_deadline_reached
+                        and self._should_repair_operational_contract(session)
+                    ):
+                        await self._request_operational_contract_repair(session)
+                        continue
                     operational_final = self._operational_terminal_final_from_observations(session)
                     if operational_final.strip():
                         operational_final = self._sanitize_user_facing_content(operational_final)
@@ -1324,6 +1332,16 @@ class Agent:
                     if content.strip() and all_responses and all_responses[-1] == content:
                         all_responses.pop()
                     await self._request_operational_progress_poll(session)
+                    continue
+                if (
+                    not is_final_iteration
+                    and not force_final_answer
+                    and not soft_deadline_reached
+                    and self._should_repair_operational_contract(session)
+                ):
+                    if content.strip() and all_responses and all_responses[-1] == content:
+                        all_responses.pop()
+                    await self._request_operational_contract_repair(session)
                     continue
                 operational_final = self._operational_terminal_final_from_observations(session)
                 if operational_final.strip():
@@ -2707,6 +2725,38 @@ class Agent:
         content = self.batch_execution.progress_poll_notice(evidence)
         reminder = Message(
             id=f"terminal-batch-progress-poll-{int(datetime.now().timestamp())}-{session.session_id}",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata={"internal_notice": True},
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _should_repair_operational_contract(self, session: Session) -> bool:
+        latest_task = self._latest_external_user_text(session)
+        evidence_messages = self.batch_execution.evidence_messages_since_latest_user(session)
+        if not evidence_messages:
+            return False
+        if not self.batch_execution.should_repair_operational_contract(
+            latest_task=latest_task,
+            terminal_messages=evidence_messages,
+        ):
+            return False
+        if self.batch_execution.operational_contract_repair_notice_count(session) >= 3:
+            return False
+        return True
+
+    async def _request_operational_contract_repair(self, session: Session) -> None:
+        decision = self.batch_execution.evaluate_operational_contract(
+            latest_task=self._latest_external_user_text(session),
+            terminal_messages=self.batch_execution.evidence_messages_since_latest_user(session),
+        )
+        content = self.batch_execution.operational_contract_repair_notice(decision)
+        reminder = Message(
+            id=f"terminal-operational-contract-repair-{int(datetime.now().timestamp())}-{session.session_id}",
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,

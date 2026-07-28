@@ -11,6 +11,18 @@ from typing import Any, Iterable, Sequence
 
 from pyclaw.core.durable_task import DurableTaskEngine, DurableTaskEvidence
 from pyclaw.core.message import Message, MessageRole
+from pyclaw.core.operational_contract import (
+    FACET_GENERIC_RESULT,
+    FACET_IMAGE_UPDATE_SUBMISSION,
+    FACET_POD_EGRESS,
+    FACET_POD_MODEL,
+    OperationalEvidenceLedger,
+    OperationalFacetEvidence,
+    OperationalGateDecision,
+    OperationalTaskContract,
+    facet_label,
+    infer_operational_task_contract,
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +41,7 @@ class BatchEvidence(DurableTaskEvidence):
     model_items: tuple[str, ...] = ()
     result_distribution: tuple[str, ...] = ()
     item_results: tuple[str, ...] = ()
+    retryable_failed_items: tuple[str, ...] = ()
     structured_report: str = ""
 
     @property
@@ -96,6 +109,12 @@ class BatchExecutionService:
 
     def __init__(self, durable_engine: DurableTaskEngine | None = None) -> None:
         self.durable = durable_engine or DurableTaskEngine()
+
+    def infer_contract(self, latest_task: str) -> OperationalTaskContract | None:
+        """Return the controller completion contract for an operational task."""
+        if not self.is_operational_task(latest_task):
+            return None
+        return infer_operational_task_contract(latest_task)
 
     def is_operational_task(self, text: str) -> bool:
         """Return True for infrastructure/CLI work that is not source-code work."""
@@ -509,6 +528,7 @@ class BatchExecutionService:
         model_items = tuple(structured.get("model_items") or ()) if structured else ()
         result_distribution = tuple(structured.get("result_distribution") or ()) if structured else ()
         item_results = tuple(structured.get("item_results") or ()) if structured else ()
+        retryable_failed_items = self._retryable_failed_items_from_item_results(model_items or item_results)
         structured_report = str(structured.get("structured_report") or "") if structured else ""
         return BatchEvidence(
             timed_out=durable.timed_out,
@@ -530,6 +550,7 @@ class BatchExecutionService:
             model_items=model_items,
             result_distribution=result_distribution,
             item_results=item_results,
+            retryable_failed_items=retryable_failed_items,
             structured_report=structured_report,
             output_excerpt=durable.output_excerpt,
         )
@@ -548,6 +569,14 @@ class BatchExecutionService:
             return ""
 
         evidence = self.evidence_from_messages(evidence_messages)
+        gate = self.evaluate_operational_contract(latest_task=latest_task, terminal_messages=evidence_messages)
+        if gate.contract is not None:
+            if gate.ready and gate.report:
+                return gate.report
+            if gate.needs_repair:
+                if self._should_block_final_for_operational_contract(gate, evidence):
+                    return ""
+
         if evidence.structured_report:
             return evidence.structured_report
         if evidence.stats_line:
@@ -574,6 +603,462 @@ class BatchExecutionService:
                 return f"批量任务未确认完成：终端命令超时，最近错误为：{evidence.error_line}"
             return "批量任务未确认完成：最近的终端命令超时，且没有观察到 PID、日志或结果文件证据。请检查运行环境后重试。"
         return ""
+
+    def should_repair_operational_contract(
+        self,
+        *,
+        latest_task: str,
+        terminal_messages: Iterable[Message],
+    ) -> bool:
+        """Return True when the controller must ask the model to gather/repair facets.
+
+        Missing facets should block premature finalization only after there is
+        completed facet evidence to merge or retryable item failures to fix.  A
+        merely-started or still-running durable job should keep using the
+        progress/start path instead of being hidden behind an empty final.
+        """
+        evidence_messages = list(terminal_messages)
+        if not evidence_messages:
+            return False
+        decision = self.evaluate_operational_contract(latest_task=latest_task, terminal_messages=evidence_messages)
+        if not decision.needs_repair:
+            return False
+        evidence = self.evidence_from_messages(evidence_messages)
+        return self._should_block_final_for_operational_contract(decision, evidence)
+
+    def _should_block_final_for_operational_contract(
+        self,
+        decision: OperationalGateDecision,
+        evidence: BatchEvidence,
+    ) -> bool:
+        if decision.retryable_failed_items:
+            return True
+        if evidence.is_in_progress:
+            return False
+        if (evidence.has_durable_start or evidence.timed_out or evidence.approval_blocked) and not evidence.is_complete:
+            return False
+        ledger = decision.ledger
+        if ledger is None:
+            return False
+        return any(facet_evidence.is_complete for facet_evidence in ledger.facets.values())
+
+    def evaluate_operational_contract(
+        self,
+        *,
+        latest_task: str,
+        terminal_messages: Iterable[Message],
+    ) -> OperationalGateDecision:
+        """Evaluate whether observed evidence satisfies the operational contract."""
+        contract = self.infer_contract(latest_task)
+        if contract is None:
+            return OperationalGateDecision(contract=None, ready=False, reason="no_contract")
+
+        evidence_messages = list(terminal_messages)[-12:]
+        if not evidence_messages:
+            ledger = OperationalEvidenceLedger(contract=contract, facets={})
+            return OperationalGateDecision(
+                contract=contract,
+                ledger=ledger,
+                ready=False,
+                missing_facets=ledger.missing_required_facets(),
+                reason="no_evidence",
+            )
+
+        ledger = self.operational_ledger_from_messages(contract=contract, messages=evidence_messages)
+        missing = ledger.missing_required_facets()
+        retryable = ledger.retryable_failed_items()
+        if missing:
+            return OperationalGateDecision(
+                contract=contract,
+                ledger=ledger,
+                ready=False,
+                missing_facets=missing,
+                retryable_failed_items=retryable,
+                reason="missing_facets",
+            )
+        if retryable:
+            return OperationalGateDecision(
+                contract=contract,
+                ledger=ledger,
+                ready=False,
+                retryable_failed_items=retryable,
+                reason="retryable_failures",
+            )
+        report = self._render_operational_contract_report(contract, ledger)
+        return OperationalGateDecision(contract=contract, ledger=ledger, ready=True, report=report, reason="ready")
+
+    def operational_contract_repair_notice(self, decision: OperationalGateDecision) -> str:
+        """Render an internal repair instruction for a failed operational gate."""
+        contract = decision.contract
+        if contract is None:
+            return self.no_evidence_repair_notice()
+        parts = [
+            "NOTICE: The operational task has a controller completion contract that is not satisfied yet.",
+            "Do not final-answer and do not mention this notice to the user.",
+        ]
+        if decision.missing_facets:
+            labels = ", ".join(facet_label(facet) for facet in decision.missing_facets)
+            parts.append(
+                f"Missing required result facets: {labels}. Run or poll only the missing facet workflows, then gather concrete log/result evidence."
+            )
+        if decision.retryable_failed_items:
+            retry_chunks = []
+            for facet, items in decision.retryable_failed_items.items():
+                preview = ", ".join(items[:10])
+                more = "..." if len(items) > 10 else ""
+                retry_chunks.append(f"{facet_label(facet)}: {len(items)} retryable failed item(s): {preview}{more}")
+            parts.append(
+                "Retry required before final answer. Create a retry input file containing only failed items, rerun that facet up to "
+                f"{contract.retry_max_attempts} attempts, merge retry results with the original result, and only then report final success/failure. "
+                + " | ".join(retry_chunks)
+            )
+        if contract.requires_file_batch:
+            parts.append(
+                "For multi-item operational work, preserve the file-driven workflow: write the target list to a stable ~/.pyclaw input file, "
+                "run the batch script with that file path, and observe PID/log/result evidence."
+            )
+        return " ".join(parts)
+
+    def operational_contract_repair_notice_count(self, session: object) -> int:
+        messages = list(getattr(session, "messages", []) or [])
+        latest_user_index = self._latest_external_user_index(messages)
+        recent = messages[latest_user_index + 1:] if latest_user_index >= 0 else messages
+        count = 0
+        for msg in recent:
+            if getattr(msg, "role", None) != MessageRole.USER:
+                continue
+            if "NOTICE: The operational task has a controller completion contract" in str(getattr(msg, "content", "") or ""):
+                count += 1
+        return count
+
+    def operational_ledger_from_messages(
+        self,
+        *,
+        contract: OperationalTaskContract,
+        messages: Iterable[Message],
+    ) -> OperationalEvidenceLedger:
+        facet_messages: dict[str, list[Message]] = {facet: [] for facet in contract.required_facets}
+        fallback_messages: list[Message] = []
+        for msg in messages:
+            content = str(getattr(msg, "content", "") or "")
+            msg_facets = self._facets_from_observation(content)
+            if not msg_facets:
+                fallback_messages.append(msg)
+                continue
+            for facet in msg_facets:
+                if facet in facet_messages:
+                    facet_messages[facet].append(msg)
+
+        if FACET_GENERIC_RESULT in facet_messages and not facet_messages[FACET_GENERIC_RESULT]:
+            facet_messages[FACET_GENERIC_RESULT] = list(messages)
+        if FACET_IMAGE_UPDATE_SUBMISSION in facet_messages and not facet_messages[FACET_IMAGE_UPDATE_SUBMISSION]:
+            image_messages = [msg for msg in messages if "update-image" in str(getattr(msg, "content", "") or "").lower()]
+            facet_messages[FACET_IMAGE_UPDATE_SUBMISSION] = image_messages
+
+        facets: dict[str, OperationalFacetEvidence] = {}
+        for facet, scoped_messages in facet_messages.items():
+            if not scoped_messages:
+                continue
+            evidence = self.evidence_from_messages(scoped_messages)
+            facet_evidence = self._facet_evidence_from_batch_evidence(facet, evidence, scoped_messages)
+            if facet_evidence is not None:
+                facets[facet] = facet_evidence
+        return OperationalEvidenceLedger(contract=contract, facets=facets)
+
+    def _facets_from_observation(self, content: str) -> tuple[str, ...]:
+        normalized = (content or "").lower()
+        facets: list[str] = []
+        if self._has_pod_model_signal(content):
+            facets.append(FACET_POD_MODEL)
+        if self._has_pod_egress_signal(content):
+            facets.append(FACET_POD_EGRESS)
+        if any(marker in normalized for marker in ("update-image", "更新云手机实例镜像", "requestid", "statuscode", "升级镜像")):
+            facets.append(FACET_IMAGE_UPDATE_SUBMISSION)
+        return tuple(dict.fromkeys(facets))
+
+    def _has_pod_model_signal(self, content: str) -> bool:
+        normalized = (content or "").lower()
+        return bool(
+            any(
+                marker in normalized
+                for marker in (
+                    "pod机型", "机型", "型号", "设备型号", "pod_models", "batch_query_model",
+                    "model distribution", "device model distribution",
+                )
+            )
+            or "Pod机型批量查询完成报告" in (content or "")
+        )
+
+    def _has_pod_egress_signal(self, content: str) -> bool:
+        normalized = (content or "").lower()
+        # FAILED_TO_GET_WSS is a retryable model-query failure sentinel, not
+        # evidence that the requested egress/IP facet was executed.  Mask it so
+        # a partial model report cannot accidentally satisfy the egress facet.
+        normalized = normalized.replace("failed_to_get_wss", "")
+        return bool(
+            any(
+                marker in normalized
+                for marker in (
+                    "pod出口ip", "出口ip", "出口 ip", "出口-ip", "公网ip", "公网 ip",
+                    "运营商", "地域分布", "地域统计", "地区分布", "地区统计", "pod_egress",
+                    "batch_query_egress", "egress", "ipinfo", "operator distribution",
+                    "region distribution", "isp distribution",
+                )
+            )
+            or "Pod出口IP/运营商批量查询完成报告" in (content or "")
+        )
+
+    def _facet_evidence_from_batch_evidence(
+        self,
+        facet: str,
+        evidence: BatchEvidence,
+        messages: Sequence[Message],
+    ) -> OperationalFacetEvidence | None:
+        if facet == FACET_POD_MODEL:
+            if not evidence.model_items and not evidence.model_distribution and "Pod机型批量查询完成报告" not in evidence.structured_report:
+                return None
+            total, success, failed = self._counts_from_evidence(evidence)
+            retryable = self._retryable_failed_items_from_item_results(evidence.model_items)
+            return OperationalFacetEvidence(
+                facet=facet,
+                status="complete",
+                total=total,
+                success=success,
+                failed=failed,
+                result_path=evidence.result_path,
+                log_path=evidence.log_path,
+                report=evidence.structured_report,
+                item_results=evidence.model_items,
+                retryable_failed_items=retryable,
+            )
+        if facet == FACET_POD_EGRESS:
+            has_egress_report = "Pod出口IP/运营商批量查询完成报告" in evidence.structured_report
+            has_distribution = bool(evidence.ip_distribution or evidence.operator_distribution or evidence.region_distribution)
+            has_completion_summary = bool(evidence.stats_line and (evidence.completion_line or evidence.result_path))
+            has_egress_signal = self._has_pod_egress_evidence_signal(messages=messages, evidence=evidence)
+            if not has_distribution and not has_egress_report and not (has_egress_signal and has_completion_summary):
+                return None
+            total, success, failed = self._counts_from_evidence(evidence)
+            return OperationalFacetEvidence(
+                facet=facet,
+                status="complete",
+                total=total,
+                success=success,
+                failed=failed,
+                result_path=evidence.result_path,
+                log_path=evidence.log_path,
+                report=evidence.structured_report,
+                item_results=evidence.item_results or self._distribution_items_from_evidence(evidence),
+            )
+        if facet == FACET_IMAGE_UPDATE_SUBMISSION:
+            rendered = self._render_image_update_submission(messages)
+            if not rendered:
+                return None
+            return OperationalFacetEvidence(facet=facet, status="submitted", total=1, success=1, report=rendered)
+        if facet == FACET_GENERIC_RESULT:
+            if not evidence.item_results and not evidence.result_distribution and not evidence.structured_report:
+                return None
+            total, success, failed = self._counts_from_evidence(evidence)
+            retryable = self._retryable_failed_items_from_item_results(evidence.item_results)
+            return OperationalFacetEvidence(
+                facet=facet,
+                status="complete",
+                total=total,
+                success=success,
+                failed=failed,
+                result_path=evidence.result_path,
+                log_path=evidence.log_path,
+                report=evidence.structured_report,
+                item_results=evidence.item_results,
+                retryable_failed_items=retryable,
+            )
+        return None
+
+    def _has_pod_egress_evidence_signal(self, *, messages: Sequence[Message], evidence: BatchEvidence) -> bool:
+        text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
+        if self._has_pod_egress_signal(text):
+            return True
+        for path in (evidence.result_path, evidence.log_path):
+            normalized_path = (path or "").lower().replace("failed_to_get_wss", "")
+            if any(marker in normalized_path for marker in ("pod_egress", "egress", "wss_results", "ipinfo", "出口")):
+                return True
+        return False
+
+    def _render_operational_contract_report(self, contract: OperationalTaskContract, ledger: OperationalEvidenceLedger) -> str:
+        if contract.required_facets == (FACET_IMAGE_UPDATE_SUBMISSION,):
+            evidence = ledger.facets.get(FACET_IMAGE_UPDATE_SUBMISSION)
+            return evidence.report if evidence else ""
+        if len(contract.required_facets) == 1:
+            evidence = ledger.facets.get(contract.required_facets[0])
+            return evidence.report if evidence else ""
+
+        lines = ["## ✅ Operational任务完成报告", "", "### 📊 契约完成情况"]
+        if contract.targets:
+            lines.append(f"- 目标数量：{len(contract.targets)}")
+        for facet in contract.required_facets:
+            evidence = ledger.facets.get(facet)
+            if not evidence:
+                continue
+            summary = f"- {facet_label(facet)}：{evidence.status}"
+            if evidence.total:
+                summary += f"，总数 {evidence.total}，成功 {evidence.success}，失败 {evidence.failed}"
+            if evidence.result_path:
+                summary += f"，结果文件 {evidence.result_path}"
+            lines.append(summary)
+
+        for facet in contract.required_facets:
+            evidence = ledger.facets.get(facet)
+            if not evidence:
+                continue
+            report = evidence.report or self._fallback_facet_report(facet, evidence)
+            if not report:
+                continue
+            lines.extend(["", f"---", "", f"### {facet_label(facet)}", "", report])
+        return "\n".join(lines).strip()
+
+    def _fallback_facet_report(self, facet: str, evidence: OperationalFacetEvidence) -> str:
+        title = {
+            FACET_POD_MODEL: "Pod机型批量查询完成报告",
+            FACET_POD_EGRESS: "Pod出口IP/运营商批量查询完成报告",
+            FACET_GENERIC_RESULT: "批量任务完成报告",
+        }.get(facet, facet_label(facet))
+        lines = [f"## ✅ {title}", "", "### 📊 总体执行情况"]
+        if evidence.total:
+            unit = "台" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS} else "条"
+            lines.extend([
+                f"- 总数：{evidence.total} {unit}",
+                f"- 成功：{evidence.success} {unit}",
+                f"- 失败：{evidence.failed} {unit}",
+            ])
+        if evidence.result_path:
+            lines.append(f"- 结果文件：{evidence.result_path}")
+        if evidence.log_path:
+            lines.append(f"- 日志：{evidence.log_path}")
+        if evidence.item_results:
+            lines.extend(["", "### 📋 明细"])
+            for item in evidence.item_results[:50]:
+                lines.append(f"- {item}")
+        return "\n".join(lines).strip()
+
+    def _counts_from_evidence(self, evidence: BatchEvidence) -> tuple[int, int, int]:
+        stats = evidence.stats_line or ""
+        total = self._first_int_after(stats, ("总数", "总查询量", "总处理量", "total"))
+        success = self._first_int_after(stats, ("成功", "success"))
+        failed = self._first_int_after(stats, ("失败", "failed", "fail"))
+        if total == 0:
+            total = len(evidence.model_items) or len(evidence.item_results)
+        if total == 0 and (success or failed):
+            total = success + failed
+        if total and success == 0 and failed == 0:
+            failed = len(self._retryable_failed_items_from_item_results(evidence.model_items or evidence.item_results))
+            success = max(0, total - failed)
+        return total, success, failed
+
+    def _distribution_items_from_evidence(self, evidence: BatchEvidence) -> tuple[str, ...]:
+        items: list[str] = []
+        for title, distribution in (
+            ("运营商分布", evidence.operator_distribution),
+            ("地域分布", evidence.region_distribution),
+            ("出口IP分布", evidence.ip_distribution),
+            ("机型分布", evidence.model_distribution),
+            ("结果分布", evidence.result_distribution),
+        ):
+            for line in distribution:
+                items.append(f"{title}: {line}")
+        return tuple(items)
+
+    def _first_int_after(self, text: str, labels: Sequence[str]) -> int:
+        for label in labels:
+            pattern = rf"{re.escape(label)}\s*[=:：]?\s*(\d+)"
+            match = re.search(pattern, text or "", flags=re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return 0
+
+    def _retryable_failed_items_from_item_results(self, item_results: Sequence[str]) -> tuple[str, ...]:
+        failed: list[str] = []
+        for item in item_results:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            left, _, right = text.partition(":")
+            if self._is_retryable_failed_value(right or text):
+                failed.append(left.strip() or text)
+        return tuple(dict.fromkeys(failed))
+
+    def _is_retryable_failed_value(self, value: str) -> bool:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "failed_to_get_wss", "timeout", "timed out", "connection reset", "connection refused",
+                "temporarily unavailable", "temporary", "empty", "未获取", "获取失败", "网络", "重试",
+            )
+        )
+
+    def _render_image_update_submission(self, messages: Sequence[Message]) -> str:
+        text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
+        normalized = text.lower()
+        if "update-image" not in normalized and "statuscode" not in normalized and "requestid" not in normalized:
+            return ""
+        status_code = self._jsonish_field(text, "StatusCode")
+        request_id = self._jsonish_field(text, "RequestId")
+        status_message = self._jsonish_field(text, "StatusMessage")
+        pod_id = self._first_pod_id(text)
+        image = self._image_from_update_command(text)
+        env = self._field_value_from_opencli_table(text, "环境")
+        if status_code and status_code != "0":
+            heading = "## ❌ Pod镜像升级请求提交失败"
+            status = f"失败（StatusCode {status_code}）"
+        else:
+            heading = "## ✅ Pod镜像升级请求已提交成功"
+            status = "提交成功（StatusCode 0）" if status_code == "0" else "提交成功"
+        rows = [heading, "", "| 项目 | 内容 |", "|---|---|"]
+        if pod_id:
+            rows.append(f"| Pod ID | `{pod_id}` |")
+        if env:
+            rows.append(f"| 环境 | {self._escape_markdown_table_cell(env)} |")
+        if image:
+            rows.append(f"| 目标镜像 | `{image}` |")
+        rows.append(f"| 提交状态 | {status} |")
+        if request_id:
+            rows.append(f"| RequestId | `{request_id}` |")
+        if status_message:
+            rows.append(f"| StatusMessage | {self._escape_markdown_table_cell(status_message)} |")
+        rows.extend([
+            "",
+            "说明：当前只观察到请求已提交；镜像升级通常是异步流程，未观察到后续验证证据前不能表述为已经完成升级。",
+        ])
+        return "\n".join(rows)
+
+    def _jsonish_field(self, text: str, field: str) -> str:
+        patterns = (
+            rf'\\"{re.escape(field)}\\"\s*:\s*\\"?([^\\",}}]+)',
+            rf'"{re.escape(field)}"\s*:\s*"?([^",}}]+)',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text or "")
+            if match:
+                return match.group(1).strip().strip('"')
+        return ""
+
+    def _first_pod_id(self, text: str) -> str:
+        match = re.search(r"\b\d{12,}\b", text or "")
+        return match.group(0) if match else ""
+
+    def _image_from_update_command(self, text: str) -> str:
+        match = re.search(r"--image\s+([^\s]+)", text or "")
+        return match.group(1).strip().strip('"\'') if match else ""
+
+    def _field_value_from_opencli_table(self, text: str, field: str) -> str:
+        pattern = re.compile(
+            rf'"field"\s*:\s*"{re.escape(field)}"\s*[,\n\r\s]+"value"\s*:\s*"([^"]*)"',
+            re.DOTALL,
+        )
+        match = pattern.search(text or "")
+        return match.group(1).strip() if match else ""
 
     def _structured_result_evidence(self, content: str, *, result_path_hint: str = "") -> dict[str, Any]:
         csv_rows, csv_path = self._csv_rows_from_text(content)
@@ -1202,6 +1687,17 @@ class BatchExecutionService:
             return True
         content = str(getattr(msg, "content", "") or "").strip()
         return content.startswith("NOTICE:")
+
+    def _latest_external_user_index(self, messages: Sequence[Message]) -> int:
+        for index in range(len(messages) - 1, -1, -1):
+            msg = messages[index]
+            if getattr(msg, "role", None) != MessageRole.USER:
+                continue
+            if self._is_internal_notice_message(msg):
+                continue
+            if str(getattr(msg, "content", "") or "").strip():
+                return index
+        return -1
 
     def _is_runtime_materialization_command(self, command: str) -> bool:
         normalized = (command or "").lower()

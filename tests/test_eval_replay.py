@@ -128,6 +128,74 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="history-composite-pod-query-model-only-needs-egress",
+            category="operational_contract",
+            input={
+                "latest_task": "查下这些pod的机型和出口ip\n7667116783811681066\n7667116783811615530",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: tail -30 /Users/bytedance/.pyclaw/batch_query_model_9pods.log\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始查询 9 台Pod的机型...\n"
+                    "[1/9] 7667116783811730218: taurus\n"
+                    "[2/9] 7667116783811713834: taurus\n"
+                    "查询完成！成功: 9, 失败: 0\n"
+                    "机型分布:\n"
+                    "  taurus: 9 台\n"
+                    "完整结果已保存到: pod_models_9_new_results.json\n"
+                ),
+            },
+            expected={"needs_repair": True, "missing_facets": ["pod_egress"], "final_empty": True},
+        ),
+        ReplayCase(
+            name="history-composite-pod-query-egress-only-needs-model",
+            category="operational_contract",
+            input={
+                "latest_task": "查下这些pod的机型和出口ip\n7667116783811681066\n7667116783811615530",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: tail -50 /Users/bytedance/.pyclaw/batch_query_egress_9pods.log\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始查询 9 台Pod的出口IP及运营商...\n"
+                    "查询完成！成功: 9, 失败: 0\n"
+                    "运营商分布统计:\n"
+                    "  AS56041 China Mobile communications corporation: 9 台\n"
+                    "地域分布统计:\n"
+                    "  ShanghaiShanghai: 9 台\n"
+                    "结果文件: /Users/bytedance/.pyclaw/pod_egress_9_new_wss_results.csv\n"
+                ),
+            },
+            expected={"needs_repair": True, "missing_facets": ["pod_model"], "final_empty": True},
+        ),
+        ReplayCase(
+            name="history-pod-model-failed-wss-requires-retry",
+            category="operational_contract",
+            input={
+                "latest_task": "查下这批pod的机型\n7663027791235308307\n7663689872217430820\n7663689796887780102",
+                "tool_name": "read_file",
+                "observation": (
+                    "OBSERVATION from read_file:\n"
+                    "File: /Users/bytedance/.pyclaw/pod_models_25_results.json (5 lines)\n"
+                    "\n"
+                    "{\n"
+                    "  \"7663027791235308307\": \"22127RK46C\",\n"
+                    "  \"7663689872217430820\": \"FAILED_TO_GET_WSS\",\n"
+                    "  \"7663689796887780102\": \"FAILED_TO_GET_WSS\"\n"
+                    "}\n"
+                ),
+            },
+            expected={
+                "needs_repair": True,
+                "reason": "retryable_failures",
+                "retryable_failed_items": {
+                    "pod_model": ["7663689872217430820", "7663689796887780102"],
+                },
+                "final_empty": True,
+            },
+        ),
+        ReplayCase(
             name="code-change-needs-validation",
             category="code_modification",
             input={"changed_files": ["pyclaw/tools/base.py"], "validation_results": []},
