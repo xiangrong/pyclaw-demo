@@ -397,6 +397,63 @@ def test_batch_execution_final_includes_model_distribution():
     assert "Pixel 8: 1 台" in final
 
 
+def test_batch_execution_final_includes_pod_model_detail_rows_from_terminal_log():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -200 /Users/bytedance/.pyclaw/batch_query_model_9pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "=== 开始批量机型查询 ===\n"
+            "Pod数量: 9台\n"
+            "开始查询 9 台Pod的机型...\n"
+            "[1/9] 7667116783811730218: taurus\n"
+            "[2/9] 7667116783811713834: taurus\n"
+            "[3/9] 7667116783811648298: taurus\n"
+            "[4/9] 7667116783811697450: taurus\n"
+            "[5/9] 7667116783811681066: taurus\n"
+            "[6/9] 7667116783811664682: taurus\n"
+            "[7/9] 7667116783811631914: taurus\n"
+            "[8/9] 7667116783811599146: taurus\n"
+            "[9/9] 7667116783811615530: taurus\n"
+            "查询完成！成功: 9, 失败: 0\n"
+            "机型分布:\n"
+            "  taurus: 9 台\n"
+            "完整结果已保存到: pod_models_9_new_results.json\n"
+            "=== 查询完成 ===\n"
+        )
+    ]
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(
+        latest_task="查下这些pod的机型",
+        terminal_messages=messages,
+    )
+
+    assert evidence.model_items == (
+        "7667116783811730218: taurus",
+        "7667116783811713834: taurus",
+        "7667116783811648298: taurus",
+        "7667116783811697450: taurus",
+        "7667116783811681066: taurus",
+        "7667116783811664682: taurus",
+        "7667116783811631914: taurus",
+        "7667116783811599146: taurus",
+        "7667116783811615530: taurus",
+    )
+    assert "Pod机型批量查询完成报告" in final
+    assert "### 📋 Pod机型明细" in final
+    assert "| 7667116783811681066 | taurus |" in final
+    assert "| 7667116783811615530 | taurus |" in final
+    assert "总查询量：9 台" in final
+    assert "查询成功：9 台" in final
+    assert "查询失败：0 台" in final
+    assert "pod_models_9_new_results.json" in final
+    assert "| taurus | 9 台 | 100.0% |" in final
+    assert "批量任务已执行完成：查询完成" not in final
+
+
 def test_batch_execution_finalizes_pod_model_json_read_file_result():
     service = BatchExecutionService()
     messages = [

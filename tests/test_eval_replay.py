@@ -31,6 +31,45 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             expected={"contains": ["总数=3", "Pixel 7: 2 台"]},
         ),
         ReplayCase(
+            name="pod-model-detail-rows-are-delivered",
+            category="pod_query",
+            input={
+                "latest_task": "查下这些pod的机型",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: tail -200 /Users/bytedance/.pyclaw/batch_query_model_9pods.log\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始查询 9 台Pod的机型...\n"
+                    "[1/9] 7667116783811730218: taurus\n"
+                    "[2/9] 7667116783811713834: taurus\n"
+                    "[3/9] 7667116783811648298: taurus\n"
+                    "[4/9] 7667116783811697450: taurus\n"
+                    "[5/9] 7667116783811681066: taurus\n"
+                    "[6/9] 7667116783811664682: taurus\n"
+                    "[7/9] 7667116783811631914: taurus\n"
+                    "[8/9] 7667116783811599146: taurus\n"
+                    "[9/9] 7667116783811615530: taurus\n"
+                    "查询完成！成功: 9, 失败: 0\n"
+                    "机型分布:\n"
+                    "  taurus: 9 台\n"
+                    "完整结果已保存到: pod_models_9_new_results.json\n"
+                    "=== 查询完成 ===\n"
+                ),
+            },
+            expected={
+                "contains": [
+                    "### 📋 Pod机型明细",
+                    "| 7667116783811681066 | taurus |",
+                    "| 7667116783811615530 | taurus |",
+                    "总查询量：9 台",
+                    "查询成功：9 台",
+                    "pod_models_9_new_results.json",
+                    "| taurus | 9 台 | 100.0% |",
+                ]
+            },
+        ),
+        ReplayCase(
             name="code-change-needs-validation",
             category="code_modification",
             input={"changed_files": ["pyclaw/tools/base.py"], "validation_results": []},

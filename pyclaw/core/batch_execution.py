@@ -26,6 +26,7 @@ class BatchEvidence(DurableTaskEvidence):
     region_distribution: tuple[str, ...] = ()
     ip_distribution: tuple[str, ...] = ()
     model_distribution: tuple[str, ...] = ()
+    model_items: tuple[str, ...] = ()
     structured_report: str = ""
 
     @property
@@ -487,7 +488,7 @@ class BatchExecutionService:
                 "device model distribution",
             ),
         )
-        structured = self._structured_result_evidence(content)
+        structured = self._structured_result_evidence(content, result_path_hint=result_path)
         if structured:
             if not result_path:
                 result_path = str(structured.get("result_path") or "")
@@ -497,6 +498,7 @@ class BatchExecutionService:
             region_distribution = region_distribution or tuple(structured.get("region_distribution") or ())
             model_distribution = model_distribution or tuple(structured.get("model_distribution") or ())
         ip_distribution = tuple(structured.get("ip_distribution") or ()) if structured else ()
+        model_items = tuple(structured.get("model_items") or ()) if structured else ()
         structured_report = str(structured.get("structured_report") or "") if structured else ""
         return BatchEvidence(
             timed_out=durable.timed_out,
@@ -515,6 +517,7 @@ class BatchExecutionService:
             region_distribution=region_distribution,
             ip_distribution=ip_distribution,
             model_distribution=model_distribution,
+            model_items=model_items,
             structured_report=structured_report,
             output_excerpt=durable.output_excerpt,
         )
@@ -560,23 +563,26 @@ class BatchExecutionService:
             return "批量任务未确认完成：最近的终端命令超时，且没有观察到 PID、日志或结果文件证据。请检查运行环境后重试。"
         return ""
 
-    def _structured_result_evidence(self, content: str) -> dict[str, Any]:
+    def _structured_result_evidence(self, content: str, *, result_path_hint: str = "") -> dict[str, Any]:
         csv_rows, csv_path = self._csv_rows_from_text(content)
         if csv_rows:
-            return self._egress_rows_evidence(csv_rows, result_path=csv_path)
+            return self._egress_rows_evidence(csv_rows, result_path=csv_path or result_path_hint)
 
         mapping, paths = self._json_mappings_from_read_files(content)
         terminal_pairs = self._model_pairs_from_terminal_rows(content)
         if mapping and self._mapping_looks_like_egress(mapping):
             rows = self._egress_rows_from_mapping(mapping)
             if rows:
-                return self._egress_rows_evidence(rows, result_path=paths[-1] if paths else "")
+                return self._egress_rows_evidence(rows, result_path=paths[-1] if paths else result_path_hint)
 
         simple_mapping = self._simple_value_mapping(mapping)
         if terminal_pairs:
             simple_mapping.update(terminal_pairs)
         if simple_mapping and (paths or self._text_has_completion_evidence(content)):
-            return self._model_mapping_evidence(simple_mapping, result_paths=paths)
+            result_paths = list(paths)
+            if result_path_hint:
+                result_paths.append(result_path_hint)
+            return self._model_mapping_evidence(simple_mapping, result_paths=result_paths)
         return {}
 
     def _json_mappings_from_read_files(self, content: str) -> tuple[dict[str, Any], list[str]]:
@@ -646,10 +652,16 @@ class BatchExecutionService:
         return pairs
 
     def _model_mapping_evidence(self, mapping: dict[str, str], *, result_paths: Sequence[str]) -> dict[str, Any]:
-        total = len(mapping)
-        failed_items = {pod: value for pod, value in mapping.items() if self._is_failed_value(value)}
+        normalized_mapping: dict[str, str] = {}
+        for pod, model in mapping.items():
+            pod_id = str(pod).strip()
+            model_name = str(model).strip()
+            if self._looks_like_pod_id(pod_id) and model_name:
+                normalized_mapping[pod_id] = model_name
+        total = len(normalized_mapping)
+        failed_items = {pod: value for pod, value in normalized_mapping.items() if self._is_failed_value(value)}
         success = total - len(failed_items)
-        distribution = Counter(value for value in mapping.values() if not self._is_failed_value(value))
+        distribution = Counter(value for value in normalized_mapping.values() if not self._is_failed_value(value))
         model_distribution = tuple(f"{model}: {count} 台" for model, count in distribution.most_common())
         stats_line = f"总数={total} 成功={success} 失败={len(failed_items)}"
         report_lines = [
@@ -666,6 +678,10 @@ class BatchExecutionService:
         if failed_items:
             failed_preview = "，".join(f"{pod}: {value}" for pod, value in list(failed_items.items())[:10])
             report_lines.append(f"- 失败项：{failed_preview}")
+        if normalized_mapping:
+            report_lines.extend(["", "### 📋 Pod机型明细", "| Pod ID | 机型 |", "|---|---|"])
+            for pod, model in normalized_mapping.items():
+                report_lines.append(f"| {pod} | {model} |")
         report_lines.extend(["", "### 📱 机型分布", "| 机型代码 | 数量 | 占比 |", "|---|---:|---:|"])
         for model, count in distribution.most_common():
             pct = (count / total * 100) if total else 0.0
@@ -679,6 +695,7 @@ class BatchExecutionService:
             "completion_line": "查询完成",
             "result_path": unique_paths[-1] if unique_paths else "",
             "model_distribution": model_distribution,
+            "model_items": tuple(f"{pod}: {model}" for pod, model in normalized_mapping.items()),
             "structured_report": "\n".join(report_lines),
         }
 
