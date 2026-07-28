@@ -117,7 +117,7 @@ def infer_operational_task_contract(text: str) -> OperationalTaskContract | None
     if not normalized.strip():
         return None
 
-    targets = tuple(dict.fromkeys(re.findall(r"(?<!\d)\d{12,}(?!\d)", raw_task)))
+    targets = _extract_targets(raw_task)
     required_facets: list[str] = []
 
     if _mentions_model(normalized):
@@ -156,6 +156,65 @@ def facet_label(facet: str) -> str:
 
 def _mentions_model(normalized: str) -> bool:
     return any(marker in normalized for marker in ("机型", "型号", "设备型号", "model", "device model"))
+
+
+def _extract_targets(raw_task: str) -> tuple[str, ...]:
+    """Extract explicit user-provided batch targets from the task text.
+
+    Pod IDs are the most common operational targets, but the controller should
+    not make per-item delivery a pod-only behavior.  Many batch requests are
+    written as a short instruction followed by one item per line, for example
+    service names, accounts, URLs, device serials, or order IDs.  Capture those
+    line-delimited tokens so generic operational batches can require item-level
+    results instead of accepting aggregate success/failure summaries.
+    """
+    targets: list[str] = []
+    pod_ids = re.findall(r"(?<!\d)\d{12,}(?!\d)", raw_task or "")
+    targets.extend(pod_ids)
+
+    for raw_line in (raw_task or "").splitlines():
+        for candidate in _target_candidates_from_line(raw_line):
+            targets.append(candidate)
+    return tuple(dict.fromkeys(targets))
+
+
+def _target_candidates_from_line(raw_line: str) -> tuple[str, ...]:
+    line = _strip_list_marker(raw_line)
+    if not line:
+        return ()
+    if re.search(r"(?<!\d)\d{12,}(?!\d)", line):
+        return tuple(re.findall(r"(?<!\d)\d{12,}(?!\d)", line))
+    if _looks_like_single_target_token(line):
+        return (line,)
+    if "," in line or "，" in line:
+        parts = [_strip_list_marker(part) for part in re.split(r"[,，]", line)]
+        return tuple(part for part in parts if _looks_like_single_target_token(part))
+    return ()
+
+
+def _strip_list_marker(value: str) -> str:
+    stripped = str(value or "").strip().strip("`'\"")
+    stripped = re.sub(r"^(?:[-*•]+|\d+[.)、]|[一二三四五六七八九十]+[、.])\s*", "", stripped)
+    return stripped.strip().strip("`'\"")
+
+
+def _looks_like_single_target_token(value: str) -> bool:
+    token = str(value or "").strip()
+    if not token or len(token) > 160:
+        return False
+    if re.search(r"\s", token):
+        return False
+    # Prose request lines often contain CJK punctuation or sentence markers;
+    # item tokens should be compact identifiers/URLs/domains/accounts.
+    if any(marker in token for marker in ("？", "?", "。", "！", "!", "：", ":")) and not re.match(r"https?://", token, re.IGNORECASE):
+        return False
+    if re.search(r"[\u4e00-\u9fff]", token):
+        return False
+    if re.match(r"https?://[^\s]+$", token, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@/+:-]{1,159}", token):
+        return True
+    return False
 
 
 def _mentions_egress(normalized: str) -> bool:

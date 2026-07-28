@@ -163,9 +163,31 @@ def test_batch_execution_final_summarizes_observed_success_stats():
 
     final = service.final_from_observations(latest_task="批量更新这些实例镜像", terminal_messages=messages)
 
-    assert "批量任务已有结果输出" in final
+    assert "批量任务完成报告" in final
     assert "success=9" in final
     assert "结果文件" in final
+
+
+def test_operational_contract_extracts_generic_batch_targets():
+    service = BatchExecutionService()
+
+    contract = service.infer_contract(
+        "批量检查这些服务的健康状态\n"
+        "user-api\n"
+        "pay-api\n"
+        "search-api\n"
+        "https://example.com/health"
+    )
+
+    assert contract is not None
+    assert contract.required_facets == ("generic_result",)
+    assert contract.targets == (
+        "user-api",
+        "pay-api",
+        "search-api",
+        "https://example.com/health",
+    )
+    assert contract.requires_file_batch
 
 
 def test_batch_execution_progress_line_is_not_treated_as_completed_stats():
@@ -349,7 +371,8 @@ def test_batch_execution_multiline_stats_mark_completion():
         terminal_messages=messages,
     )
 
-    assert "批量任务已有结果输出" in final
+    assert "Pod出口IP/运营商批量查询完成报告" in final
+    assert "汇总：总数=62 成功=58 失败=4" in final
     assert "总数=62" in final
     assert "成功=58" in final
     assert "失败=4" in final
@@ -435,6 +458,228 @@ def test_batch_execution_final_includes_operator_and_region_distribution():
     assert "地域分布" in final
     assert "BeijingBeijing: 39 台" in final
     assert "TianjinTianjin: 22 台" in final
+
+
+def test_batch_execution_finalizes_pod_egress_terminal_rows_with_item_detail():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd /Users/bytedance/.pyclaw && python3 batch_egress_wss_serial.py pod_ips_input_9.txt pod_egress_9_wss_results.csv 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 9 台Pod的出口IP及运营商...\n"
+            "[1/9] 查询 7663403048656018202... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+            "[2/9] 查询 7662277640602786611... ✓ 111.31.8.240 | AS9808 China Mobile  | BeijingBeijing\n"
+            "[3/9] 查询 7663403048655870746... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+            "[4/9] 查询 7666143962817633033... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+            "[5/9] 查询 7666143962817698569... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+            "[6/9] 查询 7666143937900059401... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+            "[7/9] 查询 7666143962817780489... ✓ 180.213.57.183 | AS58542 CHINATELECOM | TianjinTianjin\n"
+            "[8/9] 查询 7666143962817649417... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+            "[9/9] 查询 7666143962817665801... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+            "查询完成！成功: 9, 失败: 0\n"
+            "运营商分布统计:\n"
+            "  AS9808 China Mobile Communications Group Co., Ltd.: 6 台\n"
+            "  AS4837 CHINA UNICOM China169 Backbone: 2 台\n"
+            "  AS58542 CHINATELECOM TIANJIN: 1 台\n"
+            "地域分布统计:\n"
+            "  BeijingBeijing: 6 台\n"
+            "  TianjinTianjin: 3 台\n"
+            "完整结果已保存到:\n"
+            "  JSON: pod_ips_input_9_wss_results.json\n"
+            "  CSV:  pod_ips_input_9_wss_results.csv\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task=(
+            "再查询下这批pod的出口ip\n"
+            "7663403048656018202\n7662277640602786611\n7663403048655870746\n"
+            "7666143962817633033\n7666143962817698569\n7666143937900059401\n"
+            "7666143962817780489\n7666143962817649417\n7666143962817665801"
+        ),
+        terminal_messages=messages,
+    )
+    evidence = service.evidence_from_terminal_messages(messages)
+
+    assert "Pod出口IP/运营商批量查询完成报告" in final
+    assert "### 📋 Pod出口IP明细" in final
+    assert "| 7663403048656018202 | 125.39.37.182 | AS4837 CHINA UNICOM | TianjinTianjin |" in final
+    assert "| 7666143962817780489 | 180.213.57.183 | AS58542 CHINATELECOM | TianjinTianjin |" in final
+    assert "| AS9808 China Mobile Communications Group Co., Ltd. | 6 台 | 66.7% |" in final
+    assert "| AS4837 CHINA UNICOM China169 Backbone | 2 台 | 22.2% |" in final
+    assert "总查询量：9 台" in final
+    assert "查询成功：9 台" in final
+    assert "结果文件：/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv" in final
+    assert evidence.result_path == "/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv"
+    assert len(evidence.item_results) == 9
+
+
+def test_batch_execution_does_not_duplicate_structured_terminal_observation_rows():
+    service = BatchExecutionService()
+    stdout = (
+        "开始查询 9 台Pod的出口IP及运营商...\n"
+        "使用方案: WSS串行执行 + Pod内curl ipinfo.io\n"
+        "[1/9] 查询 7663403048656018202... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+        "[2/9] 查询 7662277640602786611... ✓ 111.31.8.240 | AS9808 China Mobile  | BeijingBeijing\n"
+        "[3/9] 查询 7663403048655870746... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+        "[4/9] 查询 7666143962817633033... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+        "[5/9] 查询 7666143962817698569... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+        "[6/9] 查询 7666143937900059401... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+        "[7/9] 查询 7666143962817780489... ✓ 180.213.57.183 | AS58542 CHINATELECOM | TianjinTianjin\n"
+        "[8/9] 查询 7666143962817649417... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+        "[9/9] 查询 7666143962817665801... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+        "查询完成！成功: 9, 失败: 0\n"
+        "运营商分布统计:\n"
+        "  AS9808 China Mobile Communications Group Co., Ltd.: 6 台\n"
+        "  AS4837 CHINA UNICOM China169 Backbone: 2 台\n"
+        "  AS58542 CHINATELECOM TIANJIN: 1 台\n"
+        "地域分布统计:\n"
+        "  BeijingBeijing: 6 台\n"
+        "  TianjinTianjin: 3 台\n"
+        "完整结果已保存到:\n"
+        "  JSON: pod_ips_input_9_wss_results.json\n"
+        "  CSV:  pod_ips_input_9_wss_results.csv\n"
+    )
+    messages = [
+        _structured_terminal_message(
+            command="cd /Users/bytedance/.pyclaw && python3 batch_egress_wss_serial.py pod_ips_input_9.txt pod_egress_9_wss_results.csv 2>&1",
+            stdout=stdout,
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task=(
+            "再查询下这批pod的出口ip\n"
+            "7663403048656018202\n7662277640602786611\n7663403048655870746\n"
+            "7666143962817633033\n7666143962817698569\n7666143937900059401\n"
+            "7666143962817780489\n7666143962817649417\n7666143962817665801"
+        ),
+        terminal_messages=messages,
+    )
+    evidence = service.evidence_from_terminal_messages(messages)
+
+    assert len(evidence.item_results) == 9
+    assert "总查询量：9 台" in final
+    assert "查询成功：9 台" in final
+    assert final.count("| 7663403048656018202 |") == 1
+    assert final.count("| 7666143962817665801 |") == 1
+    assert "总查询量：18 台" not in final
+    assert "批量任务已有结果输出" not in final
+
+
+def test_operational_contract_requires_detail_rows_for_multi_target_summary_only():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd /Users/bytedance/.pyclaw && python3 batch_egress_wss_serial.py pod_ips_input_9.txt pod_egress_9_wss_results.csv 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 9 台Pod的出口IP及运营商...\n"
+            "查询完成！成功: 9, 失败: 0\n"
+            "运营商分布统计:\n"
+            "  AS9808 China Mobile Communications Group Co., Ltd.: 6 台\n"
+            "  AS4837 CHINA UNICOM China169 Backbone: 2 台\n"
+            "地域分布统计:\n"
+            "  BeijingBeijing: 6 台\n"
+            "  TianjinTianjin: 3 台\n"
+            "完整结果已保存到:\n"
+            "  CSV:  pod_ips_input_9_wss_results.csv\n"
+        )
+    ]
+    latest_task = (
+        "再查询下这批pod的出口ip\n"
+        "7663403048656018202\n7662277640602786611\n7663403048655870746\n"
+        "7666143962817633033\n7666143962817698569\n7666143937900059401\n"
+        "7666143962817780489\n7666143962817649417\n7666143962817665801"
+    )
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+    notice = service.operational_contract_repair_notice(decision)
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.missing_facets == ("pod_egress",)
+    assert decision.ledger is not None
+    assert decision.ledger.facets["pod_egress"].status == "needs_detail"
+    assert decision.ledger.facets["pod_egress"].result_path == "/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv"
+    assert "lacks per-target detail rows" in notice
+    assert "read_file" in notice
+    assert "/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv" in notice
+
+
+def test_operational_contract_requires_detail_rows_for_generic_summary_only():
+    service = BatchExecutionService()
+    latest_task = (
+        "批量检查这些服务的健康状态\n"
+        "user-api\n"
+        "pay-api\n"
+        "search-api"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd /Users/bytedance/.pyclaw && python3 batch_health.py service_health_input.txt 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "处理完成！成功: 3, 失败: 0\n"
+            "结果文件: service_health_results.csv\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+    notice = service.operational_contract_repair_notice(decision)
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.missing_facets == ("generic_result",)
+    assert decision.ledger is not None
+    assert decision.ledger.facets["generic_result"].status == "needs_detail"
+    assert decision.ledger.facets["generic_result"].result_path == "/Users/bytedance/.pyclaw/service_health_results.csv"
+    assert "read_file" in notice
+    assert "/Users/bytedance/.pyclaw/service_health_results.csv" in notice
+
+
+def test_operational_contract_finalizes_generic_csv_detail_after_read_file():
+    service = BatchExecutionService()
+    latest_task = (
+        "批量检查这些服务的健康状态\n"
+        "user-api\n"
+        "pay-api\n"
+        "search-api"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd /Users/bytedance/.pyclaw && python3 batch_health.py service_health_input.txt 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "处理完成！成功: 3, 失败: 0\n"
+            "结果文件: service_health_results.csv\n"
+        ),
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/service_health_results.csv (4 lines)\n"
+            "\n"
+            "服务,状态\n"
+            "user-api,OK 200\n"
+            "pay-api,OK 200\n"
+            "search-api,OK 200\n"
+        ),
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert "## ✅ 批量任务完成报告" in final
+    assert "### 📋 明细" in final
+    assert "| user-api | OK 200 |" in final
+    assert "| pay-api | OK 200 |" in final
+    assert "| search-api | OK 200 |" in final
+    assert "结果文件：/Users/bytedance/.pyclaw/service_health_results.csv" in final
 
 
 def test_batch_execution_blocked_runtime_materialization_does_not_ask_user_confirmation():
@@ -875,6 +1120,8 @@ def test_batch_execution_finalizes_pod_egress_csv_read_file_result():
     )
 
     assert "Pod出口IP/运营商批量查询完成报告" in final
+    assert "### 📋 Pod出口IP明细" in final
+    assert "| 7663861888673078054 | 60.28.201.5 | AS4837 CHINA UNICOM China169 Backbone | TianjinTianjin |" in final
     assert "总查询量：3 台" in final
     assert "查询成功：3 台" in final
     assert "查询失败：0 台" in final
@@ -984,6 +1231,8 @@ def test_operational_contract_combines_model_and_egress_evidence_before_final():
             "Exit code: 0\n"
             "STDOUT:\n"
             "开始查询 2 台Pod的出口IP及运营商...\n"
+            "[1/2] 查询 7667116783811730218... ✓ 10.0.0.1 | AS56041 China Mobile communications corporation | ShanghaiShanghai\n"
+            "[2/2] 查询 7667116783811713834... ✓ 10.0.0.2 | AS56041 China Mobile communications corporation | ShanghaiShanghai\n"
             "查询完成！成功: 2, 失败: 0\n"
             "运营商分布统计:\n"
             "  AS56041 China Mobile communications corporation: 2 台\n"

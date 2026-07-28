@@ -128,6 +128,57 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="history-pod-egress-terminal-rows-deliver-detail-table",
+            category="pod_query",
+            input={
+                "latest_task": (
+                    "再查询下这批pod的出口ip\n"
+                    "7663403048656018202\n7662277640602786611\n7663403048655870746\n"
+                    "7666143962817633033\n7666143962817698569\n7666143937900059401\n"
+                    "7666143962817780489\n7666143962817649417\n7666143962817665801"
+                ),
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: cd /Users/bytedance/.pyclaw && python3 batch_egress_wss_serial.py pod_ips_input_9.txt pod_egress_9_wss_results.csv 2>&1\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始查询 9 台Pod的出口IP及运营商...\n"
+                    "[1/9] 查询 7663403048656018202... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                    "[2/9] 查询 7662277640602786611... ✓ 111.31.8.240 | AS9808 China Mobile  | BeijingBeijing\n"
+                    "[3/9] 查询 7663403048655870746... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                    "[4/9] 查询 7666143962817633033... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+                    "[5/9] 查询 7666143962817698569... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+                    "[6/9] 查询 7666143937900059401... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+                    "[7/9] 查询 7666143962817780489... ✓ 180.213.57.183 | AS58542 CHINATELECOM | TianjinTianjin\n"
+                    "[8/9] 查询 7666143962817649417... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+                    "[9/9] 查询 7666143962817665801... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+                    "查询完成！成功: 9, 失败: 0\n"
+                    "运营商分布统计:\n"
+                    "  AS9808 China Mobile Communications Group Co., Ltd.: 6 台\n"
+                    "  AS4837 CHINA UNICOM China169 Backbone: 2 台\n"
+                    "  AS58542 CHINATELECOM TIANJIN: 1 台\n"
+                    "地域分布统计:\n"
+                    "  BeijingBeijing: 6 台\n"
+                    "  TianjinTianjin: 3 台\n"
+                    "完整结果已保存到:\n"
+                    "  CSV:  pod_ips_input_9_wss_results.csv\n"
+                ),
+            },
+            expected={
+                "contains": [
+                    "### 📋 Pod出口IP明细",
+                    "| 7663403048656018202 | 125.39.37.182 | AS4837 CHINA UNICOM | TianjinTianjin |",
+                    "| 7666143962817780489 | 180.213.57.183 | AS58542 CHINATELECOM | TianjinTianjin |",
+                    "| AS9808 China Mobile Communications Group Co., Ltd. | 6 台 | 66.7% |",
+                    "| AS4837 CHINA UNICOM China169 Backbone | 2 台 | 22.2% |",
+                    "总查询量：9 台",
+                    "查询成功：9 台",
+                    "结果文件：/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv",
+                ],
+                "not_contains": ["批量任务已有结果输出"],
+            },
+        ),
+        ReplayCase(
             name="absolute-runtime-materialization-approval-block-repairs",
             category="runtime_materialization",
             input={
@@ -207,7 +258,7 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
                     "完整结果已保存到: pod_models_9_new_results.json\n"
                 ),
             },
-            expected={"needs_repair": True, "missing_facets": ["pod_egress"], "final_empty": True},
+            expected={"needs_repair": True, "missing_facets": ["pod_model", "pod_egress"], "final_empty": True},
         ),
         ReplayCase(
             name="history-composite-pod-query-egress-only-needs-model",
@@ -228,7 +279,104 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
                     "结果文件: /Users/bytedance/.pyclaw/pod_egress_9_new_wss_results.csv\n"
                 ),
             },
-            expected={"needs_repair": True, "missing_facets": ["pod_model"], "final_empty": True},
+            expected={"needs_repair": True, "missing_facets": ["pod_model", "pod_egress"], "final_empty": True},
+        ),
+        ReplayCase(
+            name="history-pod-egress-summary-only-needs-result-file-detail",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "再查询下这批pod的出口ip\n"
+                    "7663403048656018202\n7662277640602786611\n7663403048655870746\n"
+                    "7666143962817633033\n7666143962817698569\n7666143937900059401\n"
+                    "7666143962817780489\n7666143962817649417\n7666143962817665801"
+                ),
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: cd /Users/bytedance/.pyclaw && python3 batch_egress_wss_serial.py pod_ips_input_9.txt pod_egress_9_wss_results.csv 2>&1\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始查询 9 台Pod的出口IP及运营商...\n"
+                    "查询完成！成功: 9, 失败: 0\n"
+                    "运营商分布统计:\n"
+                    "  AS9808 China Mobile Communications Group Co., Ltd.: 6 台\n"
+                    "地域分布统计:\n"
+                    "  BeijingBeijing: 6 台\n"
+                    "完整结果已保存到:\n"
+                    "  CSV:  pod_ips_input_9_wss_results.csv\n"
+                ),
+            },
+            expected={
+                "needs_repair": True,
+                "missing_facets": ["pod_egress"],
+                "final_empty": True,
+            },
+        ),
+        ReplayCase(
+            name="generic-summary-only-needs-result-file-detail",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "批量检查这些服务的健康状态\n"
+                    "user-api\n"
+                    "pay-api\n"
+                    "search-api"
+                ),
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: cd /Users/bytedance/.pyclaw && python3 batch_health.py service_health_input.txt 2>&1\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "处理完成！成功: 3, 失败: 0\n"
+                    "结果文件: service_health_results.csv\n"
+                ),
+            },
+            expected={
+                "needs_repair": True,
+                "missing_facets": ["generic_result"],
+                "final_empty": True,
+            },
+        ),
+        ReplayCase(
+            name="generic-csv-detail-rows-deliver-table",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "批量检查这些服务的健康状态\n"
+                    "user-api\n"
+                    "pay-api\n"
+                    "search-api"
+                ),
+                "observations": [
+                    (
+                        "OBSERVATION from terminal:\n"
+                        "Command: cd /Users/bytedance/.pyclaw && python3 batch_health.py service_health_input.txt 2>&1\n"
+                        "Exit code: 0\n"
+                        "STDOUT:\n"
+                        "处理完成！成功: 3, 失败: 0\n"
+                        "结果文件: service_health_results.csv\n"
+                    ),
+                    (
+                        "OBSERVATION from read_file:\n"
+                        "File: /Users/bytedance/.pyclaw/service_health_results.csv (4 lines)\n"
+                        "\n"
+                        "服务,状态\n"
+                        "user-api,OK 200\n"
+                        "pay-api,OK 200\n"
+                        "search-api,OK 200\n"
+                    ),
+                ],
+            },
+            expected={
+                "ready": True,
+                "contains": [
+                    "## ✅ 批量任务完成报告",
+                    "### 📋 明细",
+                    "| user-api | OK 200 |",
+                    "| pay-api | OK 200 |",
+                    "| search-api | OK 200 |",
+                ],
+            },
         ),
         ReplayCase(
             name="history-pod-model-failed-wss-requires-retry",

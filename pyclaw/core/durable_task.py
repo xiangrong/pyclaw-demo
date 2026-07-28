@@ -177,16 +177,19 @@ class DurableTaskEngine:
                 command = str(structured.get("command") or "")
                 stdout = str(structured.get("stdout") or "")
                 stderr = str(structured.get("stderr") or "")
-                if command:
-                    chunks.append(f"Command: {self.compact_command_for_evidence(command)}")
-                if stdout:
-                    chunks.append(f"STDOUT:\n{stdout}")
-                if stderr:
-                    chunks.append(f"STDERR:\n{stderr}")
-                if metadata.get("tool_result_error_code") == "timeout":
+                is_timeout = metadata.get("tool_result_error_code") == "timeout"
+                if stdout or stderr or is_timeout:
+                    if command:
+                        chunks.append(f"Command: {self.compact_command_for_evidence(command)}")
+                    if stdout:
+                        chunks.append(f"STDOUT:\n{stdout}")
+                    if stderr:
+                        chunks.append(f"STDERR:\n{stderr}")
+                if is_timeout:
                     timeout = structured.get("timeout") or ""
                     chunks.append(f"Command timed out after {timeout} seconds".strip())
-                continue
+                if stdout or stderr or is_timeout:
+                    continue
             chunks.append(str(getattr(msg, "content", "") or ""))
         return self.evidence_from_text("\n".join(chunks))
 
@@ -208,6 +211,7 @@ class DurableTaskEngine:
         captured_blocks: list[str] = []
         current: list[str] = []
         capturing = False
+        in_read_file = False
         saw_output_marker = False
 
         def flush_current() -> None:
@@ -220,11 +224,21 @@ class DurableTaskEngine:
             stripped = raw.strip()
             if stripped.startswith("OBSERVATION from read_file"):
                 flush_current()
+                in_read_file = True
                 capturing = False
                 captured_blocks.append(raw)
                 continue
+            if in_read_file:
+                if stripped.startswith("OBSERVATION from "):
+                    flush_current()
+                    in_read_file = False
+                    capturing = False
+                    continue
+                current.append(raw)
+                continue
             if stripped.startswith(("OBSERVATION from ", "<error_context", "</error_context")):
                 flush_current()
+                in_read_file = False
                 capturing = False
                 continue
             if stripped in {"STDOUT:", "STDERR:"}:

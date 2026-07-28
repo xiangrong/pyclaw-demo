@@ -11718,8 +11718,9 @@ async def test_agent_finalizes_operational_batch_from_terminal_evidence_without_
 
     assert model.chat.call_count == 1
     assert tools.execute_tool_calls.call_count == 1
-    assert "批量任务已有结果输出" in response.content
-    assert "success=3" in response.content
+    assert "批量任务完成报告" in response.content
+    assert "汇总：total=3 success=3 failed=0" in response.content
+    assert "处理成功：3 条" in response.content
     assert "结果文件" in response.content
     assert "skill 工作流验收" not in response.content
 
@@ -11866,10 +11867,10 @@ async def test_agent_polls_operational_batch_progress_before_finalizing():
         1 for msg in session.messages
         if "NOTICE: A batch/operational task is still in progress" in str(msg.content)
     ) == 3
-    assert "批量任务已有结果输出" in response.content
-    assert "总数=62" in response.content
-    assert "成功=58" in response.content
-    assert "失败=4" in response.content
+    assert "Pod出口IP/运营商批量查询完成报告" in response.content
+    assert "汇总：总数=62 成功=58 失败=4" in response.content
+    assert "查询成功：58 台" in response.content
+    assert "查询失败：4 台" in response.content
     assert "仍在执行中" not in response.content
 
 
@@ -11971,10 +11972,10 @@ async def test_agent_does_not_final_answer_partial_operational_progress_without_
 
     assert tools.execute_tool_calls.call_count == 2
     assert model.chat.call_count == 3
-    assert "批量任务已有结果输出" in response.content
-    assert "总数=62" in response.content
-    assert "成功=61" in response.content
-    assert "失败=1" in response.content
+    assert "Pod出口IP/运营商批量查询完成报告" in response.content
+    assert "汇总：总数=62 成功=61 失败=1" in response.content
+    assert "查询成功：61 台" in response.content
+    assert "查询失败：1 台" in response.content
     assert "3/62" not in response.content
 
 
@@ -12026,22 +12027,25 @@ async def test_agent_exec_approval_reaches_tool_executor_and_finalizes_pod_batch
                 f"Command: {args['command']}\n"
                 "Exit code: 0\n"
                 "STDOUT:\n"
-                "[62/62] 查询 7663027791235210003... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                "[1/4] 查询 7663861888673078054... ✓ 60.28.201.5 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                "[2/4] 查询 7663689872217266980... ✓ 60.28.201.5 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
+                "[3/4] 查询 7663861888673045286... ✓ 111.32.192.161 | AS9808 China Mobile  | BeijingBeijing\n"
+                "[4/4] 查询 7664890516131257131... ✓ 125.39.37.182 | AS4837 CHINA UNICOM  | TianjinTianjin\n"
                 "\n"
-                "查询完成！成功: 61, 失败: 1\n"
+                "查询完成！成功: 4, 失败: 0\n"
                 "\n"
                 "运营商分布统计:\n"
-                "  AS9808 China Mobile Communications Group Co., Ltd.: 39 台\n"
-                "  AS4837 CHINA UNICOM China169 Backbone: 22 台\n"
+                "  AS4837 CHINA UNICOM: 3 台\n"
+                "  AS9808 China Mobile: 1 台\n"
                 "\n"
                 "地域分布统计:\n"
-                "  BeijingBeijing: 39 台\n"
-                "  TianjinTianjin: 22 台\n"
+                "  TianjinTianjin: 3 台\n"
+                "  BeijingBeijing: 1 台\n"
                 "\n"
                 "完整结果已保存到:\n"
-                "  JSON: pod_egress_61_wss_results.json\n"
-                "  CSV:  pod_egress_61_wss_results.csv\n"
-                "日志：/Users/bytedance/.pyclaw/pod_egress_61.log\n"
+                "  JSON: pod_egress_4_wss_results.json\n"
+                "  CSV:  pod_egress_4_wss_results.csv\n"
+                "日志：/Users/bytedance/.pyclaw/pod_egress_4.log\n"
             ),
             "success": True,
             "metadata": {},
@@ -12079,14 +12083,15 @@ async def test_agent_exec_approval_reaches_tool_executor_and_finalizes_pod_batch
 
     assert model.chat.call_count == 1
     assert tools.execute_tool_calls.call_count == 1
-    assert "批量任务已有结果输出" in response.content
-    assert "成功: 61" in response.content
-    assert "失败: 1" in response.content
-    assert "/Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv" in response.content
-    assert "AS9808 China Mobile Communications Group Co., Ltd.: 39 台" in response.content
-    assert "AS4837 CHINA UNICOM China169 Backbone: 22 台" in response.content
-    assert "BeijingBeijing: 39 台" in response.content
-    assert "TianjinTianjin: 22 台" in response.content
+    assert "Pod出口IP/运营商批量查询完成报告" in response.content
+    assert "### 📋 Pod出口IP明细" in response.content
+    assert "查询成功：4 台" in response.content
+    assert "查询失败：0 台" in response.content
+    assert "/Users/bytedance/.pyclaw/pod_egress_4_wss_results.csv" in response.content
+    assert "| 7663861888673078054 | 60.28.201.5 | AS4837 CHINA UNICOM | TianjinTianjin |" in response.content
+    assert "| 7664890516131257131 | 125.39.37.182 | AS4837 CHINA UNICOM | TianjinTianjin |" in response.content
+    assert "AS4837 CHINA UNICOM | 3 台" in response.content
+    assert "AS9808 China Mobile | 1 台" in response.content
     forbidden = ("approved=True", "NOTICE", "guardrail", "副作用工具重复调用", "请确认授权")
     assert not any(token in response.content for token in forbidden)
 
@@ -12175,22 +12180,62 @@ async def test_agent_exact_62_pod_egress_task_materializes_once_and_finalizes_fr
         "nohup python3 batch_egress_wss_serial.py pod_egress_61.txt > pod_egress_61.log 2>&1 < /dev/null & "
         "echo \"PID=$! LOG=/Users/bytedance/.pyclaw/pod_egress_61.log\""
     )
-    model.chat.return_value = {
-        "content": "我会把列表物化到运行目录，后台启动一次批量查询，然后根据日志汇总结果。",
-        "__tool_calls__": True,
-        "tool_calls": [{
-            "id": "exact-pod-egress-62",
-            "function": {
-                "name": "terminal",
-                "arguments": json.dumps({"command": command}, ensure_ascii=False),
-            },
-        }],
-    }
+    model.chat.side_effect = [
+        {
+            "content": "我会把列表物化到运行目录，后台启动一次批量查询，然后根据日志汇总结果。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "exact-pod-egress-62",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": command}, ensure_ascii=False),
+                },
+            }],
+        },
+        {
+            "content": "读取现有结果文件补齐逐项明细。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "read-pod-egress-62-results",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "/Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv", "max_chars": 50000}, ensure_ascii=False),
+                },
+            }],
+        },
+    ]
 
     async def execute_tool_calls(payload):
         parsed = json.loads(payload)
         tool_call = parsed["tool_calls"][0]
         args = json.loads(tool_call["function"]["arguments"])
+        if tool_call["function"]["name"] == "read_file":
+            assert args["path"] == "/Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv"
+            read_rows = [
+                "Pod ID,出口IP,运营商,地域",
+                *[
+                    f"{pod},111.32.192.161,AS9808 China Mobile Communications Group Co. Ltd.,BeijingBeijing"
+                    for pod in pod_ids[:39]
+                ],
+                *[
+                    f"{pod},125.39.37.182,AS4837 CHINA UNICOM China169 Backbone,TianjinTianjin"
+                    for pod in pod_ids[39:61]
+                ],
+                f"{pod_ids[61]},, ,FAILED_TO_GET_WSS",
+            ]
+            return [{
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "name": "read_file",
+                "content": (
+                    "File: /Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv (63 lines)\n\n"
+                    + "\n".join(read_rows)
+                    + "\n"
+                ),
+                "success": True,
+                "metadata": {},
+            }]
+
         observed_command = args["command"]
         assert args["approved"] is True
         assert observed_command.count("\n766") == 62
@@ -12251,18 +12296,24 @@ async def test_agent_exact_62_pod_egress_task_materializes_once_and_finalizes_fr
 
     response = await agent.process_message(user_msg)
 
-    assert model.chat.call_count == 1
-    assert tools.execute_tool_calls.call_count == 1
-    assert "批量任务已有结果输出" in response.content
-    assert "成功: 61" in response.content
-    assert "失败: 1" in response.content
-    assert "PID：74830" in response.content
-    assert "日志：/Users/bytedance/.pyclaw/pod_egress_61.log" in response.content
+    assert model.chat.call_count == 2
+    assert tools.execute_tool_calls.call_count == 2
+    second_prompt = "\n".join(str(message.get("content", "")) for message in model.chat.call_args_list[1][1]["messages"])
+    assert "lacks per-target detail rows" in second_prompt
+    assert "read_file" in second_prompt
+    assert "Pod出口IP/运营商批量查询完成报告" in response.content
+    assert "### 📋 Pod出口IP明细" in response.content
+    assert "查询成功：61 台" in response.content
+    assert "查询失败：1 台" in response.content
     assert "结果文件：/Users/bytedance/.pyclaw/pod_egress_61_wss_results.csv" in response.content
-    assert "AS9808 China Mobile Communications Group Co., Ltd.: 39 台" in response.content
-    assert "AS4837 CHINA UNICOM China169 Backbone: 22 台" in response.content
-    assert "BeijingBeijing: 39 台" in response.content
-    assert "TianjinTianjin: 22 台" in response.content
+    assert f"| {pod_ids[0]} | 111.32.192.161 | AS9808 China Mobile Communications Group Co. Ltd. | BeijingBeijing |" in response.content
+    assert f"| {pod_ids[39]} | 125.39.37.182 | AS4837 CHINA UNICOM China169 Backbone | TianjinTianjin |" in response.content
+    assert f"| {pod_ids[61]} |  |  | FAILED_TO_GET_WSS |" in response.content
+    assert "AS9808 China Mobile Communications Group Co., Ltd. | 39 台" in response.content
+    assert "AS4837 CHINA UNICOM China169 Backbone | 22 台" in response.content
+    assert "BeijingBeijing | 39 台" in response.content
+    assert "TianjinTianjin | 22 台" in response.content
+    assert "批量任务已有结果输出" not in response.content
     forbidden = ("approved=True", "NOTICE", "guardrail", "副作用工具重复调用", "请确认授权")
     assert not any(token in response.content for token in forbidden)
 
@@ -12281,6 +12332,9 @@ async def test_agent_operational_batch_plan_without_tools_is_not_final():
                 "Exit code: 0\n"
                 "STDOUT:\n"
                 "查询完成\n"
+                "[1/3] 7663027791235341075: Pixel 7\n"
+                "[2/3] 7663689872217266980: Pixel 7\n"
+                "[3/3] 7663861888673078054: Pixel 8\n"
                 "总数: 3\n"
                 "成功: 3\n"
                 "失败: 0\n"
@@ -12342,9 +12396,12 @@ async def test_agent_operational_batch_plan_without_tools_is_not_final():
     assert model.chat.call_count == 2
     tools.execute_tool_calls.assert_awaited_once()
     assert "标准化流程" not in response.content
-    assert "批量任务已有结果输出" in response.content
-    assert "总数=3" in response.content
-    assert "机型分布" in response.content
+    assert "Pod机型批量查询完成报告" in response.content
+    assert "### 📋 Pod机型明细" in response.content
+    assert "总查询量：3 台" in response.content
+    assert "| 7663027791235341075 | Pixel 7 |" in response.content
+    assert "| 7663861888673078054 | Pixel 8 |" in response.content
+    assert "### 📱 机型分布" in response.content
     assert any("requires concrete tool evidence" in m.content for m in session.messages)
 
 
@@ -12399,3 +12456,149 @@ def test_agent_finalizes_operational_batch_from_read_file_evidence_without_secon
     assert "查询成功：3 台" in final
     assert "PHW110" in final
     assert not agent._should_repair_operational_no_evidence_final(session, "我来整理报告")
+
+
+@pytest.mark.asyncio
+async def test_agent_repairs_summary_only_pod_egress_by_reading_result_file():
+    model = AsyncMock()
+    tools = MagicMock()
+    tools.execute_tool_calls = AsyncMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    tools.get_all_specs.return_value = []
+
+    pod_ids = [
+        "7663403048656018202",
+        "7662277640602786611",
+        "7663403048655870746",
+        "7666143962817633033",
+        "7666143962817698569",
+        "7666143937900059401",
+        "7666143962817780489",
+        "7666143962817649417",
+        "7666143962817665801",
+    ]
+    command = "cd /Users/bytedance/.pyclaw && python3 batch_egress_wss_serial.py pod_ips_input_9.txt 2>&1"
+    model.chat.side_effect = [
+        {
+            "content": "执行批量查询出口 IP。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "query-pod-egress-9",
+                "function": {
+                    "name": "terminal",
+                    "arguments": json.dumps({"command": command, "approved": True}, ensure_ascii=False),
+                },
+            }],
+        },
+        {
+            "content": "读取已有 CSV 补齐每个 pod 的出口 IP 明细。",
+            "__tool_calls__": True,
+            "tool_calls": [{
+                "id": "read-pod-egress-9",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv"}, ensure_ascii=False),
+                },
+            }],
+        },
+    ]
+
+    csv_body = "\n".join([
+        "Pod ID,出口IP,运营商,地域",
+        "7663403048656018202,125.39.37.182,AS4837 CHINA UNICOM,TianjinTianjin",
+        "7662277640602786611,111.31.8.240,AS9808 China Mobile,BeijingBeijing",
+        "7663403048655870746,125.39.37.182,AS4837 CHINA UNICOM,TianjinTianjin",
+        "7666143962817633033,111.32.192.161,AS9808 China Mobile,BeijingBeijing",
+        "7666143962817698569,111.32.192.161,AS9808 China Mobile,BeijingBeijing",
+        "7666143937900059401,111.32.192.161,AS9808 China Mobile,BeijingBeijing",
+        "7666143962817780489,180.213.57.183,AS58542 CHINATELECOM,TianjinTianjin",
+        "7666143962817649417,111.32.192.161,AS9808 China Mobile,BeijingBeijing",
+        "7666143962817665801,111.32.192.161,AS9808 China Mobile,BeijingBeijing",
+    ])
+
+    async def execute_tool_calls(payload):
+        parsed = json.loads(payload)
+        tool_call = parsed["tool_calls"][0]
+        args = json.loads(tool_call["function"]["arguments"])
+        if tool_call["function"]["name"] == "terminal":
+            assert args["approved"] is True
+            return [{
+                "role": "tool",
+                "tool_call_id": tool_call["id"],
+                "name": "terminal",
+                "content": (
+                    f"Command: {args['command']}\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "开始查询 9 台Pod的出口IP及运营商...\n"
+                    "查询完成！成功: 9, 失败: 0\n"
+                    "结果文件：pod_ips_input_9_wss_results.csv\n"
+                    "运营商分布：\n"
+                    "AS9808 China Mobile Communications Group Co., Ltd.: 6 台\n"
+                    "AS4837 CHINA UNICOM China169 Backbone: 2 台\n"
+                    "AS58542 CHINATELECOM TIANJIN: 1 台\n"
+                    "地域分布：\n"
+                    "BeijingBeijing: 6 台\n"
+                    "TianjinTianjin: 3 台\n"
+                ),
+                "success": True,
+                "metadata": {},
+            }]
+        assert tool_call["function"]["name"] == "read_file"
+        assert args["path"] == "/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv"
+        return [{
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "name": "read_file",
+            "content": (
+                "File: /Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv (10 lines)\n\n"
+                f"{csv_body}\n"
+            ),
+            "success": True,
+            "metadata": {},
+        }]
+
+    tools.execute_tool_calls.side_effect = execute_tool_calls
+
+    sessions = AsyncMock()
+    session = Session(session_id="s-pod-egress-summary-repair", user_id="u1", channel="feishu")
+
+    async def save_msg_side_effect(sess, msg):
+        sess.messages.append(msg)
+
+    sessions.save_message.side_effect = save_msg_side_effect
+    sessions.get_or_create.return_value = session
+
+    agent = Agent(model, tools, sessions, max_iterations=20)
+    user_msg = Message(
+        id="m-pod-egress-summary-repair",
+        channel="feishu",
+        channel_user_id="u1",
+        session_id=session.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="再查询下这批pod的出口ip\n" + "\n".join(pod_ids),
+    )
+
+    response = await agent.process_message(user_msg)
+
+    assert model.chat.call_count == 2
+    assert tools.execute_tool_calls.call_count == 2
+    repair_prompt = "\n".join(str(message.get("content", "")) for message in model.chat.call_args_list[1][1]["messages"])
+    assert "lacks per-target detail rows" in repair_prompt
+    assert "read_file" in repair_prompt
+    assert "/Users/bytedance/.pyclaw/pod_ips_input_9_wss_results.csv" in repair_prompt
+    assert "Pod出口IP/运营商批量查询完成报告" in response.content
+    assert "### 📋 Pod出口IP明细" in response.content
+    for pod in pod_ids:
+        assert f"| {pod} |" in response.content
+    assert "| 7663403048656018202 | 125.39.37.182 | AS4837 CHINA UNICOM | TianjinTianjin |" in response.content
+    assert "| 7666143962817780489 | 180.213.57.183 | AS58542 CHINATELECOM | TianjinTianjin |" in response.content
+    assert "查询成功：9 台" in response.content
+    assert "查询失败：0 台" in response.content
+    assert "AS9808 China Mobile Communications Group Co., Ltd. | 6 台" in response.content
+    assert "TianjinTianjin | 3 台" in response.content
+    assert "批量任务已有结果输出" not in response.content
+    assert "NOTICE" not in response.content

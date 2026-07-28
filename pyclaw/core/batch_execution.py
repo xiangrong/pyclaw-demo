@@ -464,20 +464,26 @@ class BatchExecutionService:
         message_list = list(messages)[-12:]
         chunks: list[str] = []
         for msg in message_list:
-            chunks.append(str(getattr(msg, "content", "") or ""))
             metadata = getattr(msg, "metadata", {}) or {}
             structured = metadata.get("tool_result_structured") if isinstance(metadata, dict) else None
-            if not isinstance(structured, dict):
-                continue
-            command = str(structured.get("command") or "")
-            stdout = str(structured.get("stdout") or "")
-            stderr = str(structured.get("stderr") or "")
-            if command:
-                chunks.append(f"Command: {self._compact_command_for_evidence(command)}")
-            if stdout:
-                chunks.append(f"STDOUT:\n{stdout}")
-            if stderr:
-                chunks.append(f"STDERR:\n{stderr}")
+            if isinstance(structured, dict):
+                command = str(structured.get("command") or "")
+                stdout = str(structured.get("stdout") or "")
+                stderr = str(structured.get("stderr") or "")
+                is_timeout = metadata.get("tool_result_error_code") == "timeout"
+                if stdout or stderr or is_timeout:
+                    if command:
+                        chunks.append(f"Command: {self._compact_command_for_evidence(command)}")
+                    if stdout:
+                        chunks.append(f"STDOUT:\n{stdout}")
+                    if stderr:
+                        chunks.append(f"STDERR:\n{stderr}")
+                if is_timeout:
+                    timeout = structured.get("timeout") or ""
+                    chunks.append(f"Command timed out after {timeout} seconds".strip())
+                if stdout or stderr or is_timeout:
+                    continue
+            chunks.append(str(getattr(msg, "content", "") or ""))
         return self.evidence_from_text("\n".join(chunks))
 
     def _compact_command_for_evidence(self, command: str) -> str:
@@ -494,8 +500,10 @@ class BatchExecutionService:
             observable_content,
             (
                 "运营商分布统计",
+                "运营商分布",
                 "运营商统计",
                 "ISP分布统计",
+                "ISP分布",
                 "ISP统计",
                 "operator distribution",
                 "isp distribution",
@@ -505,8 +513,10 @@ class BatchExecutionService:
             observable_content,
             (
                 "地域分布统计",
+                "地域分布",
                 "地域统计",
                 "地区分布统计",
+                "地区分布",
                 "地区统计",
                 "region distribution",
                 "location distribution",
@@ -525,10 +535,19 @@ class BatchExecutionService:
                 "device model distribution",
             ),
         )
-        structured = self._structured_result_evidence(observable_content, result_path_hint=result_path)
+        result_path = self._resolve_relative_result_path_from_context(result_path, content)
+        structured = self._structured_result_evidence(
+            observable_content,
+            result_path_hint=result_path,
+            operator_distribution_hint=operator_distribution,
+            region_distribution_hint=region_distribution,
+        )
         if structured:
             if not result_path:
                 result_path = str(structured.get("result_path") or "")
+            result_path = self._resolve_relative_result_path_from_context(result_path, content)
+            if structured.get("result_path") != result_path:
+                structured = {**structured, "result_path": result_path}
             stats_line = stats_line or str(structured.get("stats_line") or "")
             completion_line = completion_line or str(structured.get("completion_line") or "")
             operator_distribution = operator_distribution or tuple(structured.get("operator_distribution") or ())
@@ -651,7 +670,10 @@ class BatchExecutionService:
         ledger = decision.ledger
         if ledger is None:
             return False
-        return any(facet_evidence.is_complete for facet_evidence in ledger.facets.values())
+        return any(
+            facet_evidence.is_complete or facet_evidence.status == "needs_detail"
+            for facet_evidence in ledger.facets.values()
+        )
 
     def evaluate_operational_contract(
         self,
@@ -712,6 +734,19 @@ class BatchExecutionService:
             parts.append(
                 f"Missing required result facets: {labels}. Run or poll only the missing facet workflows, then gather concrete log/result evidence."
             )
+            detail_paths: list[str] = []
+            if decision.ledger is not None:
+                for facet in decision.missing_facets:
+                    evidence = decision.ledger.facets.get(facet)
+                    if evidence and evidence.status == "needs_detail" and evidence.result_path:
+                        detail_paths.append(evidence.result_path)
+            if detail_paths:
+                paths = ", ".join(dict.fromkeys(detail_paths))
+                parts.append(
+                    "The facet already has aggregate completion evidence but lacks per-target detail rows. "
+                    f"Read the existing result artifact(s) with read_file instead of rerunning the batch: {paths}. "
+                    "Final answer must include item-level rows for each requested target plus the aggregate summary."
+                )
         if decision.retryable_failed_items:
             retry_chunks = []
             for facet, items in decision.retryable_failed_items.items():
@@ -760,8 +795,13 @@ class BatchExecutionService:
                 if facet in facet_messages:
                     facet_messages[facet].append(msg)
 
-        if FACET_GENERIC_RESULT in facet_messages and not facet_messages[FACET_GENERIC_RESULT]:
-            facet_messages[FACET_GENERIC_RESULT] = list(messages)
+        if FACET_GENERIC_RESULT in facet_messages:
+            if facet_messages[FACET_GENERIC_RESULT]:
+                facet_messages[FACET_GENERIC_RESULT] = self._dedupe_messages(
+                    [*facet_messages[FACET_GENERIC_RESULT], *fallback_messages]
+                )
+            else:
+                facet_messages[FACET_GENERIC_RESULT] = list(messages)
         if FACET_IMAGE_UPDATE_SUBMISSION in facet_messages and not facet_messages[FACET_IMAGE_UPDATE_SUBMISSION]:
             image_messages = [msg for msg in messages if "update-image" in str(getattr(msg, "content", "") or "").lower()]
             facet_messages[FACET_IMAGE_UPDATE_SUBMISSION] = image_messages
@@ -771,10 +811,28 @@ class BatchExecutionService:
             if not scoped_messages:
                 continue
             evidence = self.evidence_from_messages(scoped_messages)
-            facet_evidence = self._facet_evidence_from_batch_evidence(facet, evidence, scoped_messages)
+            facet_evidence = self._facet_evidence_from_batch_evidence(
+                facet,
+                evidence,
+                scoped_messages,
+                contract=contract,
+            )
             if facet_evidence is not None:
                 facets[facet] = facet_evidence
         return OperationalEvidenceLedger(contract=contract, facets=facets)
+
+    def _dedupe_messages(self, messages: Sequence[Message]) -> list[Message]:
+        deduped: list[Message] = []
+        seen: set[tuple[str, str]] = set()
+        for index, msg in enumerate(messages):
+            msg_id = str(getattr(msg, "id", "") or "")
+            content = str(getattr(msg, "content", "") or "")
+            key = (msg_id, content) if msg_id else (f"__index_{index}", content)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(msg)
+        return deduped
 
     def _facets_from_observation(self, content: str) -> tuple[str, ...]:
         normalized = (content or "").lower()
@@ -824,21 +882,31 @@ class BatchExecutionService:
         facet: str,
         evidence: BatchEvidence,
         messages: Sequence[Message],
+        *,
+        contract: OperationalTaskContract,
     ) -> OperationalFacetEvidence | None:
         if facet == FACET_POD_MODEL:
             if not evidence.model_items and not evidence.model_distribution and "Pod机型批量查询完成报告" not in evidence.structured_report:
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
             retryable = self._retryable_failed_items_from_item_results(evidence.model_items)
+            status = "complete"
+            if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
+                evidence.model_items,
+                total=total,
+                success=success,
+                targets=contract.targets,
+            ):
+                status = "needs_detail"
             return OperationalFacetEvidence(
                 facet=facet,
-                status="complete",
+                status=status,
                 total=total,
                 success=success,
                 failed=failed,
                 result_path=evidence.result_path,
                 log_path=evidence.log_path,
-                report=evidence.structured_report,
+                report=evidence.structured_report or self._aggregate_facet_report(facet, evidence),
                 item_results=evidence.model_items,
                 retryable_failed_items=retryable,
             )
@@ -850,16 +918,24 @@ class BatchExecutionService:
             if not has_distribution and not has_egress_report and not (has_egress_signal and has_completion_summary):
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
+            status = "complete"
+            if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
+                evidence.item_results,
+                total=total,
+                success=success,
+                targets=contract.targets,
+            ):
+                status = "needs_detail"
             return OperationalFacetEvidence(
                 facet=facet,
-                status="complete",
+                status=status,
                 total=total,
                 success=success,
                 failed=failed,
                 result_path=evidence.result_path,
                 log_path=evidence.log_path,
-                report=evidence.structured_report,
-                item_results=evidence.item_results or self._distribution_items_from_evidence(evidence),
+                report=evidence.structured_report or self._aggregate_facet_report(facet, evidence),
+                item_results=evidence.item_results,
             )
         if facet == FACET_IMAGE_UPDATE_SUBMISSION:
             rendered = self._render_image_update_submission(messages)
@@ -867,23 +943,145 @@ class BatchExecutionService:
                 return None
             return OperationalFacetEvidence(facet=facet, status="submitted", total=1, success=1, report=rendered)
         if facet == FACET_GENERIC_RESULT:
-            if not evidence.item_results and not evidence.result_distribution and not evidence.structured_report:
+            has_completion_summary = bool(evidence.stats_line and (evidence.completion_line or evidence.result_path))
+            if not evidence.item_results and not evidence.result_distribution and not evidence.structured_report and not has_completion_summary:
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
             retryable = self._retryable_failed_items_from_item_results(evidence.item_results)
+            status = "complete"
+            if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
+                evidence.item_results,
+                total=total,
+                success=success,
+                targets=contract.targets,
+            ):
+                status = "needs_detail"
             return OperationalFacetEvidence(
                 facet=facet,
-                status="complete",
+                status=status,
                 total=total,
                 success=success,
                 failed=failed,
                 result_path=evidence.result_path,
                 log_path=evidence.log_path,
-                report=evidence.structured_report,
+                report=evidence.structured_report or self._aggregate_facet_report(facet, evidence),
                 item_results=evidence.item_results,
                 retryable_failed_items=retryable,
             )
         return None
+
+    def _aggregate_facet_report(self, facet: str, evidence: BatchEvidence) -> str:
+        """Render aggregate evidence when item-level rows are not available.
+
+        This keeps legacy/single-facet summaries useful while the operational
+        contract can still mark the facet as ``needs_detail`` for multi-target
+        requests.  Distribution data stays separate from ``item_results`` so an
+        aggregate-only report cannot accidentally satisfy the per-target detail
+        gate.
+        """
+        total, success, failed = self._counts_from_evidence(evidence)
+        distributions = (
+            evidence.operator_distribution,
+            evidence.region_distribution,
+            evidence.ip_distribution,
+            evidence.model_distribution,
+            evidence.result_distribution,
+        )
+        if not any((total, evidence.stats_line, evidence.completion_line, evidence.result_path, evidence.log_path, *distributions)):
+            return ""
+
+        title = {
+            FACET_POD_MODEL: "Pod机型批量查询完成报告",
+            FACET_POD_EGRESS: "Pod出口IP/运营商批量查询完成报告",
+            FACET_GENERIC_RESULT: "批量任务完成报告",
+        }.get(facet, facet_label(facet))
+        unit = "台" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS} else "条"
+        action = "查询" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS} else "处理"
+
+        lines = [f"## ✅ {title}", "", "### 📊 总体执行情况"]
+        if evidence.stats_line:
+            lines.append(f"- 汇总：{evidence.stats_line}")
+        if evidence.completion_line and evidence.completion_line != evidence.stats_line:
+            lines.append(f"- 完成摘要：{evidence.completion_line}")
+        if total:
+            lines.extend([
+                f"- 总{action}量：{total} {unit}",
+                f"- {action}成功：{success} {unit}",
+                f"- {action}失败：{failed} {unit}",
+            ])
+        if evidence.result_path:
+            lines.append(f"- 结果文件：{evidence.result_path}")
+        if evidence.log_path:
+            lines.append(f"- 日志：{evidence.log_path}")
+
+        self._append_distribution_section(lines, "📱 机型分布", evidence.model_distribution)
+        self._append_distribution_section(lines, "📡 运营商分布", evidence.operator_distribution)
+        self._append_distribution_section(lines, "🗺️ 地域分布", evidence.region_distribution)
+        self._append_distribution_section(lines, "🌐 出口IP分布", evidence.ip_distribution)
+        self._append_distribution_section(lines, "📈 结果分布", evidence.result_distribution)
+
+        if evidence.item_results:
+            lines.extend(["", "### 📋 明细"])
+            for item in evidence.item_results[:50]:
+                lines.append(f"- {item}")
+        return "\n".join(lines).strip()
+
+    def _append_distribution_section(self, lines: list[str], title: str, rows: Sequence[str]) -> None:
+        if not rows:
+            return
+        lines.extend(["", f"### {title}"])
+        for row in rows:
+            lines.append(f"- {row}")
+
+    def _contract_requires_item_detail(self, contract: OperationalTaskContract, *, facet: str, total: int) -> bool:
+        """Return True when aggregate success/fail stats are not enough.
+
+        For file-driven multi-target operational queries, the user usually asks
+        for the values of each target (for example every pod's egress IP), not
+        just a distribution.  Mark such facets incomplete until item-level rows
+        are observed, so the controller asks the model to read/parse the result
+        artifact instead of shipping a summary-only answer.
+        """
+        if facet == FACET_IMAGE_UPDATE_SUBMISSION:
+            return False
+        if not contract.requires_file_batch:
+            return False
+        if len(contract.targets) <= 1:
+            return False
+        return total <= 0 or total > 1
+
+    def _has_full_item_detail(
+        self,
+        item_results: Sequence[str],
+        *,
+        total: int,
+        success: int,
+        targets: Sequence[str] = (),
+    ) -> bool:
+        if not item_results:
+            return False
+        if targets and not self._item_results_cover_targets(item_results, targets):
+            return False
+        expected = max(total, success, len(tuple(dict.fromkeys(str(target).strip() for target in targets if str(target).strip()))))
+        if expected <= 1:
+            return True
+        return len(item_results) >= expected
+
+    def _item_results_cover_targets(self, item_results: Sequence[str], targets: Sequence[str]) -> bool:
+        rows = [str(row or "").strip() for row in item_results if str(row or "").strip()]
+        if not rows:
+            return False
+        for raw_target in dict.fromkeys(str(target).strip() for target in targets if str(target).strip()):
+            target = str(raw_target).strip()
+            if not any(
+                row == target
+                or row.startswith(f"{target}:")
+                or row.startswith(f"{target} |")
+                or row.startswith(f"{target}\t")
+                for row in rows
+            ):
+                return False
+        return True
 
     def _has_pod_egress_evidence_signal(self, *, messages: Sequence[Message], evidence: BatchEvidence) -> bool:
         text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
@@ -901,7 +1099,9 @@ class BatchExecutionService:
             return evidence.report if evidence else ""
         if len(contract.required_facets) == 1:
             evidence = ledger.facets.get(contract.required_facets[0])
-            return evidence.report if evidence else ""
+            if not evidence:
+                return ""
+            return evidence.report or self._fallback_facet_report(contract.required_facets[0], evidence)
 
         lines = ["## ✅ Operational任务完成报告", "", "### 📊 契约完成情况"]
         if contract.targets:
@@ -1071,17 +1271,43 @@ class BatchExecutionService:
         match = pattern.search(text or "")
         return match.group(1).strip() if match else ""
 
-    def _structured_result_evidence(self, content: str, *, result_path_hint: str = "") -> dict[str, Any]:
+    def _structured_result_evidence(
+        self,
+        content: str,
+        *,
+        result_path_hint: str = "",
+        operator_distribution_hint: Sequence[str] = (),
+        region_distribution_hint: Sequence[str] = (),
+    ) -> dict[str, Any]:
         csv_rows, csv_path = self._csv_rows_from_text(content)
         if csv_rows:
-            return self._egress_rows_evidence(csv_rows, result_path=csv_path or result_path_hint)
+            return self._egress_rows_evidence(
+                csv_rows,
+                result_path=csv_path or result_path_hint,
+                operator_distribution_hint=operator_distribution_hint,
+                region_distribution_hint=region_distribution_hint,
+            )
+
+        terminal_egress_rows = self._egress_rows_from_terminal_rows(content)
+        if terminal_egress_rows and self._terminal_rows_cover_completion_summary(content, row_count=len(terminal_egress_rows)):
+            return self._egress_rows_evidence(
+                terminal_egress_rows,
+                result_path=result_path_hint,
+                operator_distribution_hint=operator_distribution_hint,
+                region_distribution_hint=region_distribution_hint,
+            )
 
         mapping, paths = self._json_mappings_from_read_files(content)
         terminal_pairs = self._model_pairs_from_terminal_rows(content)
         if mapping and self._mapping_looks_like_egress(mapping):
             rows = self._egress_rows_from_mapping(mapping)
             if rows:
-                return self._egress_rows_evidence(rows, result_path=paths[-1] if paths else result_path_hint)
+                return self._egress_rows_evidence(
+                    rows,
+                    result_path=paths[-1] if paths else result_path_hint,
+                    operator_distribution_hint=operator_distribution_hint,
+                    region_distribution_hint=region_distribution_hint,
+                )
 
         simple_mapping = self._simple_value_mapping(mapping)
         if terminal_pairs:
@@ -1279,6 +1505,40 @@ class BatchExecutionService:
                 pairs[match.group("pod")] = model[:120]
         return pairs
 
+    def _egress_rows_from_terminal_rows(self, content: str) -> list[dict[str, str]]:
+        """Extract pod egress rows from common ``[i/n] 查询 <pod>...`` logs."""
+        rows: list[dict[str, str]] = []
+        pattern = re.compile(
+            r"^\s*\[\s*\d+\s*/\s*\d+\s*\]\s*"
+            r"(?:查询|check|query)?\s*"
+            r"(?P<pod>\d{12,})\s*(?:\.{3}|…)?\s*"
+            r"(?P<status>[✓✔✗✘xX-])?\s*"
+            r"(?P<tail>.*)$",
+            re.IGNORECASE,
+        )
+        ip_pattern = re.compile(r"\b(?P<ip>(?:\d{1,3}\.){3}\d{1,3})\b")
+        for raw in (content or "").splitlines():
+            match = pattern.match(raw)
+            if not match:
+                continue
+            tail = match.group("tail").strip()
+            if not tail or "|" not in tail:
+                continue
+            ip_match = ip_pattern.search(tail)
+            if not ip_match:
+                continue
+            parts = [part.strip() for part in tail.split("|")]
+            ip = ip_match.group("ip")
+            operator = parts[1] if len(parts) > 1 else ""
+            region = parts[2] if len(parts) > 2 else ""
+            rows.append({
+                "Pod ID": match.group("pod"),
+                "出口IP": ip,
+                "运营商": operator,
+                "地域": region,
+            })
+        return rows
+
     def _generic_item_results_from_terminal_rows(self, content: str) -> list[dict[str, str]]:
         """Extract item-level results from common ``[i/n] item: value`` logs.
 
@@ -1373,6 +1633,28 @@ class BatchExecutionService:
     def _escape_markdown_table_cell(self, value: str) -> str:
         return str(value or "").replace("\n", " ").replace("|", r"\|").strip()
 
+    def _dedupe_rows_by_key(self, rows: Sequence[dict[str, str]], key: str) -> list[dict[str, str]]:
+        """Return rows de-duplicated by a stable item key, keeping latest data.
+
+        Evidence can be assembled from overlapping log polls, or from legacy
+        observation text plus structured stdout.  A repeated row should not
+        inflate total/success counts.  Keep the original display order while
+        letting later rows replace earlier values so retry-success evidence can
+        correct an earlier failed item.
+        """
+        deduped: dict[str, dict[str, str]] = {}
+        order: list[str] = []
+        anonymous_index = 0
+        for row in rows:
+            item_key = str(row.get(key) or "").strip()
+            if not item_key:
+                anonymous_index += 1
+                item_key = f"__anonymous_{anonymous_index}"
+            if item_key not in deduped:
+                order.append(item_key)
+            deduped[item_key] = dict(row)
+        return [deduped[item_key] for item_key in order]
+
     def _generic_item_results_evidence(self, rows: Sequence[dict[str, str]], *, result_paths: Sequence[str]) -> dict[str, Any]:
         normalized_rows: list[dict[str, str]] = []
         for row in rows:
@@ -1380,6 +1662,7 @@ class BatchExecutionService:
             result = str(row.get("result") or "").strip()
             if item and result:
                 normalized_rows.append({"item": item, "result": result})
+        normalized_rows = self._dedupe_rows_by_key(normalized_rows, "item")
 
         total = len(normalized_rows)
         failed_items = [row for row in normalized_rows if self._is_failed_value(row["result"])]
@@ -1565,7 +1848,14 @@ class BatchExecutionService:
                 })
         return rows
 
-    def _egress_rows_evidence(self, rows: list[dict[str, str]], *, result_path: str) -> dict[str, Any]:
+    def _egress_rows_evidence(
+        self,
+        rows: list[dict[str, str]],
+        *,
+        result_path: str,
+        operator_distribution_hint: Sequence[str] = (),
+        region_distribution_hint: Sequence[str] = (),
+    ) -> dict[str, Any]:
         normalized_rows: list[dict[str, str]] = []
         for row in rows:
             pod = self._row_get(row, ("Pod ID", "pod", "pod_id", "id"))
@@ -1574,6 +1864,7 @@ class BatchExecutionService:
             region = self._row_get(row, ("地域", "地区", "region", "location", "city"))
             status = self._row_get(row, ("状态", "status", "result"))
             normalized_rows.append({"pod": pod, "ip": ip, "operator": operator, "region": region, "status": status})
+        normalized_rows = self._dedupe_rows_by_key(normalized_rows, "pod")
         total = len(normalized_rows)
         failures = [
             row for row in normalized_rows
@@ -1583,8 +1874,10 @@ class BatchExecutionService:
         operator_counter = Counter(row["operator"] for row in normalized_rows if row.get("operator"))
         region_counter = Counter(row["region"] for row in normalized_rows if row.get("region"))
         ip_counter = Counter(row["ip"] for row in normalized_rows if row.get("ip"))
-        operator_distribution = tuple(f"{name}: {count} 台" for name, count in operator_counter.most_common())
-        region_distribution = tuple(f"{name}: {count} 台" for name, count in region_counter.most_common())
+        operator_display = self._merge_distribution_display_names(operator_counter, operator_distribution_hint)
+        region_display = self._merge_distribution_display_names(region_counter, region_distribution_hint)
+        operator_distribution = tuple(f"{name}: {count} 台" for name, count in operator_display)
+        region_distribution = tuple(f"{name}: {count} 台" for name, count in region_display)
         ip_distribution = tuple(f"{name}: {count} 台" for name, count in ip_counter.most_common())
         stats_line = f"总数={total} 成功={success} 失败={len(failures)}"
         report_lines = [
@@ -1597,14 +1890,24 @@ class BatchExecutionService:
         ]
         if result_path:
             report_lines.append(f"- 结果文件：{result_path}")
+        if normalized_rows:
+            report_lines.extend(["", "### 📋 Pod出口IP明细", "| Pod ID | 出口IP | 运营商 | 地域 |", "|---|---|---|---|"])
+            for row in normalized_rows:
+                report_lines.append(
+                    "| "
+                    f"{self._escape_markdown_table_cell(row['pod'])} | "
+                    f"{self._escape_markdown_table_cell(row['ip'])} | "
+                    f"{self._escape_markdown_table_cell(row['operator'])} | "
+                    f"{self._escape_markdown_table_cell(row['region'])} |"
+                )
         if operator_distribution:
             report_lines.extend(["", "### 📡 运营商分布", "| 运营商 | 数量 | 占比 |", "|---|---:|---:|"])
-            for name, count in operator_counter.most_common():
+            for name, count in operator_display:
                 pct = (count / total * 100) if total else 0.0
                 report_lines.append(f"| {name} | {count} 台 | {pct:.1f}% |")
         if region_distribution:
             report_lines.extend(["", "### 🗺️ 地域分布", "| 地域 | 数量 | 占比 |", "|---|---:|---:|"])
-            for name, count in region_counter.most_common():
+            for name, count in region_display:
                 pct = (count / total * 100) if total else 0.0
                 report_lines.append(f"| {name} | {count} 台 | {pct:.1f}% |")
         if ip_distribution:
@@ -1618,8 +1921,94 @@ class BatchExecutionService:
             "operator_distribution": operator_distribution,
             "region_distribution": region_distribution,
             "ip_distribution": ip_distribution,
+            "item_results": tuple(
+                f"{row['pod']}: {row['ip']} | {row['operator']} | {row['region']}"
+                for row in normalized_rows
+            ),
             "structured_report": "\n".join(report_lines),
         }
+
+    def _merge_distribution_display_names(
+        self,
+        counter: Counter[str],
+        hints: Sequence[str],
+    ) -> list[tuple[str, int]]:
+        """Prefer script-provided aggregate labels when counts match row data.
+
+        Some terminal detail rows intentionally print shortened labels such as
+        ``AS9808 China Mobile`` while the completion distribution contains the
+        authoritative full ASN/org string.  Keep item rows faithful to observed
+        detail lines, but use the aggregate display name for distribution rows
+        when the count lines up with the deduped row counter.
+        """
+        if not counter:
+            return []
+        hint_by_key: dict[tuple[str, int], str] = {}
+        used_hint_names: set[str] = set()
+        for hint in hints:
+            parsed = self._parse_distribution_count(str(hint or ""))
+            if not parsed:
+                continue
+            hint_name, hint_count = parsed
+            normalized_hint = self._normalize_distribution_name(hint_name)
+            for row_name, row_count in counter.items():
+                if row_count != hint_count:
+                    continue
+                if self._distribution_names_match(row_name, hint_name):
+                    key = (row_name, row_count)
+                    if key not in hint_by_key:
+                        hint_by_key[key] = hint_name
+                        used_hint_names.add(hint_name)
+                    break
+            if hint_count and normalized_hint in {self._normalize_distribution_name(name) for name in counter}:
+                used_hint_names.add(hint_name)
+
+        rows: list[tuple[str, int]] = []
+        for row_name, count in counter.most_common():
+            rows.append((hint_by_key.get((row_name, count), row_name), count))
+
+        observed_keys = {self._normalize_distribution_name(name) for name in counter}
+        for hint in hints:
+            parsed = self._parse_distribution_count(str(hint or ""))
+            if not parsed:
+                continue
+            hint_name, hint_count = parsed
+            if hint_name in used_hint_names:
+                continue
+            if self._normalize_distribution_name(hint_name) in observed_keys:
+                continue
+            rows.append((hint_name, hint_count))
+        return rows
+
+    def _parse_distribution_count(self, line: str) -> tuple[str, int] | None:
+        text = str(line or "").strip().lstrip("-•* ").strip()
+        if not text:
+            return None
+        match = re.match(r"(?P<name>.+?)\s*[:：]\s*(?P<count>\d+)\s*(?:台|个|条|pods?|items?)?\b", text, re.IGNORECASE)
+        if not match:
+            match = re.match(r"(?P<name>.+?)\s+(?P<count>\d+)\s*(?:台|个|条|pods?|items?)\b", text, re.IGNORECASE)
+        if not match:
+            return None
+        name = match.group("name").strip()
+        if not name:
+            return None
+        return name, int(match.group("count"))
+
+    def _distribution_names_match(self, row_name: str, hint_name: str) -> bool:
+        row = self._normalize_distribution_name(row_name)
+        hint = self._normalize_distribution_name(hint_name)
+        if not row or not hint:
+            return False
+        if row == hint:
+            return True
+        return row in hint or hint in row
+
+    def _normalize_distribution_name(self, value: str) -> str:
+        normalized = str(value or "").lower()
+        normalized = normalized.replace("co., ltd.", "co ltd")
+        normalized = normalized.replace("co. ltd.", "co ltd")
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+        return re.sub(r"\s+", " ", normalized).strip()
 
     def _mapping_looks_like_egress(self, mapping: dict[str, Any]) -> bool:
         for value in mapping.values():
@@ -1668,6 +2057,18 @@ class BatchExecutionService:
             or self._first_pattern_line(content, self.STATS_PATTERNS)
             or self._multiline_stats_summary(content)
         )
+
+    def _terminal_rows_cover_completion_summary(self, content: str, *, row_count: int) -> bool:
+        if row_count <= 0 or not self._text_has_completion_evidence(content):
+            return False
+        summary = self._first_pattern_line(content, self.STATS_PATTERNS) or self._multiline_stats_summary(content)
+        if not summary:
+            return True
+        success = self._first_int_after(summary, ("成功", "success"))
+        failed = self._first_int_after(summary, ("失败", "failed", "fail"))
+        total = self._first_int_after(summary, ("总数", "总查询量", "总处理量", "total"))
+        expected = total or (success + failed)
+        return expected <= 0 or row_count >= expected
 
     def _is_batch_context(self, *, latest_task: str, command_text: str, joined: str) -> bool:
         task_text = latest_task or ""
@@ -1759,6 +2160,37 @@ class BatchExecutionService:
 
     def _last_result_path(self, content: str, *, log_path: str = "") -> str:
         return self.durable.last_result_path(content, log_path=log_path)
+
+    def _resolve_relative_result_path_from_context(self, result_path: str, content: str) -> str:
+        """Resolve relative result artifacts against observed runtime paths.
+
+        Batch scripts often print ``CSV: pod_x_results.csv`` after running from
+        ``/Users/.../.pyclaw`` without also printing a log path.  Returning that
+        bare filename is weak evidence for the user and prevents follow-up
+        reads.  Infer the working directory from the observed command when it is
+        an explicit runtime scratch scope; otherwise keep the original string.
+        """
+        path = str(result_path or "").strip()
+        if not path or path.startswith(("/", "~")):
+            return path
+        if ".." in path.split("/"):
+            return path
+        base_dir = self._runtime_workdir_from_command(content)
+        if not base_dir:
+            return path
+        return os.path.join(base_dir, path)
+
+    def _runtime_workdir_from_command(self, content: str) -> str:
+        command = self.extract_terminal_command(content)
+        if not command:
+            return ""
+        match = re.search(r"(?:^|[;&|]\s*)cd\s+(?P<path>~|/[^\s;&|`'\"]+|\$HOME/[^\s;&|`'\"]+|\$\{HOME\}/[^\s;&|`'\"]+)", command)
+        if not match:
+            return ""
+        raw_path = match.group("path").strip()
+        if not has_explicit_runtime_scratch_scope(raw_path):
+            return ""
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
 
     def _last_relative_result_path(self, content: str) -> str:
         pattern = re.compile(r"(?P<path>(?!/|~)[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:csv|json|xlsx|xls|txt))", re.IGNORECASE)
