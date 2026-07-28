@@ -80,14 +80,24 @@ class ReadFileTool(BaseTool):
             return ToolResult(
                 success=True,
                 content=f"File: {path}{line_prefix}\n\n{content}",
+                structured={
+                    "operation": "read_file",
+                    "path": safe_path,
+                    "requested_path": path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "total_lines": total_lines,
+                    "max_chars": max_chars,
+                    "truncated": truncated,
+                },
             )
 
         except PermissionError as e:
-            return ToolResult(success=False, content=str(e))
+            return ToolResult(success=False, content=str(e), error_code="sandbox_denied", requires_model_repair=True)
         except FileNotFoundError:
-            return ToolResult(success=False, content=f"File not found: {path}")
+            return ToolResult(success=False, content=f"File not found: {path}", error_code="file_not_found", requires_model_repair=True)
         except Exception as e:
-            return ToolResult(success=False, content=f"Error reading file: {str(e)}")
+            return ToolResult(success=False, content=f"Error reading file: {str(e)}", error_code="file_read_error", requires_model_repair=True)
 
 
 class WriteFileArgs(BaseModel):
@@ -116,12 +126,21 @@ class WriteFileTool(BaseTool):
             with open(safe_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            return ToolResult(success=True, content=f"File written: {path}")
+            return ToolResult(
+                success=True,
+                content=f"File written: {path}",
+                structured={
+                    "operation": "write_file",
+                    "path": safe_path,
+                    "requested_path": path,
+                    "chars_written": len(content),
+                },
+            )
 
         except PermissionError as e:
-            return ToolResult(success=False, content=str(e))
+            return ToolResult(success=False, content=str(e), error_code="sandbox_denied", requires_model_repair=True)
         except Exception as e:
-            return ToolResult(success=False, content=f"Error writing file: {str(e)}")
+            return ToolResult(success=False, content=f"Error writing file: {str(e)}", error_code="file_write_error", requires_model_repair=True)
 
 
 class CopyFileArgs(BaseModel):
@@ -150,25 +169,35 @@ class CopyFileTool(BaseTool):
             safe_target = self.validate_path(target)
 
             if not os.path.exists(safe_source):
-                return ToolResult(success=False, content=f"Source file not found: {source}")
+                return ToolResult(success=False, content=f"Source file not found: {source}", error_code="file_not_found", requires_model_repair=True)
             if not os.path.isfile(safe_source):
-                return ToolResult(success=False, content=f"Source is not a file: {source}")
+                return ToolResult(success=False, content=f"Source is not a file: {source}", error_code="not_a_file", requires_model_repair=True)
             if os.path.isdir(safe_target):
-                return ToolResult(success=False, content=f"Target is a directory: {target}")
+                return ToolResult(success=False, content=f"Target is a directory: {target}", error_code="target_is_directory", requires_model_repair=True)
             if os.path.exists(safe_target) and not overwrite:
-                return ToolResult(success=False, content=f"Target already exists: {target}")
+                return ToolResult(success=False, content=f"Target already exists: {target}", error_code="target_exists", requires_model_repair=True)
 
             dirname = os.path.dirname(safe_target)
             if dirname and not os.path.exists(dirname):
                 os.makedirs(dirname, exist_ok=True)
 
             shutil.copyfile(safe_source, safe_target)
-            return ToolResult(success=True, content=f"File copied: {source} -> {target}")
+            return ToolResult(
+                success=True,
+                content=f"File copied: {source} -> {target}",
+                structured={
+                    "operation": "copy_file",
+                    "source_path": safe_source,
+                    "target_path": safe_target,
+                    "requested_source": source,
+                    "requested_target": target,
+                },
+            )
 
         except PermissionError as e:
-            return ToolResult(success=False, content=str(e))
+            return ToolResult(success=False, content=str(e), error_code="sandbox_denied", requires_model_repair=True)
         except Exception as e:
-            return ToolResult(success=False, content=f"Error copying file: {str(e)}")
+            return ToolResult(success=False, content=f"Error copying file: {str(e)}", error_code="file_copy_error", requires_model_repair=True)
 
 
 class EditFileArgs(BaseModel):
@@ -200,7 +229,12 @@ class EditFileTool(BaseTool):
         expected_replacements = int(kwargs.get("expected_replacements", 1))
 
         if not old:
-            return ToolResult(success=False, content="Error editing file: 'old' must not be empty")
+            return ToolResult(
+                success=False,
+                content="Error editing file: 'old' must not be empty",
+                error_code="invalid_arguments",
+                requires_model_repair=True,
+            )
 
         try:
             safe_path = self.validate_path(path)
@@ -217,6 +251,15 @@ class EditFileTool(BaseTool):
                         "No changes were made. Provide a more specific 'old' snippet or "
                         "adjust expected_replacements."
                     ),
+                    structured={
+                        "operation": "edit_file",
+                        "path": safe_path,
+                        "requested_path": path,
+                        "expected_replacements": expected_replacements,
+                        "actual_replacements": actual_replacements,
+                    },
+                    error_code="ambiguous_edit",
+                    requires_model_repair=True,
                 )
 
             edited = original.replace(old, new, expected_replacements)
@@ -237,14 +280,22 @@ class EditFileTool(BaseTool):
             return ToolResult(
                 success=True,
                 content=f"File edited: {path}\nReplacements: {actual_replacements}\n\n{diff}",
+                structured={
+                    "operation": "edit_file",
+                    "path": safe_path,
+                    "requested_path": path,
+                    "expected_replacements": expected_replacements,
+                    "actual_replacements": actual_replacements,
+                    "diff_truncated": len(diff) > 8000,
+                },
             )
 
         except PermissionError as e:
-            return ToolResult(success=False, content=str(e))
+            return ToolResult(success=False, content=str(e), error_code="sandbox_denied", requires_model_repair=True)
         except FileNotFoundError:
-            return ToolResult(success=False, content=f"File not found: {path}")
+            return ToolResult(success=False, content=f"File not found: {path}", error_code="file_not_found", requires_model_repair=True)
         except Exception as e:
-            return ToolResult(success=False, content=f"Error editing file: {str(e)}")
+            return ToolResult(success=False, content=f"Error editing file: {str(e)}", error_code="file_edit_error", requires_model_repair=True)
 
 
 class SendFileArgs(BaseModel):
@@ -267,15 +318,13 @@ class SendFileTool(BaseTool):
 
     async def execute(self, **kwargs: str) -> ToolResult:
         try:
-            import os
             file_path = kwargs.get("file_path", "")
             description = kwargs.get("description", "Here is the file you requested.")
 
-            # 1. 校验文件是否存在
-            full_path = os.path.abspath(file_path)
+            full_path = self.validate_path(file_path)
             if not os.path.exists(full_path):
                 # 尝试相对于工作目录
-                full_path = os.path.abspath(os.path.join(self.agent.work_dir, file_path))
+                full_path = self.validate_path(os.path.join(self.agent.work_dir, file_path))
                 if not os.path.exists(full_path):
                     return ToolResult(success=False, content=f"Error: File not found at {file_path}")
 
@@ -290,11 +339,25 @@ class SendFileTool(BaseTool):
                     "is_file_transfer": True,
                     "file_path": full_path,
                     "description": description
-                }
+                },
+                structured={
+                    "file_path": full_path,
+                    "description": description,
+                    "basename": os.path.basename(full_path),
+                },
             )
 
+        except PermissionError as e:
+            return ToolResult(
+                success=False,
+                content=str(e),
+                error_code="sandbox_denied",
+                requires_model_repair=True,
+            )
         except Exception as e:
             return ToolResult(
                 success=False,
                 content=f"Error preparing file: {str(e)}",
+                error_code="file_delivery_error",
+                requires_model_repair=True,
             )

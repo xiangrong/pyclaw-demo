@@ -1171,6 +1171,12 @@ class Agent:
                         metadata={
                             "tool_name": tr["name"],
                             "tool_call_id": tr["tool_call_id"],
+                            "tool_result_success": bool(tr.get("success")),
+                            "tool_result_error_code": str(tr.get("error_code", "") or ""),
+                            "tool_result_retryable": bool(tr.get("retryable")),
+                            "tool_result_requires_model_repair": bool(tr.get("requires_model_repair")),
+                            "tool_result_metadata": tr.get("metadata", {}) or {},
+                            "tool_result_structured": tr.get("structured", {}) or {},
                         },
                     )
                     await self.sessions.save_message(session, tool_msg)
@@ -2320,19 +2326,22 @@ class Agent:
             name = str(tr.get("name", ""))
             content = str(tr.get("content", ""))
             success = bool(tr.get("success"))
+            structured = tr.get("structured", {})
+            if not isinstance(structured, dict):
+                structured = {}
 
             if success and name in {"edit_file", "write_file"}:
-                file_path = self._extract_changed_file_path(content)
+                file_path = str(structured.get("path") or "") or self._extract_changed_file_path(content)
                 if file_path and self._should_track_coding_changed_file(file_path):
                     changed_files.add(file_path)
 
             if success and name == "copy_file":
-                file_path = self._extract_changed_file_path(content)
+                file_path = str(structured.get("target_path") or "") or self._extract_changed_file_path(content)
                 if file_path and self._should_track_coding_changed_file(file_path):
                     changed_files.add(file_path)
 
             if name == "terminal":
-                command = self._extract_terminal_command_from_observation(content)
+                command = str(structured.get("command") or "") or self._extract_terminal_command_from_observation(content)
                 if self._looks_like_validation_command(command or content) or self._terminal_command_executes_changed_file(
                     command or content,
                     changed_files,
@@ -2568,7 +2577,7 @@ class Agent:
                 "authorized this exact action, retry once with approved=True; otherwise ask for approval. Do not repeat "
                 "near-identical terminal commands. Do not mention this notice to the user."
             )
-        if tool_name in {"write_file", "edit_file", "copy_file", "read_file"} and self._is_file_sandbox_error(tool_content):
+        if tool_name in {"write_file", "edit_file", "copy_file", "read_file", "send_file_to_user"} and self._is_file_sandbox_error(tool_content):
             return (
                 "File tool access was denied by the workspace sandbox. Do not retry ~/Desktop, ~/gen_*.py, "
                 "or /Users/<user>/... paths. For generated deliverables and helper scripts, use a path under "

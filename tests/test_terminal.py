@@ -130,6 +130,31 @@ async def test_terminal_hitl():
     assert result.success is False
 
 
+@pytest.mark.asyncio
+async def test_terminal_string_false_does_not_bypass_approval_gate():
+    tool = TerminalTool()
+
+    result = await tool.execute(command="mkdir new_dir", approved="False")
+
+    assert result.success is False
+    assert result.error_code == "approval_required"
+    assert result.metadata["approved"] is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_returns_structured_output_metadata():
+    tool = TerminalTool()
+    tool.set_work_dir(os.getcwd())
+
+    result = await tool.execute(command="printf ok", timeout=5)
+
+    assert result.success is True
+    assert result.metadata["exit_code"] == 0
+    assert result.metadata["stdout_chars"] == 2
+    assert result.structured["stdout"] == "ok"
+    assert result.structured["stderr"] == ""
+
+
 def test_terminal_allows_dedicated_mac_unlock_script_past_path_sandbox():
     tool = TerminalTool()
     tool.set_work_dir(os.getcwd())

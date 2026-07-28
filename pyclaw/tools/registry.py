@@ -12,6 +12,7 @@ from typing import Any, Optional
 from pydantic import ValidationError
 
 from .base import BaseTool, ToolResult
+from .orchestrator import ToolCallOrchestrator
 
 
 class ToolRegistry:
@@ -29,6 +30,7 @@ class ToolRegistry:
         self._file_mtimes: dict[str, float] = {}
         self.work_dir = work_dir
         self.allowed_paths = allowed_paths or []
+        self.orchestrator = ToolCallOrchestrator()
 
     def register(self, tool: BaseTool, is_static: bool = True) -> None:
         """注册一个工具"""
@@ -120,6 +122,8 @@ class ToolRegistry:
             return ToolResult(
                 success=False,
                 content=f"Tool not found: {tool_name}",
+                error_code="tool_not_found",
+                requires_model_repair=True,
             )
 
         try:
@@ -128,14 +132,25 @@ class ToolRegistry:
             return ToolResult(
                 success=False,
                 content=f"Invalid arguments for tool '{tool_name}': {e}",
+                error_code="invalid_arguments",
+                requires_model_repair=True,
             )
 
         try:
             return await tool.execute(**validated_args.model_dump())
+        except asyncio.TimeoutError:
+            return ToolResult(
+                success=False,
+                content=f"Tool '{tool_name}' timed out while executing.",
+                error_code="timeout",
+                retryable=True,
+            )
         except Exception as e:
             return ToolResult(
                 success=False,
                 content=f"Tool '{tool_name}' raised an exception: {type(e).__name__}: {e}",
+                error_code="tool_exception",
+                requires_model_repair=True,
             )
 
     async def execute_tool_calls(self, message_data: str) -> list[dict[str, Any]]:
@@ -154,46 +169,62 @@ class ToolRegistry:
             try:
                 args = json.loads(tc.get("function", {}).get("arguments", "{}"))
             except json.JSONDecodeError:
-                results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "name": tool_name,
-                        "content": f"Invalid JSON arguments for tool '{tool_name}'.",
-                        "success": False,
-                        "metadata": {},
-                    }
+                result = self.orchestrator.decorate_non_executed_result(
+                    ToolResult(
+                        success=False,
+                        content=f"Invalid JSON arguments for tool '{tool_name}'.",
+                        error_code="invalid_json",
+                        requires_model_repair=True,
+                    )
                 )
+                results.append(self._tool_result_dict(call_id=call_id, tool_name=tool_name, result=result))
+                continue
+
+            if not isinstance(args, dict):
+                result = self.orchestrator.decorate_non_executed_result(
+                    ToolResult(
+                        success=False,
+                        content=f"Invalid arguments for tool '{tool_name}': expected a JSON object.",
+                        error_code="invalid_arguments",
+                        requires_model_repair=True,
+                    )
+                )
+                results.append(self._tool_result_dict(call_id=call_id, tool_name=tool_name, result=result))
                 continue
 
             if tool_name in {"web_read", "web_search", "web_extract"}:
                 if "timeout" not in args:
                     args["timeout"] = 10 if tool_name == "web_search" else 15
-                try:
-                    result = await asyncio.wait_for(
-                        self.execute(tool_name, **args),
-                        timeout=20,
-                    )
-                except asyncio.TimeoutError:
-                    result = ToolResult(
-                        success=False,
-                        content=f"Tool '{tool_name}' timed out while executing.",
-                    )
-            else:
-                result = await self.execute(tool_name, **args)
 
-            results.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": tool_name,
-                    "content": result.content,
-                    "success": result.success,
-                    "metadata": result.metadata,
-                }
+            async def executor(name: str, call_args: dict[str, object]) -> ToolResult:
+                if name in {"web_read", "web_search", "web_extract"}:
+                    return await asyncio.wait_for(self.execute(name, **call_args), timeout=20)
+                return await self.execute(name, **call_args)
+
+            execution = await self.orchestrator.execute(
+                tool_name=tool_name,
+                args=args,
+                executor=executor,
             )
+            result = execution.result
+
+            results.append(self._tool_result_dict(call_id=call_id, tool_name=tool_name, result=result))
 
         return results
+
+    def _tool_result_dict(self, *, call_id: str, tool_name: str, result: ToolResult) -> dict[str, Any]:
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": tool_name,
+            "content": result.content,
+            "success": result.success,
+            "metadata": result.metadata,
+            "structured": result.structured,
+            "error_code": result.error_code,
+            "retryable": result.retryable,
+            "requires_model_repair": result.requires_model_repair,
+        }
 
     def parse_assistant_message(
         self,

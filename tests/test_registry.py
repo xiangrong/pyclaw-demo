@@ -98,16 +98,14 @@ async def test_execute_tool_calls_reports_invalid_json_arguments():
         '{"tool_calls":[{"id":"call1","function":{"name":"required","arguments":"{"}}]}'
     )
 
-    assert results == [
-        {
-            "role": "tool",
-            "tool_call_id": "call1",
-            "name": "required",
-            "content": "Invalid JSON arguments for tool 'required'.",
-            "success": False,
-            "metadata": {},
-        }
-    ]
+    assert results[0]["role"] == "tool"
+    assert results[0]["tool_call_id"] == "call1"
+    assert results[0]["name"] == "required"
+    assert results[0]["content"] == "Invalid JSON arguments for tool 'required'."
+    assert results[0]["success"] is False
+    assert results[0]["error_code"] == "invalid_json"
+    assert results[0]["requires_model_repair"] is True
+    assert results[0]["metadata"]["requires_model_repair"] is True
 
 @pytest.mark.asyncio
 async def test_execute_tool_calls_applies_web_extract_default_timeout():

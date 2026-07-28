@@ -9,59 +9,38 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
+from pyclaw.core.durable_task import DurableTaskEngine, DurableTaskEvidence
 from pyclaw.core.message import Message, MessageRole
 
 
 @dataclass(frozen=True)
-class BatchEvidence:
-    """Controller-owned evidence extracted from tool observations."""
+class BatchEvidence(DurableTaskEvidence):
+    """Controller-owned evidence extracted from tool observations.
 
-    timed_out: bool = False
-    approval_blocked: bool = False
-    pid: str = ""
-    log_path: str = ""
-    result_path: str = ""
-    stats_line: str = ""
-    completion_line: str = ""
-    progress_line: str = ""
-    progress_current: int = 0
-    progress_total: int = 0
-    running_line: str = ""
-    error_line: str = ""
+    Generic durable-task fields (PID/log/result/progress/status) are parsed by
+    ``DurableTaskEngine``. BatchExecutionService only layers pod/batch-specific
+    distributions and structured reports on top.
+    """
+
     operator_distribution: tuple[str, ...] = ()
     region_distribution: tuple[str, ...] = ()
     ip_distribution: tuple[str, ...] = ()
     model_distribution: tuple[str, ...] = ()
     structured_report: str = ""
-    output_excerpt: str = ""
-
-    @property
-    def has_durable_start(self) -> bool:
-        return bool(self.pid or self.log_path)
 
     @property
     def has_result(self) -> bool:
-        return bool(self.stats_line or self.completion_line or self.structured_report)
+        return super().has_result or bool(self.structured_report)
 
     @property
     def is_complete(self) -> bool:
-        return bool(self.stats_line or self.completion_line or self.structured_report)
+        return super().is_complete or bool(self.structured_report)
 
     @property
     def is_in_progress(self) -> bool:
         if self.is_complete:
             return False
-        if self.running_line:
-            return True
-        if self.progress_total > 0 and self.progress_current < self.progress_total:
-            return True
-        return bool(self.progress_line and not self.error_line)
-
-    @property
-    def progress_label(self) -> str:
-        if self.progress_current and self.progress_total:
-            return f"{self.progress_current}/{self.progress_total}"
-        return ""
+        return super().is_in_progress
 
 
 class BatchExecutionService:
@@ -107,29 +86,11 @@ class BatchExecutionService:
     DESKTOP_ONE_SHOT_MARKERS: tuple[str, ...] = (
         "screencapture", "imagesnap", "ffmpeg", "pmset displaysleepnow", "display notification",
     )
-    STATS_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"\b(?:total|success|succeeded)\b[^\n]{0,180}\b(?:success|succeeded|failed|fail|errors?|total)\b[^\n]{0,80}", re.IGNORECASE),
-        re.compile(r"\b(?:failed|fail|errors?)\b[^\n]{0,120}\b(?:success|succeeded|total)\b[^\n]{0,80}", re.IGNORECASE),
-        re.compile(r"(?:总数|成功)[^\n]{0,180}(?:成功|失败|错误|异常|完成)[^\n]{0,80}"),
-        re.compile(r"(?:失败|错误|异常)[^\n]{0,120}(?:总数|成功)[^\n]{0,80}"),
-    )
-    COMPLETION_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"\b(?:all\s+)?(?:done|completed|finished|succeeded|successfully|configured|updated|created|deleted)\b[^\n]{0,180}", re.IGNORECASE),
-        re.compile(r"(?:已完成|执行完成|更新完成|更新成功|已更新成功|处理完成|全部完成|成功完成|查询完成|汇总完成)[^\n]{0,180}"),
-    )
-    PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"(?:^|\[)\s*(?P<current>\d+)\s*/\s*(?P<total>\d+)\]?[^\n]{0,180}(?:查询|处理|执行|更新|正在|running|processing|✓|failed|失败|成功|:)" , re.IGNORECASE),
-        re.compile(r"(?:进度|progress)\s*[:：]?\s*(?P<current>\d+)\s*/\s*(?P<total>\d+)[^\n]{0,180}", re.IGNORECASE),
-    )
-    RUNNING_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"\b(?:running|in\s+progress)\b[^\n]{0,180}", re.IGNORECASE),
-        re.compile(r"(?:仍在执行|正在执行|运行中|仍在运行|后台执行中)[^\n]{0,180}"),
-        re.compile(r"\b(?:python(?:3)?|bash|sh)\b[^\n]*(?:batch|bulk|query|egress|pod|pods)[^\n]*(?:\.py|\.sh|\.txt)?", re.IGNORECASE),
-    )
-    ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"\b(?:error|failed|traceback|exception|permission denied|not found|timed out)\b[^\n]{0,180}", re.IGNORECASE),
-        re.compile(r"(?:错误|失败|异常|拒绝|不存在|超时|未找到)[^\n]{0,180}"),
-    )
+    STATS_PATTERNS = DurableTaskEngine.STATS_PATTERNS
+    COMPLETION_PATTERNS = DurableTaskEngine.COMPLETION_PATTERNS
+
+    def __init__(self, durable_engine: DurableTaskEngine | None = None) -> None:
+        self.durable = durable_engine or DurableTaskEngine()
 
     def is_operational_task(self, text: str) -> bool:
         """Return True for infrastructure/CLI work that is not source-code work."""
@@ -463,25 +424,34 @@ class BatchExecutionService:
         return 8
 
     def evidence_from_terminal_messages(self, terminal_messages: Iterable[Message]) -> BatchEvidence:
-        joined = "\n".join(str(getattr(msg, "content", "") or "") for msg in list(terminal_messages)[-8:])
-        return self.evidence_from_text(joined)
+        return self.evidence_from_messages(list(terminal_messages)[-8:])
 
     def evidence_from_messages(self, messages: Iterable[Message]) -> BatchEvidence:
-        joined = "\n".join(str(getattr(msg, "content", "") or "") for msg in list(messages)[-12:])
-        return self.evidence_from_text(joined)
+        message_list = list(messages)[-12:]
+        chunks: list[str] = []
+        for msg in message_list:
+            chunks.append(str(getattr(msg, "content", "") or ""))
+            metadata = getattr(msg, "metadata", {}) or {}
+            structured = metadata.get("tool_result_structured") if isinstance(metadata, dict) else None
+            if not isinstance(structured, dict):
+                continue
+            command = str(structured.get("command") or "")
+            stdout = str(structured.get("stdout") or "")
+            stderr = str(structured.get("stderr") or "")
+            if command:
+                chunks.append(f"Command: {command}")
+            if stdout:
+                chunks.append(stdout)
+            if stderr:
+                chunks.append(stderr)
+        return self.evidence_from_text("\n".join(chunks))
 
     def evidence_from_text(self, text: str) -> BatchEvidence:
         content = text or ""
-        pid = self._last_match(content, r"\b(?:PID|pid|进程)\b[:：=]?\s*(\d+)")
-        log_path = self._last_path(content, ("log",))
-        result_path = self._last_result_path(content, log_path=log_path)
-        stats_line = self._first_pattern_line(content, self.STATS_PATTERNS) or self._multiline_stats_summary(content)
-        completion_line = self._first_pattern_line(content, self.COMPLETION_PATTERNS)
-        progress_line, progress_current, progress_total = self._last_progress(content)
-        running_line = self._first_pattern_line(content, self.RUNNING_PATTERNS)
-        error_line = self._first_pattern_line(content, self.ERROR_PATTERNS)
-        if error_line and self._line_is_non_terminal_timeout(error_line):
-            error_line = ""
+        durable = self.durable.evidence_from_text(content)
+        result_path = durable.result_path
+        stats_line = durable.stats_line
+        completion_line = durable.completion_line
         operator_distribution = self._distribution_section(
             content,
             (
@@ -528,26 +498,25 @@ class BatchExecutionService:
             model_distribution = model_distribution or tuple(structured.get("model_distribution") or ())
         ip_distribution = tuple(structured.get("ip_distribution") or ()) if structured else ()
         structured_report = str(structured.get("structured_report") or "") if structured else ""
-        excerpt = self._output_excerpt(content)
         return BatchEvidence(
-            timed_out="Command timed out after" in content,
-            approval_blocked="检测到有副作用的指令" in content and "approved=True" in content,
-            pid=pid,
-            log_path=log_path,
+            timed_out=durable.timed_out,
+            approval_blocked=durable.approval_blocked,
+            pid=durable.pid,
+            log_path=durable.log_path,
             result_path=result_path,
             stats_line=stats_line,
             completion_line=completion_line,
-            progress_line=progress_line,
-            progress_current=progress_current,
-            progress_total=progress_total,
-            running_line=running_line,
-            error_line=error_line,
+            progress_line=durable.progress_line,
+            progress_current=durable.progress_current,
+            progress_total=durable.progress_total,
+            running_line=durable.running_line,
+            error_line=durable.error_line,
             operator_distribution=operator_distribution,
             region_distribution=region_distribution,
             ip_distribution=ip_distribution,
             model_distribution=model_distribution,
             structured_report=structured_report,
-            output_excerpt=excerpt,
+            output_excerpt=durable.output_excerpt,
         )
 
     def final_from_observations(self, *, latest_task: str, terminal_messages: Iterable[Message]) -> str:
@@ -563,7 +532,7 @@ class BatchExecutionService:
         if not self._is_batch_context(latest_task=latest_task, command_text=command_text, joined=joined):
             return ""
 
-        evidence = self.evidence_from_text(joined)
+        evidence = self.evidence_from_messages(evidence_messages)
         if evidence.structured_report:
             return evidence.structured_report
         if evidence.stats_line:
@@ -969,31 +938,7 @@ class BatchExecutionService:
         return matches[-1] if matches else ""
 
     def _last_result_path(self, content: str, *, log_path: str = "") -> str:
-        """Return an output/result file path, avoiding input list .txt files."""
-        result_lines: list[str] = []
-        for raw in (content or "").splitlines():
-            line = raw.strip()
-            lowered = line.lower()
-            if any(marker in lowered for marker in ("result", "output", "summary", "csv")) or any(
-                marker in line for marker in ("结果", "输出", "汇总")
-            ):
-                result_lines.append(line)
-        scoped = "\n".join(result_lines)
-        explicit_path = self._last_path(scoped, ("csv", "json", "xlsx", "xls", "txt")) or self._last_path(content, ("csv", "json", "xlsx", "xls"))
-        if explicit_path:
-            return explicit_path
-
-        # Many long-running scripts print result filenames relative to the log
-        # directory, for example ``CSV: pod_egress_61_wss_results.csv``.  Keep
-        # this extraction scoped to result/output lines so input lists such as
-        # ``pod_egress_61.txt`` are not reported as deliverables.
-        relative_path = self._last_relative_result_path(scoped)
-        if not relative_path:
-            return ""
-        if not log_path:
-            return relative_path
-        log_dir = os.path.dirname(os.path.abspath(os.path.expandvars(os.path.expanduser(log_path))))
-        return os.path.join(log_dir, relative_path)
+        return self.durable.last_result_path(content, log_path=log_path)
 
     def _last_relative_result_path(self, content: str) -> str:
         pattern = re.compile(r"(?P<path>(?!/|~)[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:csv|json|xlsx|xls|txt))", re.IGNORECASE)
@@ -1005,39 +950,7 @@ class BatchExecutionService:
         return matches[-1] if matches else ""
 
     def _multiline_stats_summary(self, content: str) -> str:
-        """Extract success/failure counts when tools print a small table.
-
-        Batch scripts often finish with separate lines like ``总数: 62``,
-        ``成功: 58`` and ``失败: 4``.  Treat that as completion evidence, while
-        avoiding progress-only lines such as ``[3/62] 查询 ...``.
-        """
-        total = self._last_labeled_count(
-            content,
-            (
-                r"(?:总数|总计|总查询量|总量|total)\s*[|:：=]?\s*(\d+)",
-                r"(?:查询|处理|更新)\s*完成[，,:：\s]*(?:共|总计)?\s*(\d+)",
-            ),
-        )
-        success = self._last_labeled_count(
-            content,
-            (
-                r"(?:成功|查询成功|处理成功|更新成功|success|succeeded)\s*[|:：=]?\s*(\d+)",
-            ),
-        )
-        failed = self._last_labeled_count(
-            content,
-            (
-                r"(?:失败|查询失败|处理失败|更新失败|错误|异常|failed|failures?|errors?)\s*[|:：=]?\s*(\d+)",
-            ),
-        )
-        if total and (success or failed):
-            parts = [f"总数={total}"]
-            if success:
-                parts.append(f"成功={success}")
-            if failed:
-                parts.append(f"失败={failed}")
-            return " ".join(parts)
-        return ""
+        return self.durable.multiline_stats_summary(content)
 
     def _last_labeled_count(self, content: str, patterns: Sequence[str]) -> str:
         matches: list[str] = []

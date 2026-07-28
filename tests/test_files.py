@@ -4,6 +4,72 @@ import pytest
 
 from pyclaw.tools.code_search import FindRefsTool, GotoDefTool, GrepCodeTool, ListSymbolsTool, ReadLinesTool
 from pyclaw.tools.files import CopyFileTool, EditFileTool
+from pyclaw.tools.base import BaseTool
+from pydantic import BaseModel
+
+
+class EmptyArgs(BaseModel):
+    pass
+
+
+class PathValidationTool(BaseTool):
+    name = "path_validation"
+    description = "path validation test helper"
+    args_schema = EmptyArgs
+
+    async def execute(self, **kwargs: str):
+        raise NotImplementedError
+
+
+def test_validate_path_rejects_sibling_prefix_confusion(tmp_path: Path):
+    work_dir = tmp_path / "work"
+    sibling = tmp_path / "work2"
+    work_dir.mkdir()
+    sibling.mkdir()
+    target = sibling / "secret.txt"
+    target.write_text("secret", encoding="utf-8")
+
+    tool = PathValidationTool()
+    tool.set_work_dir(str(work_dir))
+
+    with pytest.raises(PermissionError):
+        tool.validate_path(str(target))
+
+
+def test_validate_path_rejects_symlink_escape(tmp_path: Path):
+    work_dir = tmp_path / "work"
+    outside = tmp_path / "outside"
+    work_dir.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    link = work_dir / "link.txt"
+    link.symlink_to(secret)
+
+    tool = PathValidationTool()
+    tool.set_work_dir(str(work_dir))
+
+    with pytest.raises(PermissionError):
+        tool.validate_path(str(link))
+
+
+def test_validate_path_resolves_relative_paths_against_work_dir(tmp_path: Path):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    target = work_dir / "nested" / "file.txt"
+
+    tool = PathValidationTool()
+    tool.set_work_dir(str(work_dir))
+
+    assert tool.validate_path("nested/file.txt") == str(target.resolve())
+
+
+def test_validate_path_rejects_empty_path(tmp_path: Path):
+    tool = PathValidationTool()
+    tool.set_work_dir(str(tmp_path))
+
+    with pytest.raises(PermissionError):
+        tool.validate_path("")
 
 
 @pytest.mark.asyncio
@@ -22,6 +88,8 @@ async def test_edit_file_replaces_exact_snippet(tmp_path: Path):
 
     assert result.success is True
     assert target.read_text(encoding="utf-8") == "print('new')\n"
+    assert result.structured["operation"] == "edit_file"
+    assert result.structured["path"] == str(target.resolve())
     assert "File edited" in result.content
     assert "print('old')" in result.content
     assert "print('new')" in result.content
@@ -44,6 +112,9 @@ async def test_edit_file_rejects_ambiguous_replacement(tmp_path: Path):
     )
 
     assert result.success is False
+    assert result.error_code == "ambiguous_edit"
+    assert result.requires_model_repair is True
+    assert result.structured["actual_replacements"] == 2
     assert "expected 1 replacement(s), found 2" in result.content
     assert target.read_text(encoding="utf-8") == original
 
@@ -61,6 +132,8 @@ async def test_copy_file_validates_paths_and_copies(tmp_path: Path):
 
     assert result.success is True
     assert target.read_text(encoding="utf-8") == "hello"
+    assert result.structured["operation"] == "copy_file"
+    assert result.structured["target_path"] == str(target.resolve())
     assert "File copied" in result.content
 
 
@@ -76,8 +149,54 @@ async def test_copy_file_rejects_outside_workspace(tmp_path: Path):
     result = await tool.execute(source=str(outside), target=str(target))
 
     assert result.success is False
+    assert result.error_code == "sandbox_denied"
     assert "Access denied" in result.content
     assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_file_tool_respects_workspace_sandbox(tmp_path: Path):
+    from pyclaw.tools.files import SendFileTool
+
+    class AgentStub:
+        work_dir = str(tmp_path / "work")
+
+    work_dir = tmp_path / "work"
+    sibling = tmp_path / "work2"
+    work_dir.mkdir()
+    sibling.mkdir()
+    secret = sibling / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+
+    tool = SendFileTool(AgentStub())
+    tool.set_work_dir(str(work_dir))
+
+    result = await tool.execute(file_path=str(secret))
+
+    assert result.success is False
+    assert result.error_code == "sandbox_denied"
+    assert result.requires_model_repair is True
+
+
+@pytest.mark.asyncio
+async def test_send_file_tool_returns_structured_delivery_metadata(tmp_path: Path):
+    from pyclaw.tools.files import SendFileTool
+
+    class AgentStub:
+        work_dir = str(tmp_path)
+
+    target = tmp_path / "report.txt"
+    target.write_text("ok", encoding="utf-8")
+
+    tool = SendFileTool(AgentStub())
+    tool.set_work_dir(str(tmp_path))
+
+    result = await tool.execute(file_path="report.txt", description="final report")
+
+    assert result.success is True
+    assert result.metadata["is_file_transfer"] is True
+    assert result.structured["file_path"] == str(target.resolve())
+    assert result.structured["description"] == "final report"
 
 @pytest.mark.asyncio
 async def test_read_file_supports_line_ranges_and_truncation_guidance(tmp_path: Path):
@@ -91,12 +210,16 @@ async def test_read_file_supports_line_ranges_and_truncation_guidance(tmp_path: 
 
     ranged = await tool.execute(path=str(target), start_line=3, end_line=5)
     assert ranged.success is True
+    assert ranged.structured["operation"] == "read_file"
+    assert ranged.structured["path"] == str(target.resolve())
+    assert ranged.structured["truncated"] is False
     assert "lines 3-5 of 20" in ranged.content
     assert "line 3" in ranged.content
     assert "line 6" not in ranged.content
 
     truncated = await tool.execute(path=str(target), max_chars=50)
     assert truncated.success is True
+    assert truncated.structured["truncated"] is True
     assert "content truncated" in truncated.content
     assert "start_line/end_line" in truncated.content
 

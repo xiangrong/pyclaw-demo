@@ -59,10 +59,32 @@ class TerminalTool(BaseTool):
         """分类指令风险等级：1(安全), 2(需确认), 3(高风险)"""
         return classify_terminal_command(command)
 
+    def _approved_flag(self, value: object) -> bool:
+        """Return True only for explicit true values.
+
+        Registry calls already pass a validated bool, but tests and dynamic
+        tools may call TerminalTool directly.  ``bool("False")`` is True, so
+        avoid accidentally bypassing approval gates for string values.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return False
+
     async def execute(self, **kwargs: str) -> ToolResult:
         command = kwargs.get("command", "")
         timeout = int(kwargs.get("timeout", "60"))
+        approved = self._approved_flag(kwargs.get("approved", False))
+        level = self._classify_command(command)
         is_allowed_desktop_control = self._is_allowed_mac_desktop_control_command(command)
+        base_metadata = {
+            "command": command,
+            "timeout": timeout,
+            "risk_level": level,
+            "approved": approved,
+        }
+        base_structured = dict(base_metadata)
 
         # 1. 增强型高风险指令拦截 (Command Firewall)
         # 只校验 shell 语义上会访问本机文件系统的路径参数。不要对整条
@@ -82,6 +104,10 @@ class TerminalTool(BaseTool):
                                 f"⚠️ 拦截到尝试跳出工作目录的操作: `{command}`。"
                                 f"路径: `{path_ref.path}`\n原因: {str(e)}"
                             ),
+                            metadata={**base_metadata, "path": path_ref.path, "resolved_path": path_ref.resolved_path},
+                            structured={**base_structured, "blocked_path": path_ref.path, "resolved_path": path_ref.resolved_path},
+                            error_code="sandbox_denied",
+                            requires_model_repair=True,
                         )
                     return ToolResult(
                         success=False,
@@ -89,12 +115,13 @@ class TerminalTool(BaseTool):
                             f"⚠️ 拦截到非法路径访问: `{path_ref.path}`。\n"
                             f"指令: `{command}`\n原因: {str(e)}"
                         ),
+                        metadata={**base_metadata, "path": path_ref.path, "resolved_path": path_ref.resolved_path},
+                        structured={**base_structured, "blocked_path": path_ref.path, "resolved_path": path_ref.resolved_path},
+                        error_code="sandbox_denied",
+                        requires_model_repair=True,
                     )
 
         # 2. 风险等级分类处理
-        level = self._classify_command(command)
-        approved = kwargs.get("approved", False)
-        
         if level == 3 and not approved:
             return ToolResult(
                 success=False,
@@ -102,7 +129,11 @@ class TerminalTool(BaseTool):
                     f"🛑 拦截到高风险指令: `{command}`\n"
                     "该指令具有破坏性，默认拒绝执行。如果你确定要执行，请确保已经过用户明确授权，"
                     "并在工具调用中显式设置 `approved=True`。"
-                )
+                ),
+                metadata=base_metadata,
+                structured={**base_structured, "blocked": True, "reason": "high_risk_denied"},
+                error_code="high_risk_denied",
+                requires_model_repair=True,
             )
         
         if level == 2 and not approved and not is_allowed_desktop_control:
@@ -112,9 +143,14 @@ class TerminalTool(BaseTool):
                     f"⚠️ 检测到有副作用的指令: `{command}`\n"
                     "为了安全起见，请在对话中先询问用户是否允许执行该操作，"
                     "并在用户同意后，在工具调用中添加 `approved=True` 参数。"
-                )
+                ),
+                metadata=base_metadata,
+                structured={**base_structured, "blocked": True, "reason": "approval_required"},
+                error_code="approval_required",
+                requires_model_repair=True,
             )
 
+        proc: asyncio.subprocess.Process | None = None
         try:
             cwd = self.work_dir if self.work_dir and os.path.exists(self.work_dir) else None
             
@@ -140,17 +176,59 @@ class TerminalTool(BaseTool):
             if stderr:
                 output += f"\nSTDERR:\n{stderr}\n"
 
-            return ToolResult(success=exit_code == 0, content=self._truncate_output(output))
+            content = self._truncate_output(output)
+            return ToolResult(
+                success=exit_code == 0,
+                content=content,
+                metadata={
+                    **base_metadata,
+                    "cwd": cwd or "",
+                    "exit_code": exit_code,
+                    "stdout_chars": len(stdout),
+                    "stderr_chars": len(stderr),
+                    "output_truncated": content != output,
+                },
+                structured={
+                    **base_structured,
+                    "cwd": cwd or "",
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "output_truncated": content != output,
+                },
+                error_code="" if exit_code == 0 else "nonzero_exit",
+                retryable=exit_code != 0 and level == 1,
+                requires_model_repair=exit_code != 0 and level != 1,
+            )
 
         except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
             return ToolResult(
                 success=False,
                 content=f"Command: {command}\nCommand timed out after {timeout} seconds",
+                metadata=base_metadata,
+                structured={**base_structured, "timeout": timeout},
+                error_code="timeout",
+                retryable=level == 1,
+                requires_model_repair=level != 1,
             )
         except Exception as e:
             return ToolResult(
                 success=False,
                 content=f"Error executing command: {str(e)}",
+                metadata=base_metadata,
+                structured={**base_structured, "exception": type(e).__name__},
+                error_code="execution_error",
+                requires_model_repair=True,
             )
 
     def _truncate_output(self, output: str, max_chars: int = 8000) -> str:
