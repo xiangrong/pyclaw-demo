@@ -86,3 +86,34 @@ def test_durable_task_engine_keeps_explicit_process_running_evidence():
     assert evidence.running_line == "batch job still running pid=12345"
     assert evidence.is_in_progress is True
     assert evidence.status == "running"
+
+
+def test_durable_task_engine_ignores_observed_app_process_pid():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "07-28 17:58:51.539527   473   539 V ActivityManager: "
+        "byte_proc doSendBroadCast <com.run.tower.defense> created:true pid:4821; "
+        "uid:10083; packageName:com.run.tower.defense; "
+        "reason:mHostingType:pre-top-activity\n"
+        "07-28 17:58:51.540407   473   539 I ActivityManager: "
+        "Start proc 4821:com.run.tower.defense/u0a83 for pre-top-activity\n"
+    )
+
+    assert evidence.pid == ""
+    assert evidence.completion_line == ""
+    assert evidence.has_durable_start is False
+    assert evidence.status == "unknown"
+
+
+def test_durable_task_engine_ignores_runtime_executor_completed_tasks():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "07-28 23:18:31.941339 15821 15877 I Finsky  : "
+        "[32] Stats for Executor: bgExecutor vrr@a808303"
+        "[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 542]\n"
+    )
+
+    assert evidence.completion_line == ""
+    assert evidence.stats_line == ""
+    assert evidence.running_line == ""
+    assert evidence.status == "unknown"

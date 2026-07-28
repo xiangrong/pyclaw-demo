@@ -120,6 +120,162 @@ def test_single_operational_detail_query_does_not_request_progress_poll():
     )
 
 
+def test_single_pod_crash_diagnosis_reading_source_is_not_batch_progress():
+    service = BatchExecutionService()
+    latest_task = (
+        "pod: 7660844625406057267\n"
+        "包名：com.run.tower.defense\n"
+        "问题：云机应用闪退\n\n"
+        "你去给我分析下原因"
+    )
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/cloudphone_shell.py (136 lines)\n"
+            "\n"
+            "用法:\n"
+            "  python3 cloudphone_shell.py --egress      # 查询出口 IP\n"
+            "for item in data:\n"
+            "    pass\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    evidence = service.evidence_from_messages(messages)
+
+    assert service.is_operational_task(latest_task)
+    assert evidence.running_line == "python3 cloudphone_shell.py --egress      # 查询出口 IP"
+    assert service._durable_evidence_messages(messages, latest_task=latest_task) == []
+    assert final == ""
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task=latest_task,
+        prior_notice_count=0,
+    )
+
+
+def test_single_pod_crash_diagnosis_terminal_script_is_not_batch_context():
+    service = BatchExecutionService()
+    latest_task = (
+        "pod: 7660844625406057267\n"
+        "包名：com.run.tower.defense\n"
+        "问题：云机应用闪退\n\n"
+        "你去给我分析下原因"
+    )
+    messages = [
+        _terminal_message(
+            "<error_context>\n"
+            "OBSERVATION from terminal (FAILED):\n"
+            "Command: cd /Users/bytedance/.pyclaw && python3 app_crash_diagnose.py 2>&1\n"
+            "Exit code: 1\n"
+            "STDOUT:\n"
+            "Traceback (most recent call last):\n"
+            "  File \"/Users/bytedance/.pyclaw/app_crash_diagnose.py\", line 5, in <module>\n"
+            "    from cloudphone_shell import CloudPhoneShell\n"
+            "ImportError: cannot import name 'CloudPhoneShell' from 'cloudphone_shell'\n"
+            "</error_context>\n"
+        ),
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/cloudphone_shell.py (136 lines)\n\n"
+            "for item in data:\n"
+            "  print(item)\n"
+            "python3 cloudphone_shell.py --egress\n"
+        ),
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert final == ""
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task=latest_task,
+        prior_notice_count=0,
+    )
+
+
+def test_single_pod_crash_diagnosis_logcat_pid_is_not_durable_start():
+    service = BatchExecutionService()
+    latest_task = (
+        "给我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+        "pod: 7660844625406057267\n"
+        "包名：com.run.tower.defense\n"
+        "问题：云机应用闪退"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='grep \"com.run.tower.defense\" /data/misc/logd/logcat | head -150' && python3 scripts/wss_run.py 2>&1\n"
+            "Exit code: 0\n"
+            "\n"
+            "STDOUT:\n"
+            "=== CONNECTED ===\n"
+            "=== OUTPUT START ===\n"
+            "07-28 17:58:51.539527   473   539 V ActivityManager: "
+            "byte_proc doSendBroadCast <com.run.tower.defense> created:true pid:4821; "
+            "uid:10083; packageName:com.run.tower.defense; "
+            "reason:mHostingType:pre-top-activity\n"
+            "07-28 17:58:51.540407   473   539 I ActivityManager: "
+            "Start proc 4821:com.run.tower.defense/u0a83 for pre-top-activity\n"
+            "07-28 17:58:53.223051  1628  1734 I SignInPerformer-0: "
+            "Reporting resolvable error with suppressed resolution for [com.run.tower.defense]\n"
+            "__DONE__0\n"
+            "=== OUTPUT END ===\n"
+        )
+    ]
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert service.is_operational_task(latest_task)
+    assert service.infer_contract(latest_task) is None
+    assert evidence.pid == ""
+    assert evidence.completion_line == ""
+    assert evidence.has_durable_start is False
+    assert final == ""
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task=latest_task,
+        prior_notice_count=0,
+    )
+
+
+def test_single_pod_crash_diagnosis_runtime_executor_completed_tasks_not_batch_final():
+    service = BatchExecutionService()
+    latest_task = (
+        "给我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+        "pod: 7660844625406057267\n"
+        "包名：com.run.tower.defense\n"
+        "问题：云机应用闪退"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='tail -500 /data/misc/logd/logcat' && python3 scripts/wss_run.py 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "07-28 23:18:31.941339 15821 15877 I Finsky  : "
+            "[32] Stats for Executor: bgExecutor vrr@a808303"
+            "[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 542]\n"
+        )
+    ]
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert service.is_operational_task(latest_task)
+    assert service.infer_contract(latest_task) is None
+    assert evidence.completion_line == ""
+    assert evidence.stats_line == ""
+    assert evidence.running_line == ""
+    assert final == ""
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task=latest_task,
+        prior_notice_count=0,
+    )
+
+
 def test_batch_execution_does_not_classify_desktop_one_shot_as_batch():
     service = BatchExecutionService()
 

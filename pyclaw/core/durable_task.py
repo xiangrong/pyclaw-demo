@@ -101,7 +101,17 @@ class DurableTaskEngine:
         re.compile(r"(?:失败|错误|异常)[^\n]{0,120}(?:总数|成功)[^\n]{0,80}"),
     )
     COMPLETION_PATTERNS: tuple[re.Pattern[str], ...] = (
-        re.compile(r"\b(?:all\s+)?(?:done|completed|finished|succeeded|successfully|configured|updated|created|deleted)\b[^\n]{0,180}", re.IGNORECASE),
+        re.compile(r"\b(?:all\s+)?(?:done|completed|finished|succeeded|successfully)\b[^\n]{0,180}", re.IGNORECASE),
+        re.compile(
+            r"\b(?:job|task|batch|script|command|file|artifact|resource|record|items?)\b"
+            r"[^\n]{0,100}\b(?:configured|updated|created|deleted)\b[^\n]{0,80}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(?:configured|updated|created|deleted)\b[^\n]{0,80}"
+            r"\b(?:successfully|complete|completed|done)\b[^\n]{0,80}",
+            re.IGNORECASE,
+        ),
         re.compile(r"(?:已完成|执行完成|更新完成|更新成功|已更新成功|处理完成|全部完成|成功完成|查询完成|汇总完成)[^\n]{0,180}"),
     )
     PROGRESS_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -132,10 +142,7 @@ class DurableTaskEngine:
     def evidence_from_text(self, text: str) -> DurableTaskEvidence:
         content = text or ""
         observable_content = self.observable_output_text(content)
-        pid = self._last_match(observable_content, r"\b(?:PID|pid|进程)\b[:：=]?\s*(\d+)") or self._last_match(
-            content,
-            r"\b(?:PID|pid|进程)\b[:：=]?\s*(\d+)",
-        )
+        pid = self._last_durable_pid(observable_content) or self._last_durable_pid(content)
         log_path = self._last_path(observable_content, ("log",)) or self._last_path(content, ("log",))
         result_path = self._last_result_path(observable_content, log_path=log_path)
         stats_line = self._first_pattern_line(observable_content, self.STATS_PATTERNS) or self._multiline_stats_summary(observable_content)
@@ -299,6 +306,97 @@ class DurableTaskEngine:
         matches = re.findall(pattern, content or "", flags=re.IGNORECASE)
         return str(matches[-1]).strip() if matches else ""
 
+    def _last_durable_pid(self, content: str) -> str:
+        """Return a PID only when it is a durable-task handle.
+
+        Operational logs often contain application or system process ids, for
+        example Android logcat rows such as ``created:true pid:4821``.  Those
+        PIDs describe the inspected target, not a controller-owned background
+        job.  Durable execution handles are expected to be explicit pointer
+        lines (``PID=... LOG=...``) or lines with job/task/batch/script context.
+        """
+        matches: list[str] = []
+        for raw in (content or "").splitlines():
+            line = raw.strip()
+            if not line or self._line_is_runtime_observation_noise(line):
+                continue
+
+            explicit = re.search(r"\bPID\b\s*[:：=]\s*(\d+)", line)
+            if explicit:
+                matches.append(explicit.group(1))
+                continue
+
+            chinese = re.search(r"(?:进程号|进程)\s*[:：=]?\s*(\d+)", line)
+            if chinese:
+                matches.append(chinese.group(1))
+                continue
+
+            if not self._has_durable_pid_context(line):
+                continue
+            contextual = re.search(r"\bpid\b\s*[:：=]\s*(\d+)", line)
+            if contextual:
+                matches.append(contextual.group(1))
+        return matches[-1] if matches else ""
+
+    def _looks_like_observed_process_log(self, line: str) -> bool:
+        """Return True for inspected runtime logs whose PIDs are not handles."""
+        text = line or ""
+        if re.match(r"\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\d+\s+[VDIWEF]\s+", text):
+            return True
+        lowered = text.lower()
+        if "packagename:" in lowered or "processname:" in lowered:
+            return True
+        if re.search(r"\buid\s*[:=]?\s*\d+\b", lowered) and re.search(r"\bpid\s*[:=]\s*\d+\b", lowered):
+            return True
+        return False
+
+    def line_is_runtime_observation_noise(self, line: str) -> bool:
+        """Return True for inspected runtime/app logs, not controller task logs."""
+        return self._line_is_runtime_observation_noise(line)
+
+    def _line_is_runtime_observation_noise(self, line: str) -> bool:
+        text = (line or "").strip()
+        if not text:
+            return False
+        if self._looks_like_observed_process_log(text):
+            return True
+        if self._looks_like_runtime_executor_stats(text):
+            return True
+        return False
+
+    def _looks_like_runtime_executor_stats(self, line: str) -> bool:
+        """Return True for VM/app executor counters that contain completion words.
+
+        Android and Java logs frequently print lines such as ``Stats for
+        Executor ... completed tasks = 542``.  The word ``completed`` is about
+        the app/runtime thread pool, not about the user-requested durable task.
+        Keep this conservative so normal batch summaries still pass through.
+        """
+        lowered = (line or "").lower()
+        runtime_counters = ("completed tasks", "queued tasks", "active threads", "pool size")
+        if "stats for executor" in lowered:
+            return True
+        if "threadpoolexecutor" in lowered and any(marker in lowered for marker in runtime_counters):
+            return True
+        if any(marker in lowered for marker in ("completed tasks", "queued tasks")) and any(
+            marker in lowered for marker in ("executor", "active threads", "pool size")
+        ):
+            return True
+        return False
+
+    def _has_durable_pid_context(self, line: str) -> bool:
+        lowered = (line or "").lower()
+        return bool(
+            any(
+                marker in lowered
+                for marker in (
+                    "job", "task", "batch", "script", "command", "nohup", "setsid",
+                    "background", "running", "in progress", " log=", " log:", ".log",
+                )
+            )
+            or any(marker in (line or "") for marker in ("后台", "执行中", "运行中", "日志"))
+        )
+
     def _last_path(self, content: str, extensions: Sequence[str]) -> str:
         ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
         pattern = re.compile(rf"(?P<path>(?:~|/)[^\s`'\"<>]+\.(?:{ext_pattern}))", re.IGNORECASE)
@@ -309,6 +407,8 @@ class DurableTaskEngine:
         result_lines: list[str] = []
         for raw in (content or "").splitlines():
             line = raw.strip()
+            if self._line_is_runtime_observation_noise(line):
+                continue
             lowered = line.lower()
             if any(marker in lowered for marker in ("result", "output", "summary", "csv")) or any(
                 marker in line for marker in ("结果", "输出", "汇总")
@@ -364,7 +464,7 @@ class DurableTaskEngine:
         matches: list[str] = []
         for line in (content or "").splitlines():
             stripped = line.strip()
-            if not stripped or re.search(r"\[?\d+\s*/\s*\d+\]?", stripped):
+            if not stripped or self._line_is_runtime_observation_noise(stripped) or re.search(r"\[?\d+\s*/\s*\d+\]?", stripped):
                 continue
             for pattern in patterns:
                 match = re.search(pattern, stripped, flags=re.IGNORECASE)
@@ -376,6 +476,8 @@ class DurableTaskEngine:
         lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
         for line in reversed(lines):
             if line.startswith(("Command:", "OBSERVATION from", "NOTICE:")):
+                continue
+            if self._line_is_runtime_observation_noise(line):
                 continue
             for pattern in self.PROGRESS_PATTERNS:
                 match = pattern.search(line)
@@ -395,6 +497,8 @@ class DurableTaskEngine:
         for line in reversed(lines):
             if line.startswith(("Command:", "OBSERVATION from", "NOTICE:")):
                 continue
+            if self._line_is_runtime_observation_noise(line):
+                continue
             for pattern in patterns:
                 match = pattern.search(line)
                 if match:
@@ -412,6 +516,8 @@ class DurableTaskEngine:
             if not line:
                 continue
             if line.startswith(("Command:", "OBSERVATION from", "NOTICE:", "<error_context", "</error_context")):
+                continue
+            if self._line_is_runtime_observation_noise(line):
                 continue
             if "Command timed out after" in line:
                 continue

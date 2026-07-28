@@ -107,6 +107,28 @@ class BatchExecutionService:
         ".log", "nohup", "tail", "sleep", "pid", "python3", "python ", ".sh", ".py",
         ">", "&", "tee", "timeout", "kubectl", "opencli", "bash", "sh ", "./",
     )
+    SOURCE_READ_FILE_EXTENSIONS: tuple[str, ...] = (
+        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".kts",
+        ".go", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".swift",
+        ".sh", ".bash", ".zsh", ".fish", ".rb", ".php", ".pl", ".pm", ".lua",
+        ".scala", ".sc", ".r", ".sql", ".md", ".markdown", ".rst", ".toml", ".yaml",
+        ".yml", ".ini", ".cfg", ".conf", ".xml", ".html", ".css",
+    )
+    STRUCTURED_RESULT_EXTENSIONS: tuple[str, ...] = (
+        ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls",
+    )
+    TEXT_RESULT_EXTENSIONS: tuple[str, ...] = (".log", ".out", ".txt")
+    RESULT_ARTIFACT_PATH_MARKERS: tuple[str, ...] = (
+        "result", "results", "output", "outputs", "summary", "summaries", "report", "reports",
+        "batch", "bulk", "query", "queries", "status", "statuses", "health", "version",
+        "versions", "model", "models", "egress", "出口", "ip", "ips", "wss", "pod_", "pods_",
+        "service", "account", "job", "ticket", "order", "log", "logs",
+    )
+    RESULT_ROW_HEADERS: tuple[str, ...] = (
+        "结果", "状态", "健康状态", "版本", "镜像", "机型", "型号", "值", "出口ip", "公网ip",
+        "运营商", "地域", "地区", "result", "status", "state", "health", "version", "image",
+        "model", "value", "ip", "public_ip", "egress_ip", "operator", "isp", "region", "location",
+    )
     DESKTOP_ONE_SHOT_MARKERS: tuple[str, ...] = (
         "screencapture", "imagesnap", "ffmpeg", "pmset displaysleepnow", "display notification",
     )
@@ -429,11 +451,18 @@ class BatchExecutionService:
         max_notices: int | None = None,
     ) -> bool:
         """Return True when only partial batch evidence exists and polling should continue."""
-        terminal_messages = list(terminal_messages)
-        if not terminal_messages:
+        evidence_messages = self._durable_evidence_messages(
+            list(terminal_messages),
+            latest_task=latest_task,
+        )
+        if not evidence_messages:
             return False
-        joined = "\n".join(str(getattr(msg, "content", "") or "") for msg in terminal_messages[-8:])
-        command_text = "\n".join(self.extract_terminal_command(str(getattr(msg, "content", "") or "")) for msg in terminal_messages[-8:])
+        joined = "\n".join(str(getattr(msg, "content", "") or "") for msg in evidence_messages[-8:])
+        command_text = "\n".join(
+            self.extract_terminal_command(str(getattr(msg, "content", "") or ""))
+            for msg in evidence_messages[-8:]
+            if (getattr(msg, "metadata", {}) or {}).get("tool_name") == "terminal"
+        )
         if not self._is_batch_context(latest_task=latest_task, command_text=command_text, joined=joined):
             return False
         evidence = self.evidence_from_text(joined)
@@ -485,6 +514,139 @@ class BatchExecutionService:
                     continue
             chunks.append(str(getattr(msg, "content", "") or ""))
         return self.evidence_from_text("\n".join(chunks))
+
+    def _durable_evidence_messages(self, messages: Iterable[Message], *, latest_task: str = "") -> list[Message]:
+        """Return messages that are safe to parse as durable execution evidence.
+
+        Terminal observations are live process/output evidence.  ``read_file`` is
+        evidence only when it reads a result artifact (CSV/JSON/log-like output).
+        Source/doc reads often contain command examples such as ``python3
+        batch_query.py`` or loops with ``for``; parsing those as task progress
+        can hijack unrelated single-target diagnosis turns.
+        """
+        result: list[Message] = []
+        for msg in messages:
+            tool_name = (getattr(msg, "metadata", {}) or {}).get("tool_name")
+            if tool_name == "terminal":
+                result.append(msg)
+                continue
+            if tool_name != "read_file":
+                continue
+            if self._read_file_message_is_result_artifact(msg, latest_task=latest_task):
+                result.append(msg)
+        return result
+
+    def _read_file_message_is_result_artifact(self, msg: Message, *, latest_task: str = "") -> bool:
+        metadata = getattr(msg, "metadata", {}) or {}
+        structured = metadata.get("tool_result_structured") if isinstance(metadata, dict) else None
+        paths: list[str] = []
+        if isinstance(structured, dict):
+            for key in ("path", "requested_path"):
+                value = str(structured.get(key) or "").strip()
+                if value:
+                    paths.append(value)
+        content = str(getattr(msg, "content", "") or "")
+        blocks = self._read_file_blocks(content)
+        paths.extend(path for path, _body in blocks if path)
+        if not paths and "OBSERVATION from read_file" not in content:
+            return False
+
+        bodies = [body for _path, body in blocks]
+        if not bodies and "OBSERVATION from read_file" in content:
+            # Legacy/truncated read_file observations may omit the exact blank
+            # line shape that _read_file_blocks expects.  Fall back to the full
+            # content, but still require path/content evidence below.
+            bodies = [content]
+
+        if paths and any(self._path_has_extension(path, self.SOURCE_READ_FILE_EXTENSIONS) for path in paths):
+            return any(self._body_has_structured_result_rows(body, latest_task=latest_task) for body in bodies)
+
+        if paths and any(
+            self._path_has_extension(path, self.STRUCTURED_RESULT_EXTENSIONS)
+            and self._structured_result_path_looks_like_artifact(path)
+            for path in paths
+        ):
+            return True
+
+        if paths and any(self._text_result_path_looks_like_artifact(path) for path in paths):
+            return True
+
+        if any(self._body_has_structured_result_rows(body, latest_task=latest_task) for body in bodies):
+            return True
+        return False
+
+    def _path_has_extension(self, path: str, extensions: Sequence[str]) -> bool:
+        normalized = self._clean_observed_path(path).lower()
+        return any(normalized.endswith(ext) for ext in extensions)
+
+    def _clean_observed_path(self, path: str) -> str:
+        text = str(path or "").strip().strip("`'\"")
+        text = re.sub(r"\s+\(\d+\s+lines\)$", "", text)
+        return text.rstrip(".,;:)]}")
+
+    def _text_result_path_looks_like_artifact(self, path: str) -> bool:
+        normalized = self._clean_observed_path(path).lower()
+        if not any(normalized.endswith(ext) for ext in self.TEXT_RESULT_EXTENSIONS):
+            return False
+        basename = os.path.basename(normalized)
+        return any(marker in basename for marker in self.RESULT_ARTIFACT_PATH_MARKERS)
+
+    def _structured_result_path_looks_like_artifact(self, path: str) -> bool:
+        normalized = self._clean_observed_path(path).lower()
+        if not any(normalized.endswith(ext) for ext in self.STRUCTURED_RESULT_EXTENSIONS):
+            return False
+        basename = os.path.basename(normalized)
+        return any(marker in basename for marker in self.RESULT_ARTIFACT_PATH_MARKERS)
+
+    def _body_has_structured_result_rows(self, body: str, *, latest_task: str = "") -> bool:
+        text = (body or "").strip()
+        if not text:
+            return False
+        parsed = self._loads_json_object(text)
+        if self._json_body_has_result_shape(parsed, latest_task=latest_task):
+            return True
+        rows = self._parse_csv_rows_from_body(text)
+        if rows and self._rows_have_result_shape(rows, latest_task=latest_task):
+            return True
+        if self._egress_rows_from_terminal_rows(text):
+            return True
+        if self._generic_item_results_from_terminal_rows(text):
+            return True
+        if self._model_pairs_from_terminal_rows(text):
+            return True
+        return False
+
+    def _json_body_has_result_shape(self, parsed: Any, *, latest_task: str = "") -> bool:
+        if not isinstance(parsed, dict) or not parsed:
+            return False
+        task_targets = set(re.findall(r"(?<!\d)\d{12,}(?!\d)", latest_task or ""))
+        keys = {str(key or "").strip() for key in parsed.keys()}
+        if task_targets and task_targets.issubset(keys):
+            return True
+        if any(self._looks_like_pod_id(key) for key in keys):
+            return True
+        for value in parsed.values():
+            if isinstance(value, dict):
+                lowered_keys = {str(key or "").strip().lower() for key in value.keys()}
+                if any(any(marker in key for marker in self.RESULT_ROW_HEADERS) for key in lowered_keys):
+                    return True
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                return True
+        return False
+
+    def _rows_have_result_shape(self, rows: Sequence[dict[str, str]], *, latest_task: str = "") -> bool:
+        if not rows:
+            return False
+        headers = [str(header or "").strip().lower() for header in rows[0].keys()]
+        if any(any(marker in header for marker in self.RESULT_ROW_HEADERS) for header in headers):
+            return True
+        task_targets = set(re.findall(r"(?<!\d)\d{12,}(?!\d)", latest_task or ""))
+        if task_targets:
+            observed_values = {str(value or "").strip() for row in rows for value in row.values()}
+            if task_targets & observed_values:
+                return True
+        return len(headers) >= 2 and len(rows) > 1
 
     def _compact_command_for_evidence(self, command: str) -> str:
         return self.durable.compact_command_for_evidence(command)
@@ -585,7 +747,8 @@ class BatchExecutionService:
         )
 
     def final_from_observations(self, *, latest_task: str, terminal_messages: Iterable[Message]) -> str:
-        evidence_messages = list(terminal_messages)
+        raw_messages = list(terminal_messages)
+        evidence_messages = self._durable_evidence_messages(raw_messages, latest_task=latest_task)
         if not evidence_messages:
             return ""
         joined = "\n".join(str(getattr(msg, "content", "") or "") for msg in evidence_messages[-12:])
@@ -647,7 +810,10 @@ class BatchExecutionService:
         merely-started or still-running durable job should keep using the
         progress/start path instead of being hidden behind an empty final.
         """
-        evidence_messages = list(terminal_messages)
+        evidence_messages = self._durable_evidence_messages(
+            list(terminal_messages),
+            latest_task=latest_task,
+        )
         if not evidence_messages:
             return False
         decision = self.evaluate_operational_contract(latest_task=latest_task, terminal_messages=evidence_messages)
@@ -687,6 +853,7 @@ class BatchExecutionService:
             return OperationalGateDecision(contract=None, ready=False, reason="no_contract")
 
         evidence_messages = list(terminal_messages)[-12:]
+        evidence_messages = self._durable_evidence_messages(evidence_messages, latest_task=latest_task)[-12:]
         if not evidence_messages:
             ledger = OperationalEvidenceLedger(contract=contract, facets={})
             return OperationalGateDecision(
@@ -783,6 +950,7 @@ class BatchExecutionService:
         contract: OperationalTaskContract,
         messages: Iterable[Message],
     ) -> OperationalEvidenceLedger:
+        messages = self._durable_evidence_messages(list(messages), latest_task=contract.raw_task)
         facet_messages: dict[str, list[Message]] = {facet: [] for facet in contract.required_facets}
         fallback_messages: list[Message] = []
         for msg in messages:
@@ -2073,8 +2241,15 @@ class BatchExecutionService:
     def _is_batch_context(self, *, latest_task: str, command_text: str, joined: str) -> bool:
         task_text = latest_task or ""
         contract = self.infer_contract(task_text)
-        if contract is not None and contract.requires_file_batch:
-            return True
+        if contract is not None:
+            if contract.requires_file_batch:
+                return True
+            # A single-target operational/diagnostic request may use inline
+            # scripts, JSON loops, or read source files while investigating.
+            # Those incidental ``for``/``list``/``python`` tokens are not batch
+            # progress.  Let the normal agent loop answer from concrete tool
+            # evidence instead of hijacking the turn with a batch finalizer.
+            return False
         if self.looks_like_batch_terminal_command(command_text, task_text=task_text):
             return True
         evidence = self.evidence_from_text(joined)
@@ -2208,7 +2383,7 @@ class BatchExecutionService:
         matches: list[str] = []
         for line in (content or "").splitlines():
             stripped = line.strip()
-            if not stripped or re.search(r"\[?\d+\s*/\s*\d+\]?", stripped):
+            if not stripped or self.durable.line_is_runtime_observation_noise(stripped) or re.search(r"\[?\d+\s*/\s*\d+\]?", stripped):
                 continue
             for pattern in patterns:
                 match = re.search(pattern, stripped, flags=re.IGNORECASE)
@@ -2241,6 +2416,8 @@ class BatchExecutionService:
         collected: list[str] = []
         for raw in lines:
             stripped = raw.strip()
+            if self.durable.line_is_runtime_observation_noise(stripped):
+                continue
             lowered = stripped.lower()
 
             if not collecting:
@@ -2313,6 +2490,8 @@ class BatchExecutionService:
         for line in reversed(lines):
             if line.startswith(("Command:", "OBSERVATION from", "NOTICE:")):
                 continue
+            if self.durable.line_is_runtime_observation_noise(line):
+                continue
             for pattern in self.PROGRESS_PATTERNS:
                 match = pattern.search(line)
                 if not match:
@@ -2331,6 +2510,8 @@ class BatchExecutionService:
         for line in reversed(lines):
             if line.startswith(("Command:", "OBSERVATION from", "NOTICE:")):
                 continue
+            if self.durable.line_is_runtime_observation_noise(line):
+                continue
             for pattern in patterns:
                 match = pattern.search(line)
                 if match:
@@ -2348,6 +2529,8 @@ class BatchExecutionService:
             if not line:
                 continue
             if line.startswith(("Command:", "OBSERVATION from", "NOTICE:", "<error_context", "</error_context")):
+                continue
+            if self.durable.line_is_runtime_observation_noise(line):
                 continue
             if "Command timed out after" in line:
                 continue

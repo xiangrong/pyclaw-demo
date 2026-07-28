@@ -405,6 +405,98 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="single-pod-crash-diagnosis-source-read-not-batch-progress",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "pod: 7660844625406057267\n"
+                    "包名：com.run.tower.defense\n"
+                    "问题：云机应用闪退\n\n"
+                    "你去给我分析下原因"
+                ),
+                "tool_name": "read_file",
+                "observation": (
+                    "OBSERVATION from read_file:\n"
+                    "File: /Users/bytedance/.pyclaw/cloudphone_shell.py (136 lines)\n"
+                    "\n"
+                    "用法:\n"
+                    "  python3 cloudphone_shell.py --egress      # 查询出口 IP\n"
+                    "for item in data:\n"
+                    "    pass\n"
+                ),
+            },
+            expected={
+                "ready": False,
+                "needs_repair": False,
+                "reason": "no_contract",
+                "missing_facets": [],
+                "final_empty": True,
+                "not_contains": ["批量任务仍在执行中"],
+            },
+        ),
+        ReplayCase(
+            name="single-pod-crash-diagnosis-logcat-pid-not-durable-start",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "给我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+                    "pod: 7660844625406057267\n"
+                    "包名：com.run.tower.defense\n"
+                    "问题：云机应用闪退"
+                ),
+                "tool_name": "terminal",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='grep \"com.run.tower.defense\" /data/misc/logd/logcat | head -150' && python3 scripts/wss_run.py 2>&1\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "07-28 17:58:51.539527   473   539 V ActivityManager: "
+                    "byte_proc doSendBroadCast <com.run.tower.defense> created:true pid:4821; "
+                    "uid:10083; packageName:com.run.tower.defense; reason:mHostingType:pre-top-activity\n"
+                    "07-28 17:58:51.540407   473   539 I ActivityManager: "
+                    "Start proc 4821:com.run.tower.defense/u0a83 for pre-top-activity\n"
+                ),
+            },
+            expected={
+                "ready": False,
+                "needs_repair": False,
+                "reason": "no_contract",
+                "missing_facets": [],
+                "final_empty": True,
+                "not_contains": ["批量任务已在后台启动", "PID：4821", "批量任务仍在执行中"],
+            },
+        ),
+        ReplayCase(
+            name="single-pod-crash-diagnosis-runtime-executor-completed-tasks-not-final",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "给我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+                    "pod: 7660844625406057267\n"
+                    "包名：com.run.tower.defense\n"
+                    "问题：云机应用闪退"
+                ),
+                "tool_name": "terminal",
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='tail -500 /data/misc/logd/logcat' && python3 scripts/wss_run.py 2>&1\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "07-28 23:18:31.941339 15821 15877 I Finsky  : "
+                    "[32] Stats for Executor: bgExecutor vrr@a808303"
+                    "[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 542]\n"
+                ),
+            },
+            expected={
+                "ready": False,
+                "needs_repair": False,
+                "reason": "no_contract",
+                "missing_facets": [],
+                "final_empty": True,
+                "not_contains": ["批量任务仍在执行中", "批量任务已在后台启动", "completed tasks"],
+            },
+        ),
+        ReplayCase(
             name="code-change-needs-validation",
             category="code_modification",
             input={"changed_files": ["pyclaw/tools/base.py"], "validation_results": []},

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 FACET_POD_MODEL = "pod_model"
@@ -16,6 +16,9 @@ FACET_LABELS: Mapping[str, str] = {
     FACET_IMAGE_UPDATE_SUBMISSION: "镜像升级提交结果",
     FACET_GENERIC_RESULT: "批量处理结果",
 }
+
+
+NUMERIC_TARGET_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{12,}(?![A-Za-z0-9])")
 
 
 @dataclass(frozen=True)
@@ -128,7 +131,7 @@ def infer_operational_task_contract(text: str) -> OperationalTaskContract | None
         required_facets.append(FACET_IMAGE_UPDATE_SUBMISSION)
 
     if not required_facets:
-        if _looks_like_generic_operational_batch(normalized):
+        if _looks_like_generic_operational_batch(raw_task, normalized, targets):
             required_facets.append(FACET_GENERIC_RESULT)
         else:
             return None
@@ -169,7 +172,7 @@ def _extract_targets(raw_task: str) -> tuple[str, ...]:
     results instead of accepting aggregate success/failure summaries.
     """
     targets: list[str] = []
-    pod_ids = re.findall(r"(?<!\d)\d{12,}(?!\d)", raw_task or "")
+    pod_ids = NUMERIC_TARGET_PATTERN.findall(raw_task or "")
     targets.extend(pod_ids)
 
     for raw_line in (raw_task or "").splitlines():
@@ -182,8 +185,8 @@ def _target_candidates_from_line(raw_line: str) -> tuple[str, ...]:
     line = _strip_list_marker(raw_line)
     if not line:
         return ()
-    if re.search(r"(?<!\d)\d{12,}(?!\d)", line):
-        return tuple(re.findall(r"(?<!\d)\d{12,}(?!\d)", line))
+    if NUMERIC_TARGET_PATTERN.search(line):
+        return tuple(NUMERIC_TARGET_PATTERN.findall(line))
     if _looks_like_single_target_token(line):
         return (line,)
     if "," in line or "，" in line:
@@ -254,13 +257,59 @@ def _mentions_batch(normalized: str) -> bool:
     )
 
 
-def _looks_like_generic_operational_batch(normalized: str) -> bool:
-    subjects = (
-        "服务", "域名", "网址", "url", "endpoint", "api", "账号", "账户", "订单", "工单",
-        "job", "jobs", "worker", "设备", "实例", "pod", "pods", "device", "serial", "健康检查", "状态", "版本",
+def _looks_like_generic_operational_batch(
+    raw_task: str,
+    normalized: str,
+    targets: Sequence[str],
+) -> bool:
+    """Return True only for generic operational work that needs batch gating.
+
+    Generic contracts intentionally require aggregate/detail evidence before a
+    final answer is accepted.  That is useful for multi-item jobs, but harmful
+    for single-target diagnostics: Android/app logs can contain words such as
+    ``pid``, ``running`` or package fragments like ``com.run.*`` that look like
+    controller progress.  Keep single-target investigations in the normal tool
+    reasoning path unless the user explicitly asked for batch/list/all work.
+    """
+    if not (_mentions_generic_operational_subject(normalized) and _mentions_generic_operational_action(normalized)):
+        return False
+    if _mentions_batch(normalized):
+        return True
+    explicit_line_targets = _line_delimited_targets(raw_task)
+    return len(tuple(dict.fromkeys((*targets, *explicit_line_targets)))) > 1
+
+
+def _mentions_generic_operational_subject(normalized: str) -> bool:
+    cjk_subjects = (
+        "服务", "域名", "网址", "账号", "账户", "订单", "工单", "设备", "实例",
+        "健康检查", "状态", "版本",
     )
-    actions = (
+    english_subjects = (
+        "url", "endpoint", "api", "job", "jobs", "worker", "pod", "pods", "device", "serial",
+    )
+    return any(subject in normalized for subject in cjk_subjects) or _contains_english_word(normalized, english_subjects)
+
+
+def _mentions_generic_operational_action(normalized: str) -> bool:
+    cjk_actions = (
         "查询", "查下", "查一下", "查", "检查", "看下", "看一下", "导出", "统计", "汇总",
-        "更新", "升级", "处理", "执行", "query", "inspect", "check", "export", "update", "upgrade", "run", "execute",
+        "更新", "升级", "处理", "执行", "分析", "诊断", "排查", "定位",
     )
-    return any(subject in normalized for subject in subjects) and any(action in normalized for action in actions)
+    english_actions = ("query", "inspect", "check", "export", "update", "upgrade", "run", "execute", "diagnose", "debug")
+    return any(action in normalized for action in cjk_actions) or _contains_english_word(normalized, english_actions)
+
+
+def _contains_english_word(text: str, words: Sequence[str]) -> bool:
+    for word in words:
+        pattern = rf"(?<![A-Za-z0-9_.:/-]){re.escape(word)}(?![A-Za-z0-9_.:/-])"
+        if re.search(pattern, text or "", flags=re.IGNORECASE):
+            return True
+    return False
+
+
+def _line_delimited_targets(raw_task: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    for raw_line in (raw_task or "").splitlines():
+        for candidate in _target_candidates_from_line(raw_line):
+            targets.append(candidate)
+    return tuple(dict.fromkeys(targets))
