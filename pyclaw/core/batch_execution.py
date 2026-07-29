@@ -197,7 +197,7 @@ class BatchExecutionService:
         if any(marker in combined for marker in self.DESKTOP_ONE_SHOT_MARKERS):
             return False
 
-        multi_item_signal = any(marker in combined for marker in self.MULTI_ITEM_MARKERS)
+        multi_item_signal = self._has_multi_item_signal(combined)
         query_signal = any(marker in combined for marker in self.QUERY_MARKERS)
         operational_signal = any(marker in command_scope for marker in self.OPERATIONAL_MARKERS)
         action_signal = any(marker in command_scope for marker in self.ACTION_MARKERS)
@@ -206,7 +206,7 @@ class BatchExecutionService:
             re.search(r"(?:>|>>|tee\s+)[^\s]+\.(?:log|out|txt|csv|json)", command_scope)
         )
         script_batch_signal = bool(re.search(r"(?:^|[/\s])(?:batch|bulk|query|update)[\w.-]*\.(?:py|sh)\b", command_scope))
-        loop_batch_signal = bool(re.search(r"\b(?:while\s+read|for\s+\w+\s+in|xargs|parallel)\b", command_scope))
+        loop_batch_signal = self._has_shell_loop_signal(command_scope)
         task_operational = self.is_operational_task(task_text)
         task_batch_signal = self._task_requires_batch_context(task_scope)
 
@@ -2258,9 +2258,9 @@ class BatchExecutionService:
             return True
         if evidence.has_durable_start and self._task_requires_batch_context(task_text):
             return True
-        if evidence.has_durable_start and any(marker in joined_scope for marker in self.MULTI_ITEM_MARKERS):
+        if evidence.has_durable_start and self._has_multi_item_signal(joined_scope):
             return True
-        if evidence.running_line and any(marker in joined_scope for marker in self.MULTI_ITEM_MARKERS):
+        if evidence.running_line and self._has_multi_item_signal(joined_scope):
             return True
         return False
 
@@ -2268,10 +2268,41 @@ class BatchExecutionService:
         normalized = (task_text or "").lower()
         if not normalized:
             return False
-        if any(marker in normalized for marker in self.MULTI_ITEM_MARKERS):
+        if self._has_multi_item_signal(normalized):
             return True
         targets = re.findall(r"(?<!\d)\d{12,}(?!\d)", task_text or "")
         return len(set(targets)) > 1
+
+    def _has_multi_item_signal(self, text: str) -> bool:
+        normalized = (text or "").lower()
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in ("批量", "这些", "这批", "列表", "全部", "逐个", "串行", "并行", "多条", "多个")):
+            return True
+        if "batch_" in normalized:
+            return True
+        if re.search(r"(?<![a-z0-9_.:/-])(?:batch|bulk|serial|parallel|all)(?![a-z0-9_.:/-])", normalized):
+            return True
+        if re.search(
+            r"(?<![a-z0-9_.:/-])lists?(?![a-z0-9_.:/-])\s+"
+            r"(?:of|file|input|targets?|items?|ids?|pods?|devices?|services?)\b",
+            normalized,
+        ):
+            return True
+        if re.search(r"\b(?:from|in|with)\s+(?:a\s+)?lists?\b", normalized):
+            return True
+        return self._has_shell_loop_signal(normalized)
+
+    def _has_shell_loop_signal(self, text: str) -> bool:
+        normalized = (text or "").lower()
+        if not normalized:
+            return False
+        if re.search(r"\b(?:while\s+read|xargs|parallel|foreach|mapfile)\b", normalized):
+            return True
+        # Require shell-loop syntax.  Python/list-comprehension snippets such as
+        # ``next(x for x in data)`` are common in one-shot diagnostic commands
+        # and must not be classified as multi-item durable batches.
+        return bool(re.search(r"\bfor\s+\w+\s+in\b[^\n;&|]*(?:;\s*)?\bdo\b", normalized))
 
     def _evidence_suffix(self, evidence: BatchEvidence) -> str:
         parts: list[str] = []

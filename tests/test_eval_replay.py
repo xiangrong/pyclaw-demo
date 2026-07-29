@@ -497,6 +497,59 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
             },
         ),
         ReplayCase(
+            name="history-single-pod-crash-diagnosis-dropbox-pid-not-durable-start",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+                    "pod: 7660844625406057267\n"
+                    "包名：com.run.tower.defense\n"
+                    "问题：云机应用闪退"
+                ),
+                "tool_name": "terminal",
+                "observations": [
+                    (
+                        "OBSERVATION from terminal:\n"
+                        "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='pm list packages | grep tower; ps -A | grep -i tower' && python3 scripts/wss_run.py 2>&1\n"
+                        "Exit code: 0\n"
+                        "STDOUT:\n"
+                        "package:com.run.tower.defense\n"
+                    ),
+                    (
+                        "OBSERVATION from terminal:\n"
+                        "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='cat /data/system/dropbox/data_app_crash@1785197912797.txt' && python3 scripts/wss_run.py 2>&1\n"
+                        "Exit code: 0\n"
+                        "STDOUT:\n"
+                        "=== CONNECTED ===\n"
+                        "=== OUTPUT START ===\n"
+                        "__BEGIN__\n"
+                        "Process: com.google.android.play.games\n"
+                        "PID: 1921\n"
+                        "UID: 10078\n"
+                        "Flags: 0x20cbbe44\n"
+                        "Package: com.google.android.play.games v391890040\n"
+                        "Foreground: No\n"
+                        "Process-Runtime: 6524\n"
+                        "Build: alps/gemini/gemini:12/SP1A.210812.016/1753073604:user/release-keys\n"
+                        "Loading-Progress: 1.0\n"
+                        "\n"
+                        "java.lang.SecurityException: addOnPermissionsChangeListener\n"
+                        "\tat android.os.Parcel.createException(Parcel.java:2426)\n"
+                        "__DONE__0\n"
+                        "=== OUTPUT END ===\n"
+                    ),
+                ],
+            },
+            expected={
+                "ready": False,
+                "needs_repair": False,
+                "reason": "no_contract",
+                "missing_facets": [],
+                "final_empty": True,
+                "not_contains": ["批量任务已在后台启动", "PID：1921", "批量任务仍在执行中"],
+            },
+        ),
+        ReplayCase(
             name="code-change-needs-validation",
             category="code_modification",
             input={"changed_files": ["pyclaw/tools/base.py"], "validation_results": []},

@@ -276,6 +276,103 @@ def test_single_pod_crash_diagnosis_runtime_executor_completed_tasks_not_batch_f
     )
 
 
+def test_single_pod_crash_diagnosis_dropbox_pid_is_not_durable_start():
+    service = BatchExecutionService()
+    latest_task = (
+        "我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+        "pod: 7660844625406057267\n"
+        "包名：com.run.tower.defense\n"
+        "问题：云机应用闪退"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='cat /data/system/dropbox/data_app_crash@1785197912797.txt' && python3 scripts/wss_run.py 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "=== CONNECTED ===\n"
+            "=== OUTPUT START ===\n"
+            "__BEGIN__\n"
+            "Process: com.google.android.play.games\n"
+            "PID: 1921\n"
+            "UID: 10078\n"
+            "Flags: 0x20cbbe44\n"
+            "Package: com.google.android.play.games v391890040\n"
+            "Foreground: No\n"
+            "Process-Runtime: 6524\n"
+            "Build: alps/gemini/gemini:12/SP1A.210812.016/1753073604:user/release-keys\n"
+            "Loading-Progress: 1.0\n"
+            "\n"
+            "java.lang.SecurityException: addOnPermissionsChangeListener\n"
+            "\tat android.os.Parcel.createException(Parcel.java:2426)\n"
+            "__DONE__0\n"
+            "=== OUTPUT END ===\n"
+        )
+    ]
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert service.is_operational_task(latest_task)
+    assert service.infer_contract(latest_task) is None
+    assert evidence.pid == ""
+    assert evidence.completion_line == ""
+    assert evidence.stats_line == ""
+    assert evidence.has_durable_start is False
+    assert final == ""
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task=latest_task,
+        prior_notice_count=0,
+    )
+
+
+def test_single_pod_diagnosis_pm_list_plus_dropbox_pid_is_not_batch_context():
+    service = BatchExecutionService()
+    latest_task = (
+        "我分析这个pod应用闪退的原因，日志在/data/misc/logd/logcat文件中\n"
+        "pod: 7660844625406057267\n"
+        "包名：com.run.tower.defense\n"
+        "问题：云机应用闪退"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='pm list packages | grep tower; ps -A | grep -i tower' && python3 scripts/wss_run.py 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "package:com.run.tower.defense\n"
+        ),
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd ~/.pyclaw/skills/vephone-pod-exec && export RUN_CMD='cat /data/system/dropbox/data_app_crash@1785197912797.txt' && python3 scripts/wss_run.py 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "Process: com.google.android.play.games\n"
+            "PID: 1921\n"
+            "UID: 10078\n"
+            "Package: com.google.android.play.games v391890040\n"
+            "java.lang.SecurityException: addOnPermissionsChangeListener\n"
+        ),
+    ]
+    joined = "\n".join(msg.content for msg in messages)
+    command_text = "\n".join(service.extract_terminal_command(msg.content) for msg in messages)
+
+    evidence = service.evidence_from_terminal_messages(messages)
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert service.infer_contract(latest_task) is None
+    assert not service._is_batch_context(latest_task=latest_task, command_text=command_text, joined=joined)
+    assert evidence.pid == ""
+    assert evidence.has_durable_start is False
+    assert final == ""
+    assert not service.should_request_progress_poll(
+        messages,
+        latest_task=latest_task,
+        prior_notice_count=0,
+    )
+
+
 def test_batch_execution_does_not_classify_desktop_one_shot_as_batch():
     service = BatchExecutionService()
 

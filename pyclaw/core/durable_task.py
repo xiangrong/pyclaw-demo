@@ -313,21 +313,29 @@ class DurableTaskEngine:
         example Android logcat rows such as ``created:true pid:4821``.  Those
         PIDs describe the inspected target, not a controller-owned background
         job.  Durable execution handles are expected to be explicit pointer
-        lines (``PID=... LOG=...``) or lines with job/task/batch/script context.
+        lines (``PID=... LOG=...``) or lines with job/task/batch/script context;
+        a bare ``PID: 123`` line is intentionally ambiguous and is ignored.
         """
         matches: list[str] = []
-        for raw in (content or "").splitlines():
-            line = raw.strip()
+        lines = [raw.strip() for raw in (content or "").splitlines()]
+        for index, line in enumerate(lines):
             if not line or self._line_is_runtime_observation_noise(line):
+                continue
+            # Command text is launch intent, not observed handle output.  It may
+            # legitimately contain grep/printf fragments such as ``PID: 1921``
+            # while inspecting a target runtime; those literals must not become
+            # controller-owned durable task PIDs.  Nearby command context is
+            # considered separately for stdout lines that print a bare PID.
+            if line.startswith("Command:"):
                 continue
 
             explicit = re.search(r"\bPID\b\s*[:：=]\s*(\d+)", line)
-            if explicit:
+            if explicit and (self._has_durable_pid_context(line) or self._nearby_has_durable_pid_context(lines, index)):
                 matches.append(explicit.group(1))
                 continue
 
             chinese = re.search(r"(?:进程号|进程)\s*[:：=]?\s*(\d+)", line)
-            if chinese:
+            if chinese and (self._has_durable_pid_context(line) or self._nearby_has_durable_pid_context(lines, index)):
                 matches.append(chinese.group(1))
                 continue
 
@@ -360,7 +368,32 @@ class DurableTaskEngine:
             return False
         if self._looks_like_observed_process_log(text):
             return True
+        if self._looks_like_android_crash_report_metadata(text):
+            return True
         if self._looks_like_runtime_executor_stats(text):
+            return True
+        return False
+
+    def _looks_like_android_crash_report_metadata(self, line: str) -> bool:
+        """Return True for Android dropbox/tombstone header rows.
+
+        Crash reports and tombstones commonly contain rows such as ``Process:``,
+        ``PID:``, ``UID:`` and ``Package:`` before the stack trace.  Those rows
+        describe the crashed app/process under investigation.  They must never
+        be promoted into controller-owned durable-task handles.
+        """
+        text = (line or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        if re.match(
+            r"^(?:process|uid|package|foreground|flags|build|process-runtime|loading-progress)\s*[:：]",
+            lowered,
+        ):
+            return True
+        if re.match(r"^(?:cmdline|abi|signal|backtrace|tombstone|build fingerprint)\b", lowered):
+            return True
+        if re.match(r"^java\.[\w.$]+(?:exception|error)\b", lowered):
             return True
         return False
 
@@ -386,16 +419,81 @@ class DurableTaskEngine:
 
     def _has_durable_pid_context(self, line: str) -> bool:
         lowered = (line or "").lower()
-        return bool(
-            any(
-                marker in lowered
-                for marker in (
-                    "job", "task", "batch", "script", "command", "nohup", "setsid",
-                    "background", "running", "in progress", " log=", " log:", ".log",
-                )
+        if any(
+            marker in lowered
+            for marker in (
+                "job", "task", "batch", "command", "nohup", "setsid",
+                "background", " log=", " log:", "log=", "log:", ".log",
+                "result=", "result:", "output=", "output:",
             )
-            or any(marker in (line or "") for marker in ("后台", "执行中", "运行中", "日志"))
-        )
+        ):
+            return True
+        # Avoid treating helper paths such as ``scripts/wss_run.py`` as durable
+        # task context.  Only the standalone word "script" should qualify.
+        if re.search(r"\bscript\b", lowered):
+            return True
+        return any(marker in (line or "") for marker in ("后台", "任务", "脚本", "日志", "结果"))
+
+    def _nearby_has_durable_pid_context(self, lines: Sequence[str], index: int) -> bool:
+        output_marker_index = -1
+        command_index = -1
+        for cursor in range(index - 1, -1, -1):
+            stripped = lines[cursor].strip()
+            if stripped in {"STDOUT:", "STDERR:"}:
+                output_marker_index = cursor
+                break
+
+        command_search_start = (output_marker_index - 1) if output_marker_index >= 0 else (index - 1)
+        for cursor in range(command_search_start, -1, -1):
+            stripped = lines[cursor].strip()
+            if stripped.startswith("OBSERVATION from ") or stripped in {"STDOUT:", "STDERR:"}:
+                break
+            if stripped.startswith("Command:"):
+                command_index = cursor
+                break
+
+        context_lines: list[str] = []
+        if output_marker_index >= 0:
+            context_lines.extend(lines[output_marker_index + 1:index])
+        else:
+            start = max(0, index - 5)
+            context_lines.extend(lines[start:index])
+
+        # A bare ``PID:`` printed on stdout can be a valid durable handle when
+        # the command itself is a durable launcher.  But command text must not
+        # leak durable context into structured crash reports, whose stdout body
+        # has its own runtime metadata markers like ``Process:``/``UID:``.
+        if output_marker_index >= 0 and command_index >= 0:
+            output_context = "\n".join(context_lines)
+            if self._stdout_context_allows_command_launch_handle(output_context):
+                context_lines.append(lines[command_index])
+
+        end = min(len(lines), index + 3)
+        context_lines.extend(lines[index + 1:end])
+        return self._has_durable_launch_context("\n".join(context_lines))
+
+    def _stdout_context_allows_command_launch_handle(self, context: str) -> bool:
+        visible = [line.strip() for line in (context or "").splitlines() if line.strip()]
+        if not visible:
+            return True
+        for line in visible[-4:]:
+            if self._looks_like_android_crash_report_metadata(line) or self._looks_like_observed_process_log(line):
+                return False
+        return True
+
+    def _has_durable_launch_context(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        if not lowered:
+            return False
+        if re.search(r"\becho\s+['\"]?pid\s*[:：=]", lowered):
+            return True
+        if re.search(r"(?:>|>>|tee\s+)[^\n]+\.(?:log|out|txt|csv|json)\b", lowered):
+            return True
+        if any(marker in lowered for marker in (" log=", " log:", "log=", "log:", ".log")):
+            return True
+        if re.search(r"\b(?:nohup|setsid|batch|bulk|background|script)\b", lowered):
+            return True
+        return any(marker in (text or "") for marker in ("后台", "脚本", "日志"))
 
     def _last_path(self, content: str, extensions: Sequence[str]) -> str:
         ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)

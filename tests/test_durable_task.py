@@ -62,6 +62,54 @@ def test_durable_task_engine_ignores_completion_markers_inside_command_script():
     assert evidence.status == "starting"
 
 
+def test_durable_task_engine_keeps_bare_pid_when_nearby_launch_context_exists():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "OBSERVATION from terminal:\n"
+        "Command: cd ~/.pyclaw && python3 batch_pod_models.py pod_models_62.txt > pod_models_62.log 2>&1 & echo PID:$!\n"
+        "Exit code: 0\n"
+        "STDOUT:\n"
+        "PID:12345\n"
+    )
+
+    assert evidence.pid == "12345"
+    assert evidence.has_durable_start is True
+
+
+def test_durable_task_engine_does_not_reuse_previous_command_for_later_stdout_pid():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "OBSERVATION from terminal:\n"
+        "Command: cd ~/.pyclaw && python3 batch_pod_models.py pods.txt > pod_models.log 2>&1 & echo PID:$!\n"
+        "Exit code: 0\n"
+        "STDOUT:\n"
+        "PID:12345\n"
+        "OBSERVATION from terminal:\n"
+        "Command: ps -A | head\n"
+        "Exit code: 0\n"
+        "STDOUT:\n"
+        "PID: 67890\n"
+    )
+
+    assert evidence.pid == "12345"
+    assert evidence.has_durable_start is True
+
+
+def test_durable_task_engine_does_not_treat_wrapper_script_stdout_pid_as_launch_handle():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "OBSERVATION from terminal:\n"
+        "Command: cd ~/.pyclaw/skills/remote-exec && export RUN_CMD='cat /proc/123/status' && python3 scripts/wss_run.py 2>&1\n"
+        "Exit code: 0\n"
+        "STDOUT:\n"
+        "Name:\tinspected-app\n"
+        "PID: 67890\n"
+    )
+
+    assert evidence.pid == ""
+    assert evidence.has_durable_start is False
+
+
 def test_durable_task_engine_does_not_treat_resource_status_running_as_task_progress():
     engine = DurableTaskEngine()
     evidence = engine.evidence_from_text(
@@ -102,6 +150,35 @@ def test_durable_task_engine_ignores_observed_app_process_pid():
     assert evidence.pid == ""
     assert evidence.completion_line == ""
     assert evidence.has_durable_start is False
+    assert evidence.status == "unknown"
+
+
+def test_durable_task_engine_ignores_android_dropbox_crash_report_pid():
+    engine = DurableTaskEngine()
+    evidence = engine.evidence_from_text(
+        "=== OUTPUT START ===\n"
+        "__BEGIN__\n"
+        "Process: com.google.android.play.games\n"
+        "PID: 1921\n"
+        "UID: 10078\n"
+        "Flags: 0x20cbbe44\n"
+        "Package: com.google.android.play.games v391890040\n"
+        "Foreground: No\n"
+        "Process-Runtime: 6524\n"
+        "Build: alps/gemini/gemini:12/SP1A.210812.016/1753073604:user/release-keys\n"
+        "Loading-Progress: 1.0\n"
+        "\n"
+        "java.lang.SecurityException: addOnPermissionsChangeListener\n"
+        "\tat android.os.Parcel.createException(Parcel.java:2426)\n"
+        "__DONE__0\n"
+        "=== OUTPUT END ===\n"
+    )
+
+    assert evidence.pid == ""
+    assert evidence.has_durable_start is False
+    assert evidence.completion_line == ""
+    assert evidence.stats_line == ""
+    assert evidence.running_line == ""
     assert evidence.status == "unknown"
 
 
