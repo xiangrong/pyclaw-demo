@@ -175,6 +175,201 @@ def test_incomplete_agent_response_is_not_success():
     assert not _is_incomplete_agent_response("# 今日早报\n\n这里是完整结果。")
 
 
+def test_cron_treats_process_only_continuation_as_incomplete():
+    from pyclaw.cron.scheduler import _is_incomplete_agent_response
+
+    task_text = (
+        "每日10点执行该任务：获取至少10个 GitHub LLM Agent 热门项目的仓库URL、"
+        "当前star总数、官方简介、仓库链接，并整理为热榜列表。"
+    )
+
+    assert _is_incomplete_agent_response("继续提取剩余热门项目的详细信息。", task_text)
+    assert _is_incomplete_agent_response("我将继续获取热门项目的详细信息，为您整理完整的热榜。", task_text)
+    assert _is_incomplete_agent_response(
+        "✅ 已成功手动触发每日10点LLM/Agent GitHub热榜推送任务，执行完成后会自动将最新的热门项目榜单推送到当前会话，请稍等~",
+        task_text,
+    )
+    assert not _is_incomplete_agent_response(
+        "# GitHub AI Agent 热榜\n\n"
+        "1. OpenHands — 82.4k Stars — AI-Driven Development — https://github.com/All-Hands-AI/OpenHands\n"
+        "2. Agent-Reach — 61.4k Stars — Give your AI agent eyes — https://github.com/Panniantong/Agent-Reach",
+        task_text,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_job_with_agent_uses_fresh_session_per_run(monkeypatch):
+    from pyclaw.core.message import Message, MessageRole, MessageType
+    from pyclaw.core.session import Session
+    from pyclaw.cron import scheduler
+
+    class DummySessions:
+        def __init__(self):
+            self.calls = []
+
+        async def get_or_create(self, channel, user_id):
+            self.calls.append((channel, user_id))
+            return Session(session_id=f"session-{user_id}", user_id=user_id, channel=channel)
+
+    class DummyAgent:
+        def __init__(self):
+            self.sessions = DummySessions()
+            self.messages = []
+
+        async def process_message(self, message):
+            self.messages.append(message)
+            return Message(
+                id=f"response-{message.id}",
+                channel=message.channel,
+                channel_user_id=message.channel_user_id,
+                session_id=message.session_id,
+                type=MessageType.TEXT,
+                role=MessageRole.ASSISTANT,
+                content="# 今日热榜\n\n1. OpenHands — 82.4k Stars — https://github.com/All-Hands-AI/OpenHands",
+            )
+
+    ids = iter(["cron_12f7d94f_100", "cron_12f7d94f_200"])
+    monkeypatch.setattr(scheduler, "_new_cron_run_session_id", lambda job_id: next(ids))
+    agent = DummyAgent()
+    job = {
+        "id": "12f7d94f",
+        "prompt": "获取 GitHub LLM Agent 热门项目的仓库URL和当前star总数，整理为热榜列表。",
+        "origin": {"platform": "telegram"},
+    }
+
+    first = await scheduler.run_job_with_agent(job, agent)
+    second = await scheduler.run_job_with_agent(job, agent)
+
+    assert first[0] is True
+    assert second[0] is True
+    assert agent.sessions.calls == [
+        ("cron", "job_12f7d94f_100"),
+        ("cron", "job_12f7d94f_200"),
+    ]
+    assert [message.session_id for message in agent.messages] == [
+        "cron_12f7d94f_100",
+        "cron_12f7d94f_200",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_job_with_agent_retries_incomplete_process_only_final(monkeypatch):
+    from pyclaw.core.message import Message, MessageRole, MessageType
+    from pyclaw.core.session import Session
+    from pyclaw.cron import scheduler
+
+    class DummySessions:
+        def __init__(self):
+            self.calls = []
+
+        async def create_session(self, session_id, user_id="default", channel="internal"):
+            self.calls.append((session_id, channel, user_id))
+            return Session(session_id=session_id, user_id=user_id, channel=channel)
+
+    class DummyAgent:
+        def __init__(self):
+            self.sessions = DummySessions()
+            self.messages = []
+            self.responses = [
+                "继续提取剩余热门项目的详细信息。",
+                "# GitHub LLM Agent 热榜\n\n"
+                "1. OpenHands — 82.4k Stars — https://github.com/All-Hands-AI/OpenHands\n"
+                "2. LangGraph — 17.2k Stars — https://github.com/langchain-ai/langgraph",
+            ]
+
+        async def process_message(self, message):
+            self.messages.append(message)
+            return Message(
+                id=f"response-{message.id}",
+                channel=message.channel,
+                channel_user_id=message.channel_user_id,
+                session_id=message.session_id,
+                type=MessageType.TEXT,
+                role=MessageRole.ASSISTANT,
+                content=self.responses.pop(0),
+            )
+
+    monkeypatch.setattr(scheduler, "CRON_MAX_RESULT_ATTEMPTS", 2)
+    ids = iter(["cron_12f7d94f_100", "cron_12f7d94f_200"])
+    monkeypatch.setattr(scheduler, "_new_cron_run_session_id", lambda job_id: next(ids))
+    agent = DummyAgent()
+    job = {
+        "id": "12f7d94f",
+        "prompt": "获取 GitHub LLM Agent 热门项目的仓库URL和当前star总数，整理为热榜列表。",
+        "origin": {"platform": "telegram"},
+    }
+
+    success, full_output, final_response, error = await scheduler.run_job_with_agent(job, agent)
+
+    assert success is True
+    assert error is None
+    assert "OpenHands" in final_response
+    assert len(agent.messages) == 2
+    assert [message.session_id for message in agent.messages] == [
+        "cron_12f7d94f_100",
+        "cron_12f7d94f_200",
+    ]
+    assert "【结果纠正尝试 2/2】" in agent.messages[1].content
+    assert "上一轮不合格输出" in agent.messages[1].content
+    assert "继续提取剩余热门项目" in agent.messages[1].content
+    assert "Attempts:" in full_output
+    assert "1: incomplete" in full_output
+    assert "2: delivered" in full_output
+
+
+@pytest.mark.asyncio
+async def test_run_job_with_agent_fails_after_repeated_incomplete_finals(monkeypatch):
+    from pyclaw.core.message import Message, MessageRole, MessageType
+    from pyclaw.core.session import Session
+    from pyclaw.cron import scheduler
+
+    class DummySessions:
+        async def create_session(self, session_id, user_id="default", channel="internal"):
+            return Session(session_id=session_id, user_id=user_id, channel=channel)
+
+    class DummyAgent:
+        def __init__(self):
+            self.sessions = DummySessions()
+            self.messages = []
+            self.responses = [
+                "继续提取剩余热门项目的详细信息。",
+                "我将继续获取热门项目的详细信息，为您整理完整的热榜。",
+            ]
+
+        async def process_message(self, message):
+            self.messages.append(message)
+            return Message(
+                id=f"response-{message.id}",
+                channel=message.channel,
+                channel_user_id=message.channel_user_id,
+                session_id=message.session_id,
+                type=MessageType.TEXT,
+                role=MessageRole.ASSISTANT,
+                content=self.responses.pop(0),
+            )
+
+    monkeypatch.setattr(scheduler, "CRON_MAX_RESULT_ATTEMPTS", 2)
+    ids = iter(["cron_12f7d94f_100", "cron_12f7d94f_200"])
+    monkeypatch.setattr(scheduler, "_new_cron_run_session_id", lambda job_id: next(ids))
+    agent = DummyAgent()
+    job = {
+        "id": "12f7d94f",
+        "prompt": "获取 GitHub LLM Agent 热门项目的仓库URL和当前star总数，整理为热榜列表。",
+        "origin": {"platform": "telegram"},
+    }
+
+    success, full_output, final_response, error = await scheduler.run_job_with_agent(job, agent)
+
+    assert success is False
+    assert len(agent.messages) == 2
+    assert "attempt 2/2" in (error or "")
+    assert "我将继续获取热门项目" in final_response
+    assert "Attempts:" in full_output
+    assert "1: incomplete" in full_output
+    assert "2: incomplete" in full_output
+    assert "2: delivered" not in full_output
+
+
 def test_sanitize_cron_final_response_removes_internal_notices():
     from pyclaw.cron.scheduler import _sanitize_cron_final_response
 

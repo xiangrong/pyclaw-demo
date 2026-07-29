@@ -37,6 +37,7 @@ CRON_TOTAL_TIMEOUT_SECONDS = int(os.getenv("PYCLAW_CRON_TOTAL_TIMEOUT_SECONDS", 
 CRON_INACTIVITY_TIMEOUT_SECONDS = int(os.getenv("PYCLAW_CRON_INACTIVITY_TIMEOUT_SECONDS", "120"))
 CRON_SOFT_DEADLINE_SECONDS = int(os.getenv("PYCLAW_CRON_SOFT_DEADLINE_SECONDS", "480"))
 CRON_MAX_ITERATIONS = int(os.getenv("PYCLAW_CRON_MAX_ITERATIONS", "90"))
+CRON_MAX_RESULT_ATTEMPTS = max(1, int(os.getenv("PYCLAW_CRON_MAX_RESULT_ATTEMPTS", "3")))
 CRON_STOP_MARKERS = (
     "工具调用次数过多",
     "工具重复调用过多",
@@ -49,6 +50,9 @@ CRON_STOP_MARKERS = (
     "LLM 调用出错",
     "模型请求连续超时",
     "模型请求超时",
+    "大模型返回了空响应",
+    "返回了空响应",
+    "未生成有效内容",
 )
 ANSWER_QUALITY_GATE = AnswerQualityGate()
 
@@ -197,80 +201,86 @@ async def run_job_with_agent(
         origin = job.get("origin", {})
         platform = str(origin.get("platform", "")).lower()
 
-        # 创建任务专用的独立会话（不要用户普通会话的历史上下文）
-        # 避免会话历史干扰，让Agent专注于执行当前任务prompt。
-        # channel/user_id 也必须使用 cron 专用值；SessionManager 以
-        # channel:user_id 作为真实会话 key，不能复用 Telegram 用户会话。
-        cron_session_id = f"cron_{job_id}_{int(time.time())}"
+        attempts: list[dict[str, str]] = []
+        previous_final: str = ""
+        previous_error: str = ""
+        last_final_response = ""
+        last_error: Optional[str] = None
+        max_attempts = max(1, CRON_MAX_RESULT_ATTEMPTS)
 
-        # 创建消息（用独立的cron会话，干净的上下文）
-        # 在prompt前加强制前缀，明确告诉Agent这是定时任务执行
-        run_time_instruction = _run_time_instruction()
-        research_instruction = _research_policy_instruction(prompt)
-        cron_prompt = (
-            "【定时任务执行 - 请只执行以下任务，不要创建新任务，不要回复关于任务本身的说明】\n"
-            f"{run_time_instruction}"
-            "硬性限制：优先使用少量高可信来源；先找权威来源，再抽取正文或结构化数据，最后交叉核对；"
-            "多页面读取优先用 web_extract 一次读取，避免反复调用 web_read；"
-            "terminal、cronjob、发邮件、发消息、写文件等有副作用工具在本任务中最多执行一次。"
-            "如果信息不足，请明确标注待确认，不要编造，也不要继续无限搜索。"
-            "最终回复不得提及工具调用、执行时限、预算、超时、guardrail、内部错误或邮件发送失败；"
-            "实时新闻/体育赛事只能输出已确认信息，未确认的比分、进球、黄牌、换人不要编造。\n\n"
-            f"{research_instruction}\n"
-            f"{_delivery_style_instruction(platform)}\n\n"
-            f"{prompt}"
-        )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                cron_session_id = _new_cron_run_session_id(job_id)
+                cron_run_user_id = f"job_{job_id}_{cron_session_id.rsplit('_', 1)[-1]}"
+                cron_message_id = f"cron-{job_id}-{cron_session_id.rsplit('_', 1)[-1]}"
+                cron_prompt = _build_cron_prompt(
+                    prompt=prompt,
+                    platform=platform,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    previous_final=previous_final,
+                    previous_error=previous_error,
+                )
+                message = _build_cron_message(
+                    job_id=job_id,
+                    cron_message_id=cron_message_id,
+                    cron_run_user_id=cron_run_user_id,
+                    cron_session_id=cron_session_id,
+                    cron_prompt=cron_prompt,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
 
-        message = Message(
-            id=f"cron-{job_id}",
-            channel="cron",
-            channel_user_id=f"job_{job_id}",
-            session_id=cron_session_id,  # 任务专用会话
-            type=MessageType.TEXT,
-            role=MessageRole.USER,
-            content=cron_prompt,
-            metadata={
-                "soft_deadline_seconds": CRON_SOFT_DEADLINE_SECONDS,
-                "total_timeout_seconds": CRON_TOTAL_TIMEOUT_SECONDS,
-                "inactivity_timeout_seconds": CRON_INACTIVITY_TIMEOUT_SECONDS,
-                "max_iterations": CRON_MAX_ITERATIONS,
-                # Cron tasks are synthetic wrapper executions and are delivered
-                # by the scheduler as text.  They must not enter the channel
-                # artifact-delivery completion workflow unless a future cron
-                # feature explicitly opts in; otherwise wrapper wording can be
-                # mistaken for a file/webpage request and synthesize index.html.
-                "disable_completion_contracts": True,
-            },
-        )
+                # 执行。每次 result attempt 都用全新的 channel/user/session 组合，
+                # 避免一次失败后的历史摘要、旧工具 observation 或“继续”状态污染下一次纠正。
+                session = await _prepare_cron_session(agent, message, job_id, attempt, max_attempts)
+                response = await agent.process_message(message)
 
-        # 执行
-        session = await agent.sessions.get_or_create(
-            channel=message.channel,
-            user_id=message.channel_user_id,
-        )
-        session.metadata["soft_deadline_seconds"] = CRON_SOFT_DEADLINE_SECONDS
-        session.metadata["total_timeout_seconds"] = CRON_TOTAL_TIMEOUT_SECONDS
-        session.metadata["inactivity_timeout_seconds"] = CRON_INACTIVITY_TIMEOUT_SECONDS
-        session.metadata["max_iterations"] = max(int(session.metadata.get("max_iterations", 0) or 0), CRON_MAX_ITERATIONS)
-        session.metadata["cron_job_id"] = job_id
-        session.metadata["disable_completion_contracts"] = True
+                # 获取响应内容
+                if hasattr(response, 'content'):
+                    final_response = response.content
+                else:
+                    final_response = str(response)
 
-        response = await agent.process_message(message)
+                final_response = _sanitize_cron_final_response(final_response, platform)
+                last_final_response = final_response
+                attempts.append({
+                    "attempt": str(attempt),
+                    "session_id": session.session_id,
+                    "response": final_response,
+                    "error": "",
+                    "status": "candidate",
+                })
 
-        # 获取响应内容
-        if hasattr(response, 'content'):
-            final_response = response.content
-        else:
-            final_response = str(response)
+                if not _is_incomplete_agent_response(final_response, cron_prompt):
+                    attempts[-1]["status"] = "delivered"
+                    full_output = _format_cron_full_output(job_id, prompt, final_response, attempts)
+                    return True, full_output, final_response, None
 
-        final_response = _sanitize_cron_final_response(final_response, platform)
-        full_output = f"# Cron Job Execution: {job_id}\n\nPrompt: {prompt}\n\nResponse: {final_response}"
-        error = None
-        success = True
-        if _is_incomplete_agent_response(final_response, cron_prompt):
-            success = False
-            error = "Agent stopped before producing a complete cron result"
-        return success, full_output, final_response, error
+                attempts[-1]["status"] = "incomplete"
+                last_error = _cron_incomplete_error(final_response, attempt, max_attempts)
+                previous_final = final_response
+                previous_error = last_error
+                logger.warning("Cron job %s attempt %d/%d incomplete: %s", job_id, attempt, max_attempts, last_error)
+            except Exception as attempt_error:
+                last_error = f"Attempt {attempt}/{max_attempts} execution error: {attempt_error}"
+                previous_error = last_error
+                attempts.append({
+                    "attempt": str(attempt),
+                    "session_id": "",
+                    "response": "",
+                    "error": last_error,
+                    "status": "error",
+                })
+                logger.exception("Cron job %s attempt %d/%d failed", job_id, attempt, max_attempts)
+
+            if attempt < max_attempts:
+                continue
+
+        if not last_error:
+            last_error = f"Agent stopped before producing a complete cron result after {max_attempts} attempt(s)"
+        full_output = _format_cron_full_output(job_id, prompt, last_final_response or last_error, attempts)
+        return False, full_output, last_final_response or last_error, last_error
 
     except Exception as e:
         error = f"Execution error: {e}"
@@ -284,6 +294,178 @@ def _is_incomplete_agent_response(content: str, task_text: str = "") -> bool:
         content,
         task_text=task_text,
     )
+
+
+def _build_cron_prompt(
+    *,
+    prompt: str,
+    platform: str,
+    attempt: int = 1,
+    max_attempts: int = 1,
+    previous_final: str = "",
+    previous_error: str = "",
+) -> str:
+    """Build a self-contained cron execution prompt for one isolated attempt."""
+    run_time_instruction = _run_time_instruction()
+    research_instruction = _research_policy_instruction(prompt)
+    repair_instruction = _cron_result_repair_instruction(
+        attempt=attempt,
+        max_attempts=max_attempts,
+        previous_final=previous_final,
+        previous_error=previous_error,
+    )
+    return (
+        "【定时任务执行 - 请只执行以下任务，不要创建新任务，不要回复关于任务本身的说明】\n"
+        f"{run_time_instruction}"
+        "硬性限制：优先使用少量高可信来源；先找权威来源，再抽取正文或结构化数据，最后交叉核对；"
+        "多页面读取优先用 web_extract 一次读取，避免反复调用 web_read；"
+        "terminal、cronjob、发邮件、发消息、写文件等有副作用工具在本任务中最多执行一次。"
+        "如果信息不足，请明确标注待确认，不要编造，也不要继续无限搜索。"
+        "最终回复不得提及工具调用、执行时限、预算、超时、guardrail、内部错误或邮件发送失败；"
+        "实时新闻/体育赛事只能输出已确认信息，未确认的比分、进球、黄牌、换人不要编造。\n\n"
+        f"{research_instruction}\n"
+        f"{repair_instruction}"
+        f"{_delivery_style_instruction(platform)}\n\n"
+        f"{prompt}"
+    )
+
+
+def _build_cron_message(
+    *,
+    job_id: str,
+    cron_message_id: str,
+    cron_run_user_id: str,
+    cron_session_id: str,
+    cron_prompt: str,
+    attempt: int,
+    max_attempts: int,
+) -> Message:
+    """Create the synthetic cron user message for one result attempt."""
+    return Message(
+        id=cron_message_id,
+        channel="cron",
+        channel_user_id=cron_run_user_id,
+        session_id=cron_session_id,  # 任务专用会话
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content=cron_prompt,
+        metadata={
+            "soft_deadline_seconds": CRON_SOFT_DEADLINE_SECONDS,
+            "total_timeout_seconds": CRON_TOTAL_TIMEOUT_SECONDS,
+            "inactivity_timeout_seconds": CRON_INACTIVITY_TIMEOUT_SECONDS,
+            "max_iterations": CRON_MAX_ITERATIONS,
+            "cron_job_id": job_id,
+            "cron_attempt": attempt,
+            "cron_max_attempts": max_attempts,
+            # Cron tasks are synthetic wrapper executions and are delivered
+            # by the scheduler as text.  They must not enter the channel
+            # artifact-delivery completion workflow unless a future cron
+            # feature explicitly opts in; otherwise wrapper wording can be
+            # mistaken for a file/webpage request and synthesize index.html.
+            "disable_completion_contracts": True,
+        },
+    )
+
+
+async def _prepare_cron_session(agent: Any, message: Message, job_id: str, attempt: int, max_attempts: int) -> Any:
+    """Create or load an isolated cron session and attach execution budgets."""
+    if hasattr(agent.sessions, "create_session"):
+        session = await agent.sessions.create_session(
+            message.session_id,
+            user_id=message.channel_user_id,
+            channel=message.channel,
+        )
+    else:
+        session = await agent.sessions.get_or_create(
+            channel=message.channel,
+            user_id=message.channel_user_id,
+        )
+    session.metadata["soft_deadline_seconds"] = CRON_SOFT_DEADLINE_SECONDS
+    session.metadata["total_timeout_seconds"] = CRON_TOTAL_TIMEOUT_SECONDS
+    session.metadata["inactivity_timeout_seconds"] = CRON_INACTIVITY_TIMEOUT_SECONDS
+    session.metadata["max_iterations"] = max(int(session.metadata.get("max_iterations", 0) or 0), CRON_MAX_ITERATIONS)
+    session.metadata["cron_job_id"] = job_id
+    session.metadata["cron_attempt"] = attempt
+    session.metadata["cron_max_attempts"] = max_attempts
+    session.metadata["disable_completion_contracts"] = True
+    return session
+
+
+def _cron_result_repair_instruction(
+    *,
+    attempt: int,
+    max_attempts: int,
+    previous_final: str = "",
+    previous_error: str = "",
+) -> str:
+    """Return generic correction guidance after a failed cron result attempt."""
+    if attempt <= 1:
+        return ""
+
+    previous_bits = []
+    if previous_error:
+        previous_bits.append(f"上一轮失败原因：{_abbreviate_for_repair(previous_error, 220)}")
+    if previous_final:
+        previous_bits.append(f"上一轮不合格输出：{_abbreviate_for_repair(previous_final, 500)}")
+    previous_block = "\n".join(previous_bits)
+    if previous_block:
+        previous_block = previous_block + "\n"
+
+    return (
+        f"【结果纠正尝试 {attempt}/{max_attempts}】\n"
+        f"{previous_block}"
+        "上一轮没有产出可投递的业务结果。本轮必须重新执行当前定时任务并直接交付结果；"
+        "不要说“继续/正在/稍后/执行完成后推送/我将获取/我会整理”等过程话术。"
+        "如果无法完全核验，输出已确认子集和极短的待核验说明；不要把过程声明当最终答案。"
+        "最终答案必须包含用户请求的核心交付物，例如名称、数量、状态、链接、数据点、原因或结论。\n\n"
+    )
+
+
+def _cron_incomplete_error(final_response: str, attempt: int, max_attempts: int) -> str:
+    """Return a readable, channel-safe reason for an incomplete cron answer."""
+    compact = " ".join(str(final_response or "").split())
+    if compact:
+        compact = _abbreviate_for_repair(compact, 180)
+        return f"Agent produced an incomplete cron result on attempt {attempt}/{max_attempts}: {compact}"
+    return f"Agent produced an empty cron result on attempt {attempt}/{max_attempts}"
+
+
+def _format_cron_full_output(
+    job_id: str,
+    prompt: str,
+    final_response: str,
+    attempts: list[dict[str, str]],
+) -> str:
+    """Format persisted cron output with compact attempt diagnostics."""
+    output = f"# Cron Job Execution: {job_id}\n\nPrompt: {prompt}\n\nResponse: {final_response}"
+    if len(attempts) <= 1:
+        return output
+
+    attempt_lines = ["", "Attempts:"]
+    for item in attempts:
+        attempt = item.get("attempt", "?")
+        error = item.get("error") or ""
+        response = item.get("response") or ""
+        status = item.get("status") or ("error" if error else "candidate")
+        detail = error or _abbreviate_for_repair(response, 180)
+        if detail:
+            attempt_lines.append(f"- {attempt}: {status} - {detail}")
+        else:
+            attempt_lines.append(f"- {attempt}: {status}")
+    return output + "\n" + "\n".join(attempt_lines)
+
+
+def _abbreviate_for_repair(text: str, limit: int) -> str:
+    """Compact text for internal repair prompts and persisted diagnostics."""
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _new_cron_run_session_id(job_id: str) -> str:
+    """Return a unique per-run session id for one cron job."""
+    return f"cron_{job_id}_{time.time_ns()}"
 
 
 def _sanitize_cron_final_response(content: str, platform: str = "") -> str:

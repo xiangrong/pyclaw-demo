@@ -81,13 +81,41 @@ class AnswerQualityGate:
     )
     _REQUEST_DELIVERABLE_RE = re.compile(
         r"比分|赛果|赛程|结果|价格|金额|费用|报价|汇率|版本|发布时间|日期|时间|地点|链接|地址|"
-        r"名单|排名|数量|状态|进度|红黄牌|进球|助攻|score|scores|result|results|schedule|fixture|"
-        r"price|cost|rate|version|date|time|link|url|status|count|ranking|release",
+        r"名单|排名|数量|状态|进度|红黄牌|进球|助攻|仓库|星标|涨幅|热榜|热门|"
+        r"score|scores|result|results|schedule|fixture|repo|repository|star|stars|fork|forks|"
+        r"price|cost|rate|version|date|time|link|url|status|count|ranking|release|trending|hot",
         re.IGNORECASE,
     )
     _LIVE_OR_RESEARCH_RE = re.compile(
-        r"最新|今日|今天|昨天|明天|当前|实时|最近|新闻|消息|动态|查询|查一下|整理|汇总|早报|晚报|"
-        r"latest|current|today|yesterday|tomorrow|live|news|recent|report|summary|lookup",
+        r"最新|今日|今天|昨天|明天|当前|实时|最近|近\s*24\s*小时|过去\s*24\s*小时|新闻|消息|动态|"
+        r"查询|查一下|整理|汇总|早报|晚报|热门|热榜|涨幅|排行榜|排名|"
+        r"latest|current|today|yesterday|tomorrow|live|news|recent|report|summary|lookup|trending|hot",
+        re.IGNORECASE,
+    )
+    _PROCESS_ONLY_START_RE = re.compile(
+        r"^(?:"
+        r"继续|正在|准备|开始|稍后|马上|待会儿?|后续|下一步|接下来|"
+        r"现在(?:我)?(?:来|将|会|正在)?|我(?:将|会|来|先|直接|继续|正在|准备)|"
+        r"先|已(?:成功)?(?:手动)?触发"
+        r")",
+        re.IGNORECASE,
+    )
+    _PROCESS_ONLY_VERB_RE = re.compile(
+        r"继续|正在|准备|开始|提取|获取|搜索|查询|读取|爬取|整理|完善|生成|创建|执行|触发|"
+        r"分析|调研|核对|补充|推送|抓取|调用|extract|fetch|search|crawl|read|analy[sz]e|"
+        r"continue|proceed|working|will|going to",
+        re.IGNORECASE,
+    )
+    _DEFERRED_COMPLETION_RE = re.compile(
+        r"(?:执行完成后|整理完成后|完成后|稍后|马上|待会儿?|后续).{0,40}(?:推送|发送|回复|给你|通知)|"
+        r"(?:will|after it completes|once complete).{0,60}(?:send|notify|reply|deliver)",
+        re.IGNORECASE,
+    )
+    _DELIVERABLE_EVIDENCE_RE = re.compile(
+        r"https?://|github\.com|\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\b|"
+        r"(?:价格|报价|比分|赛果|版本|链接|地址|状态|Star|Stars|Fork|Forks|涨幅|项目|仓库|排名|数量)\s*[:：]\s*\S|"
+        r"\b\d+(?:\.\d+)?\s*(?:k|m|stars?|forks?|%|元|美元|usd|cny)\b|"
+        r"\b\d+\s*[-:]\s*\d+\b",
         re.IGNORECASE,
     )
     _TASK_CURRENT_DATE_RES = (
@@ -121,6 +149,18 @@ class AnswerQualityGate:
             return AnswerQualityDecision("allow")
 
         issues: list[AnswerQualityIssue] = []
+        process_only = self._process_only_final(task_text, draft)
+        if process_only:
+            issues.append(
+                AnswerQualityIssue(
+                    code="process_only_final",
+                    message=(
+                        "The draft is only a progress/continuation statement and does not deliver the requested result."
+                    ),
+                    evidence=tuple(process_only),
+                )
+            )
+
         unresolved = self._unresolved_requested_facts(task_text, draft)
         if unresolved:
             issues.append(
@@ -171,9 +211,44 @@ class AnswerQualityGate:
         """Return True for stored cron/user-visible responses that should not count as complete."""
         if not content:
             return True
+        if self._process_only_final(task_text, content):
+            return True
         if task_text:
             return self.evaluate(task_text=task_text, draft=content, used_research_tools=True).needs_repair
         return bool(self._uncertain_completed_lines(content))
+
+    def _process_only_final(self, task_text: str, draft: str) -> list[str]:
+        """Detect short progress/continuation text masquerading as a final answer.
+
+        Cron and channel deliveries must contain the business result, not a plan
+        such as "继续提取..." or "整理完成后推送".  Keep this heuristic
+        evidence-based: only short drafts with process verbs and no concrete
+        deliverable facts are rejected, so normal summaries that happen to use
+        words like "整理" remain valid.
+        """
+        compact = _strip_leading_markers(_compact(draft))
+        if not compact:
+            return []
+
+        lines = _logical_lines(draft)
+        if self._has_deliverable_evidence(draft):
+            return []
+        if len(compact) > 240 or len(lines) > 3:
+            return []
+
+        task_requires_result = (
+            not task_text
+            or self._looks_like_live_factual_task(task_text)
+            or self._requests_concrete_facts(task_text)
+        )
+        if not task_requires_result:
+            return []
+
+        if self._DEFERRED_COMPLETION_RE.search(compact):
+            return [compact]
+        if self._PROCESS_ONLY_START_RE.search(compact) and self._PROCESS_ONLY_VERB_RE.search(compact):
+            return [compact]
+        return []
 
     def _unresolved_requested_facts(self, task_text: str, draft: str) -> list[str]:
         if not self._requests_concrete_facts(task_text):
@@ -292,6 +367,23 @@ class AnswerQualityGate:
             return False
         return bool(self._REQUEST_DELIVERABLE_RE.search(line) or self._COMPLETED_STATUS_RE.search(line))
 
+    def _has_deliverable_evidence(self, text: str) -> bool:
+        if self._DELIVERABLE_EVIDENCE_RE.search(text or ""):
+            return True
+        substantive_lines = [
+            _strip_leading_markers(_compact(line))
+            for line in _logical_lines(text)
+        ]
+        substantive_lines = [
+            line
+            for line in substantive_lines
+            if len(line) >= 12 and not (
+                self._PROCESS_ONLY_START_RE.search(line)
+                and self._PROCESS_ONLY_VERB_RE.search(line)
+            )
+        ]
+        return len(substantive_lines) >= 3
+
 
 def _logical_lines(text: str) -> list[str]:
     """Split markdown-ish content into lines while preserving table rows/items."""
@@ -305,6 +397,10 @@ def _logical_lines(text: str) -> list[str]:
 
 def _compact(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _strip_leading_markers(text: str) -> str:
+    return str(text or "").lstrip(" \t\r\n-*#>0123456789.、):：）】]✅⚠️🔥🚀📌⏰📊🏆")
 
 
 def _dedupe(items: Iterable[str]) -> list[str]:
