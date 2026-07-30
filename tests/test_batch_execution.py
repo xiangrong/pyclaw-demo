@@ -897,6 +897,48 @@ def test_operational_contract_requires_detail_rows_for_generic_summary_only():
     assert "/Users/bytedance/.pyclaw/service_health_results.csv" in notice
 
 
+def test_final_coverage_gate_blocks_generic_wrong_target_item_rows():
+    service = BatchExecutionService()
+    latest_task = (
+        "批量检查这些服务的健康状态\n"
+        "user-api\n"
+        "pay-api\n"
+        "search-api"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: cd /Users/bytedance/.pyclaw && python3 batch_health.py service_health_input.txt 2>&1\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "[1/3] user-api: OK\n"
+            "[2/3] pay-api: OK\n"
+            "[3/3] cache-api: OK\n"
+            "处理完成！成功: 3, 失败: 0\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    incomplete = service.final_from_observations(
+        latest_task=latest_task,
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+    notice = service.operational_contract_repair_notice(decision)
+
+    assert final == ""
+    assert not decision.ready
+    assert decision.needs_repair
+    assert decision.reason == "coverage_missing_targets"
+    assert decision.coverage_missing_items["generic_result"] == ("search-api",)
+    assert "结果覆盖缺失项" in incomplete
+    assert "search-api" in incomplete
+    assert "cache-api" in incomplete
+    assert "Final Coverage Gate failed" in notice
+    assert "search-api" in notice
+
+
 def test_operational_contract_finalizes_generic_csv_detail_after_read_file():
     service = BatchExecutionService()
     latest_task = (
@@ -1509,6 +1551,311 @@ def test_operational_contract_combines_model_and_egress_evidence_before_final():
     assert "pod_egress_2_wss_results.csv" in final
 
 
+def test_operational_contract_finalizes_composite_pod_csv_with_both_facets():
+    service = BatchExecutionService()
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/pod_details_final.csv (7 lines)\n"
+            "\n"
+            "pod_id,model,egress_ip,operator,city\n"
+            "7652273671583210290,g3.8c24g三开,解析失败,,\n"
+            "7652273671583193906,g3.8c24g三开,解析失败,,\n"
+            "7667399079500487470,g3.8c24g四开,解析失败,,\n"
+            "7667399079500471086,g3.8c24g四开,解析失败,,\n"
+            "7667399079500454702,g3.8c24g四开,解析失败,,\n"
+            "7667399079500438318,g3.8c24g四开,解析失败,,\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+            "7667399079500471086\n7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+    )
+    incomplete = service.final_from_observations(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+            "7667399079500471086\n7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+    decision = service.evaluate_operational_contract(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+            "7667399079500471086\n7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+    )
+
+    assert not decision.ready
+    assert decision.needs_repair
+    assert decision.retryable_failed_items["pod_egress"] == (
+        "7652273671583210290",
+        "7652273671583193906",
+        "7667399079500487470",
+        "7667399079500471086",
+        "7667399079500454702",
+        "7667399079500438318",
+    )
+    assert final == ""
+    assert "批量任务已完成，但结果未满足完成契约" in incomplete
+    assert "Pod机型与出口IP批量查询完成报告" in incomplete
+    assert "| 7652273671583210290 | g3.8c24g三开 |" in incomplete
+    assert "| 7667399079500438318 | g3.8c24g四开 |" in incomplete
+    assert "| 7652273671583210290 | g3.8c24g三开 | 解析失败 |" in incomplete
+    assert "出口IP查询失败：6 台" in incomplete
+    assert "批量任务已在后台启动" not in incomplete
+
+
+def test_operational_contract_treats_shell_sentinels_as_retryable_failures():
+    service = BatchExecutionService()
+    messages = [
+        _read_file_message(
+            "OBSERVATION from read_file:\n"
+            "File: /Users/bytedance/.pyclaw/pod_model_ip_final.csv (3 lines)\n"
+            "\n"
+            "pod_id,model,ip,org,city,success\n"
+            "7652273671583210290,__BEGIN__,解析失败,,,False\n"
+            "7652273671583193906,__DONE__0,kalama:/ #,,,False\n"
+        )
+    ]
+    latest_task = (
+        "重新查一遍，查询下面pod的型号（getprop ro.product.model）和出口ip\n"
+        "7652273671583210290\n7652273671583193906"
+    )
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    incomplete = service.final_from_observations(
+        latest_task=latest_task,
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.retryable_failed_items["pod_model"] == (
+        "7652273671583210290",
+        "7652273671583193906",
+    )
+    assert "批量任务已完成，但结果未满足完成契约" in incomplete
+    assert "Pod机型与出口IP批量查询完成报告" in incomplete
+    assert "机型查询失败：2 台" in incomplete
+    assert "出口IP查询失败：2 台" in incomplete
+    assert "机型分布" not in incomplete
+    assert "出口IP分布" not in incomplete
+
+
+def test_operational_contract_completed_retryable_failures_default_blocks_but_can_report():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "LOG=/Users/bytedance/.pyclaw/fetch_pod_details_final.log\n"
+            "RESULT=/Users/bytedance/.pyclaw/pod_model_ip_final.csv\n"
+            "pod_id,model,ip,org,city,success\n"
+            "7652273671583210290,未知,未知,,,False\n"
+            "7652273671583193906,未知,未知,,,False\n"
+            "7667399079500487470,未知,未知,,,False\n"
+            "7667399079500471086,未知,未知,,,False\n"
+            "7667399079500454702,未知,未知,,,False\n"
+            "7667399079500438318,未知,未知,,,False\n"
+            "\n"
+            "✅ 查询完成，结果已保存到 /Users/bytedance/.pyclaw/pod_model_ip_final.csv\n"
+        )
+    ]
+    latest_task = (
+        "重新查一遍，查询下面pod的型号（getprop ro.product.model）和出口ip\n"
+        "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+        "7667399079500471086\n7667399079500454702\n7667399079500438318"
+    )
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    incomplete = service.final_from_observations(
+        latest_task=latest_task,
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+
+    assert final == ""
+    assert "批量任务已完成，但结果未满足完成契约" in incomplete
+    assert "Pod机型与出口IP批量查询完成报告" in incomplete
+    assert "机型查询失败：6 台" in incomplete
+    assert "出口IP查询失败：6 台" in incomplete
+    assert "7652273671583210290" in incomplete
+    assert "未能生成结构化摘要" not in incomplete
+
+
+def test_operational_contract_finalizes_chinese_pod_model_egress_log():
+    service = BatchExecutionService()
+    latest_task = (
+        "重新查一遍，查询下面pod的型号（getprop ro.product.model）和出口ip\n"
+        "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+        "7667399079500471086\n7667399079500454702\n7667399079500438318"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "PID=8899\n"
+            "LOG=~/.pyclaw/query_6pods_result.log\n"
+            "开始查询 6 个 Pod...\n"
+            "[1/6] 处理 7652273671583210290...\n"
+            "  ✅ 获取 WSS URL 成功\n"
+            "  ✅ 机型: M2105K81C\n"
+            "  ✅ 出口IP: 111.32.216.74\n"
+            "  ✅ 运营商: AS9808 China Mobile Communications Group Co., Ltd. Beijing\n"
+            "[2/6] 处理 7652273671583193906...\n"
+            "  ✅ 获取 WSS URL 成功\n"
+            "  ✅ 机型: SM-S9160\n"
+            "  ✅ 出口IP: 111.32.216.74\n"
+            "  ✅ 运营商: AS9808 China Mobile Communications Group Co., Ltd. Beijing\n"
+            "[3/6] 处理 7667399079500487470...\n"
+            "  ✅ 获取 WSS URL 成功\n"
+            "  ✅ 机型: SM-S9160\n"
+            "  ✅ 出口IP: 183.60.233.20\n"
+            "  ✅ 运营商: AS4134 CHINANET BACKBONE Shenzhen\n"
+            "[4/6] 处理 7667399079500471086...\n"
+            "  ✅ 获取 WSS URL 成功\n"
+            "  ✅ 机型: SM-S9160\n"
+            "  ✅ 出口IP: 183.60.233.20\n"
+            "  ✅ 运营商: AS4134 CHINANET BACKBONE Shenzhen\n"
+            "[5/6] 处理 7667399079500454702...\n"
+            "  ✅ 获取 WSS URL 成功\n"
+            "  ✅ 机型: aries\n"
+            "  ✅ 出口IP: 167.148.131.203\n"
+            "  ✅ 运营商: AS996 JY Mobile Communications Ashburn\n"
+            "[6/6] 处理 7667399079500438318...\n"
+            "  ✅ 获取 WSS URL 成功\n"
+            "  ✅ 机型: SM-S9160\n"
+            "  ✅ 出口IP: 183.60.233.20\n"
+            "  ✅ 运营商: AS4134 CHINANET BACKBONE Shenzhen\n"
+            "查询完成！\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+
+    assert decision.ready
+    assert not decision.needs_repair
+    assert "批量任务已完成，但结果未满足完成契约" not in final
+    assert "Operational任务完成报告" in final
+    assert "Pod机型：complete，总数 6，成功 6，失败 0" in final
+    assert "Pod出口IP/运营商：complete，总数 6，成功 6，失败 0" in final
+    assert final.count("查询成功：6 台") >= 2
+    assert "| 7652273671583210290 | M2105K81C |" in final
+    assert "| 7652273671583210290 | 111.32.216.74 | AS9808 China Mobile Communications Group Co., Ltd. Beijing |" in final
+    assert "| 7667399079500454702 | aries |" in final
+    assert "| 7667399079500454702 | 167.148.131.203 | AS996 JY Mobile Communications Ashburn |" in final
+
+
+def test_operational_contract_completed_composite_log_without_parsed_facets_blocks_generic_start_final():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "PID=38977\n"
+            "LOG=/Users/bytedance/.pyclaw/fetch_all_pods.log\n"
+            "Processing 7652273671583210290...\n"
+            "  Result: g3.8c24g三开 / 解析失败\n"
+            "Processing 7652273671583193906...\n"
+            "  Result: g3.8c24g三开 / 解析失败\n"
+            "Done. Results saved to /Users/bytedance/.pyclaw/pod_details_final.csv\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n"
+            "7667399079500487470\n7667399079500471086\n"
+            "7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+    )
+    decision = service.evaluate_operational_contract(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n"
+            "7667399079500487470\n7667399079500471086\n"
+            "7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+    )
+
+    assert final == ""
+    assert decision.needs_repair
+    assert set(decision.missing_facets) == {"pod_model", "pod_egress"}
+
+
+def test_operational_contract_parses_completed_composite_processing_log():
+    service = BatchExecutionService()
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "PID=38977\n"
+            "LOG=/Users/bytedance/.pyclaw/fetch_all_pods.log\n"
+            "Processing 7652273671583210290...\n"
+            "  Fetching WSS URL...\n"
+            "  Got WSS URL, fetching IP...\n"
+            "  Result: g3.8c24g三开 / 解析失败\n"
+            "Processing 7652273671583193906...\n"
+            "  Fetching WSS URL...\n"
+            "  Got WSS URL, fetching IP...\n"
+            "  Result: g3.8c24g三开 / 解析失败\n"
+            "Processing 7667399079500487470...\n"
+            "  Fetching WSS URL...\n"
+            "  Got WSS URL, fetching IP...\n"
+            "  Result: g3.8c24g四开 / 解析失败\n"
+            "Processing 7667399079500471086...\n"
+            "  Fetching WSS URL...\n"
+            "  Got WSS URL, fetching IP...\n"
+            "  Result: g3.8c24g四开 / 解析失败\n"
+            "Processing 7667399079500454702...\n"
+            "  Fetching WSS URL...\n"
+            "  Got WSS URL, fetching IP...\n"
+            "  Result: g3.8c24g四开 / 解析失败\n"
+            "Processing 7667399079500438318...\n"
+            "  Fetching WSS URL...\n"
+            "  Got WSS URL, fetching IP...\n"
+            "  Result: g3.8c24g四开 / 解析失败\n"
+            "Done. Results saved to /Users/bytedance/.pyclaw/pod_details_final.csv\n"
+        )
+    ]
+
+    final = service.final_from_observations(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+            "7667399079500471086\n7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+    )
+    incomplete = service.final_from_observations(
+        latest_task=(
+            "查询下面pod的型号和出口ip\n"
+            "7652273671583210290\n7652273671583193906\n7667399079500487470\n"
+            "7667399079500471086\n7667399079500454702\n7667399079500438318"
+        ),
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+
+    assert final == ""
+    assert "批量任务已完成，但结果未满足完成契约" in incomplete
+    assert "Pod机型与出口IP批量查询完成报告" in incomplete
+    assert "| 7652273671583210290 | g3.8c24g三开 |" in incomplete
+    assert "| 7667399079500438318 | g3.8c24g四开 | 解析失败 |" in incomplete
+    assert "出口IP查询失败：6 台" in incomplete
+
+
 def test_operational_contract_requires_retry_for_retryable_item_failures():
     service = BatchExecutionService()
     messages = [
@@ -1597,3 +1944,204 @@ def test_operational_contract_renders_update_image_as_submitted_not_completed():
     assert "升级已完成" not in final
     assert "未观察到后续验证证据" in final
     assert "202607272252076EDBF38393F45F4BD23B" in final
+
+
+def test_operational_contract_finalizes_pod_adb_log_with_item_table():
+    service = BatchExecutionService()
+    latest_task = (
+        "查询下面pod的ADB地址\n"
+        "7667772764296239923\n"
+        "7667772764296223539\n"
+        "7667772764296207155"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -120 /Users/bytedance/.pyclaw/query_29pods_adb_v2.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 3 个 Pod 的 ADB 地址...\n"
+            "[1/3] 处理 7667772764296239923...\n"
+            "  ✅ ADB: 111.32.216.46:10030\n"
+            "[2/3] 处理 7667772764296223539...\n"
+            "  ✅ ADB: 111.32.216.46:10029\n"
+            "[3/3] 处理 7667772764296207155...\n"
+            "  ✅ ADB: 111.32.216.46:10028\n"
+            "查询完成！成功: 3, 失败: 0\n"
+            "\n"
+            "Pod ID                 ADB 地址\n"
+            "--------------------------------------------------------------------------------\n"
+            "7667772764296239923    111.32.216.46:10030\n"
+            "7667772764296223539    111.32.216.46:10029\n"
+            "7667772764296207155    111.32.216.46:10028\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+
+    assert decision.ready
+    assert "Pod ADB地址批量查询完成报告" in final
+    assert "总查询量：3 台" in final
+    assert "查询成功：3 台" in final
+    assert "| 7667772764296239923 | 111.32.216.46:10030 |" in final
+    assert "| 7667772764296223539 | 111.32.216.46:10029 |" in final
+    assert "| 7667772764296207155 | 111.32.216.46:10028 |" in final
+    assert "批量任务已有结果输出" not in final
+
+
+def test_operational_contract_failed_pod_adb_log_returns_retryable_detail_not_summary():
+    service = BatchExecutionService()
+    latest_task = (
+        "查询下面pod的ADB地址\n"
+        "7667772764296239923\n"
+        "7667772764296223539\n"
+        "7667772764296207155"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -120 /Users/bytedance/.pyclaw/query_29pods_adb.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "开始查询 3 个 Pod 的 ADB 地址...\n"
+            "[1/3] 处理 7667772764296239923...\n"
+            "  ❌ 未找到 ADB 地址\n"
+            "[2/3] 处理 7667772764296223539...\n"
+            "  ❌ 未找到 ADB 地址\n"
+            "[3/3] 处理 7667772764296207155...\n"
+            "  ❌ 未找到 ADB 地址\n"
+            "查询完成！成功: 0, 失败: 3\n"
+            "\n"
+            "Pod ID                 ADB 地址\n"
+            "--------------------------------------------------------------------------------\n"
+            "7667772764296239923    ❌ 未找到 ADB 地址\n"
+            "7667772764296223539    ❌ 未找到 ADB 地址\n"
+            "7667772764296207155    ❌ 未找到 ADB 地址\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    incomplete = service.final_from_observations(
+        latest_task=latest_task,
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+
+    assert final == ""
+    assert decision.needs_repair
+    assert decision.retryable_failed_items["pod_adb"] == (
+        "7667772764296239923",
+        "7667772764296223539",
+        "7667772764296207155",
+    )
+    assert "批量任务已完成，但结果未满足完成契约" in incomplete
+    assert "Pod ADB地址批量查询完成报告" in incomplete
+    assert "未找到 ADB 地址" in incomplete
+    assert "批量任务已有结果输出" not in incomplete
+
+
+def test_operational_contract_renders_three_pod_image_update_submission_rows():
+    service = BatchExecutionService()
+    image = "cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr202607282240"
+    latest_task = (
+        f"升级下面三个pod镜像到 {image}\n"
+        "7668229922166463273\n"
+        "7668241538635881225\n"
+        "7668233647811779337"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -120 /Users/bytedance/.pyclaw/batch_update_3pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "🚀 开始批量更新，共 3 台 Pod\n"
+            f"📦 目标镜像: {image}\n"
+            "\n"
+            "[1/3] 处理 Pod: 7668229922166463273\n"
+            "  ✅ 更新成功 | RequestId: None\n"
+            "[2/3] 处理 Pod: 7668241538635881225\n"
+            "  ✅ 更新成功 | RequestId: None\n"
+            "[3/3] 处理 Pod: 7668233647811779337\n"
+            "  ✅ 更新成功 | RequestId: None\n"
+            "\n"
+            "📊 批量更新完成！\n"
+            "   总数: 3\n"
+            "   成功: 3\n"
+            "   失败: 0\n"
+            "\n"
+            "📋 详细结果:\n"
+            "序号    Pod ID                 状态       RequestId\n"
+            "------------------------------------------------------------------------------------------\n"
+            "1     7668229922166463273    ✅ 成功     -\n"
+            "2     7668241538635881225    ✅ 成功     -\n"
+            "3     7668233647811779337    ✅ 成功     -\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+
+    assert "Pod镜像升级请求批量提交完成" in final
+    assert "总提交量：3 台" in final
+    assert "提交成功：3 台" in final
+    assert "提交失败：0 台" in final
+    assert image in final
+    assert "| 7668229922166463273 | 提交成功 | - |" in final
+    assert "| 7668241538635881225 | 提交成功 | - |" in final
+    assert "| 7668233647811779337 | 提交成功 | - |" in final
+    assert "升级已完成" not in final
+    assert "已生效" not in final
+
+
+def test_final_coverage_gate_blocks_partial_image_update_submission_rows():
+    service = BatchExecutionService()
+    image = "cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr202607282240"
+    latest_task = (
+        f"升级下面三个pod镜像到 {image}\n"
+        "7668229922166463273\n"
+        "7668241538635881225\n"
+        "7668233647811779337"
+    )
+    messages = [
+        _terminal_message(
+            "OBSERVATION from terminal:\n"
+            "Command: tail -120 /Users/bytedance/.pyclaw/batch_update_3pods.log\n"
+            "Exit code: 0\n"
+            "STDOUT:\n"
+            "🚀 开始批量更新，共 3 台 Pod\n"
+            f"📦 目标镜像: {image}\n"
+            "\n"
+            "[1/3] 处理 Pod: 7668229922166463273\n"
+            "  ✅ 更新成功 | RequestId: None\n"
+            "\n"
+            "📊 批量更新完成！\n"
+            "   总数: 3\n"
+            "   成功: 3\n"
+            "   失败: 0\n"
+        )
+    ]
+
+    final = service.final_from_observations(latest_task=latest_task, terminal_messages=messages)
+    incomplete = service.final_from_observations(
+        latest_task=latest_task,
+        terminal_messages=messages,
+        allow_incomplete_completed_report=True,
+    )
+    decision = service.evaluate_operational_contract(latest_task=latest_task, terminal_messages=messages)
+    notice = service.operational_contract_repair_notice(decision)
+
+    assert final == ""
+    assert not decision.ready
+    assert decision.needs_repair
+    assert decision.reason == "coverage_missing_targets"
+    assert decision.coverage_missing_items["image_update_submission"] == (
+        "7668241538635881225",
+        "7668233647811779337",
+    )
+    assert "Pod镜像升级请求批量提交完成" not in final
+    assert "结果覆盖缺失项" in incomplete
+    assert "7668241538635881225" in incomplete
+    assert "7668233647811779337" in incomplete
+    assert "Final Coverage Gate failed" in notice

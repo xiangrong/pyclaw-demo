@@ -14,6 +14,7 @@ from pyclaw.core.message import Message, MessageRole
 from pyclaw.core.operational_contract import (
     FACET_GENERIC_RESULT,
     FACET_IMAGE_UPDATE_SUBMISSION,
+    FACET_POD_ADB,
     FACET_POD_EGRESS,
     FACET_POD_MODEL,
     OperationalEvidenceLedger,
@@ -38,12 +39,16 @@ class BatchEvidence(DurableTaskEvidence):
     operator_distribution: tuple[str, ...] = ()
     region_distribution: tuple[str, ...] = ()
     ip_distribution: tuple[str, ...] = ()
+    adb_items: tuple[str, ...] = ()
     model_distribution: tuple[str, ...] = ()
     model_items: tuple[str, ...] = ()
     result_distribution: tuple[str, ...] = ()
     item_results: tuple[str, ...] = ()
     retryable_failed_items: tuple[str, ...] = ()
     structured_report: str = ""
+    adb_structured_report: str = ""
+    model_structured_report: str = ""
+    egress_structured_report: str = ""
 
     @property
     def has_result(self) -> bool:
@@ -122,11 +127,11 @@ class BatchExecutionService:
         "result", "results", "output", "outputs", "summary", "summaries", "report", "reports",
         "batch", "bulk", "query", "queries", "status", "statuses", "health", "version",
         "versions", "model", "models", "egress", "出口", "ip", "ips", "wss", "pod_", "pods_",
-        "service", "account", "job", "ticket", "order", "log", "logs",
+        "adb", "service", "account", "job", "ticket", "order", "log", "logs",
     )
     RESULT_ROW_HEADERS: tuple[str, ...] = (
         "结果", "状态", "健康状态", "版本", "镜像", "机型", "型号", "值", "出口ip", "公网ip",
-        "运营商", "地域", "地区", "result", "status", "state", "health", "version", "image",
+        "adb", "adb地址", "adb 地址", "运营商", "地域", "地区", "result", "status", "state", "health", "version", "image",
         "model", "value", "ip", "public_ip", "egress_ip", "operator", "isp", "region", "location",
     )
     DESKTOP_ONE_SHOT_MARKERS: tuple[str, ...] = (
@@ -608,6 +613,8 @@ class BatchExecutionService:
         rows = self._parse_csv_rows_from_body(text)
         if rows and self._rows_have_result_shape(rows, latest_task=latest_task):
             return True
+        if self._adb_rows_from_terminal_rows(text):
+            return True
         if self._egress_rows_from_terminal_rows(text):
             return True
         if self._generic_item_results_from_terminal_rows(text):
@@ -716,11 +723,15 @@ class BatchExecutionService:
             region_distribution = region_distribution or tuple(structured.get("region_distribution") or ())
             model_distribution = model_distribution or tuple(structured.get("model_distribution") or ())
         ip_distribution = tuple(structured.get("ip_distribution") or ()) if structured else ()
+        adb_items = tuple(structured.get("adb_items") or ()) if structured else ()
         model_items = tuple(structured.get("model_items") or ()) if structured else ()
         result_distribution = tuple(structured.get("result_distribution") or ()) if structured else ()
         item_results = tuple(structured.get("item_results") or ()) if structured else ()
-        retryable_failed_items = self._retryable_failed_items_from_item_results(model_items or item_results)
+        retryable_failed_items = self._retryable_failed_items_from_item_results(model_items or adb_items or item_results)
         structured_report = str(structured.get("structured_report") or "") if structured else ""
+        adb_structured_report = str(structured.get("adb_structured_report") or "") if structured else ""
+        model_structured_report = str(structured.get("model_structured_report") or "") if structured else ""
+        egress_structured_report = str(structured.get("egress_structured_report") or "") if structured else ""
         return BatchEvidence(
             timed_out=durable.timed_out,
             approval_blocked=durable.approval_blocked,
@@ -737,16 +748,26 @@ class BatchExecutionService:
             operator_distribution=operator_distribution,
             region_distribution=region_distribution,
             ip_distribution=ip_distribution,
+            adb_items=adb_items,
             model_distribution=model_distribution,
             model_items=model_items,
             result_distribution=result_distribution,
             item_results=item_results,
             retryable_failed_items=retryable_failed_items,
             structured_report=structured_report,
+            adb_structured_report=adb_structured_report,
+            model_structured_report=model_structured_report,
+            egress_structured_report=egress_structured_report,
             output_excerpt=durable.output_excerpt,
         )
 
-    def final_from_observations(self, *, latest_task: str, terminal_messages: Iterable[Message]) -> str:
+    def final_from_observations(
+        self,
+        *,
+        latest_task: str,
+        terminal_messages: Iterable[Message],
+        allow_incomplete_completed_report: bool = False,
+    ) -> str:
         raw_messages = list(terminal_messages)
         evidence_messages = self._durable_evidence_messages(raw_messages, latest_task=latest_task)
         if not evidence_messages:
@@ -764,7 +785,15 @@ class BatchExecutionService:
             if gate.ready and gate.report:
                 return gate.report
             if gate.needs_repair:
-                if self._should_block_final_for_operational_contract(gate, evidence):
+                if allow_incomplete_completed_report:
+                    incomplete = self._render_incomplete_completed_report(
+                        latest_task=latest_task,
+                        decision=gate,
+                        evidence=evidence,
+                    )
+                    if incomplete:
+                        return incomplete
+                if self._should_block_final_for_operational_contract(gate, evidence) or self._has_terminal_completion_evidence(evidence):
                     return ""
 
         if not self._is_batch_context(latest_task=latest_task, command_text=command_text, joined=joined):
@@ -797,6 +826,75 @@ class BatchExecutionService:
             return "批量任务未确认完成：最近的终端命令超时，且没有观察到 PID、日志或结果文件证据。请检查运行环境后重试。"
         return ""
 
+    def _render_incomplete_completed_report(
+        self,
+        *,
+        latest_task: str,
+        decision: OperationalGateDecision,
+        evidence: BatchEvidence,
+    ) -> str:
+        """Render a user-visible completed-but-unsatisfied report.
+
+        Normal agent turns return an empty final when retryable failures exist so
+        the model can repair the failed facet.  A durable batch monitor cannot
+        safely continue tool work after it has only read a completed artifact;
+        in that delivery path, hide neither the completion evidence nor the
+        concrete failures behind a generic fallback.
+        """
+        if not (self._has_terminal_completion_evidence(evidence) or evidence.is_complete):
+            return ""
+        if not decision.needs_repair:
+            return ""
+
+        lines = [
+            "## ⚠️ 批量任务已完成，但结果未满足完成契约",
+            "",
+            "已观察到任务完成信号；以下是当前可解析结果。该报告不表示全部成功。",
+        ]
+        if latest_task.strip():
+            lines.append(f"- 用户任务：{latest_task.strip().splitlines()[0]}")
+        if decision.missing_facets:
+            missing = "，".join(facet_label(facet) for facet in decision.missing_facets)
+            lines.append(f"- 缺失结果维度：{missing}")
+        if decision.retryable_failed_items:
+            lines.append("- 需要重试/修复的失败项：")
+            for facet, items in decision.retryable_failed_items.items():
+                preview = "，".join(items[:12])
+                more = "..." if len(items) > 12 else ""
+                lines.append(f"  - {facet_label(facet)}：{len(items)} 项（{preview}{more}）")
+        if decision.coverage_missing_items:
+            lines.append("- 结果覆盖缺失项：")
+            for facet, items in decision.coverage_missing_items.items():
+                preview = "，".join(items[:12])
+                more = "..." if len(items) > 12 else ""
+                lines.append(f"  - {facet_label(facet)}：缺少 {len(items)} 项（{preview}{more}）")
+        if evidence.stats_line:
+            lines.append(f"- 汇总：{evidence.stats_line}")
+        if evidence.completion_line and evidence.completion_line != evidence.stats_line:
+            lines.append(f"- 完成信号：{evidence.completion_line}")
+        if evidence.result_path:
+            lines.append(f"- 结果文件：{evidence.result_path}")
+        if evidence.log_path:
+            lines.append(f"- 日志：{evidence.log_path}")
+
+        if evidence.structured_report:
+            lines.extend(["", "---", "", "### 当前已解析结果", "", evidence.structured_report])
+            return "\n".join(lines).strip()
+
+        ledger = decision.ledger
+        if ledger is not None:
+            for facet in ledger.contract.required_facets:
+                facet_evidence = ledger.facets.get(facet)
+                if facet_evidence is None:
+                    continue
+                report = facet_evidence.report or self._fallback_facet_report(facet, facet_evidence)
+                if not report:
+                    continue
+                lines.extend(["", "---", "", f"### {facet_label(facet)}", "", report])
+        elif evidence.output_excerpt:
+            lines.extend(["", "### 关键输出", evidence.output_excerpt])
+        return "\n".join(lines).strip()
+
     def should_repair_operational_contract(
         self,
         *,
@@ -827,6 +925,8 @@ class BatchExecutionService:
         decision: OperationalGateDecision,
         evidence: BatchEvidence,
     ) -> bool:
+        if decision.coverage_missing_items:
+            return True
         if decision.retryable_failed_items:
             return True
         if evidence.is_in_progress:
@@ -840,6 +940,16 @@ class BatchExecutionService:
             facet_evidence.is_complete or facet_evidence.status == "needs_detail"
             for facet_evidence in ledger.facets.values()
         )
+
+    def _has_terminal_completion_evidence(self, evidence: BatchEvidence) -> bool:
+        """Return True when observed output says the durable task finished.
+
+        Missing contract facets after a ``Done``/``查询完成`` line usually mean
+        the controller failed to parse or materialize the final artifact.  Do
+        not fall through to the generic ``has_durable_start`` message in that
+        state; it incorrectly tells the user the task is merely still running.
+        """
+        return bool(evidence.stats_line or evidence.completion_line or evidence.structured_report)
 
     def evaluate_operational_contract(
         self,
@@ -866,6 +976,7 @@ class BatchExecutionService:
 
         ledger = self.operational_ledger_from_messages(contract=contract, messages=evidence_messages)
         missing = ledger.missing_required_facets()
+        coverage_missing = self._coverage_missing_targets(contract, ledger)
         retryable = ledger.retryable_failed_items()
         if missing:
             return OperationalGateDecision(
@@ -873,6 +984,7 @@ class BatchExecutionService:
                 ledger=ledger,
                 ready=False,
                 missing_facets=missing,
+                coverage_missing_items=coverage_missing,
                 retryable_failed_items=retryable,
                 reason="missing_facets",
             )
@@ -881,8 +993,17 @@ class BatchExecutionService:
                 contract=contract,
                 ledger=ledger,
                 ready=False,
+                coverage_missing_items=coverage_missing,
                 retryable_failed_items=retryable,
                 reason="retryable_failures",
+            )
+        if coverage_missing:
+            return OperationalGateDecision(
+                contract=contract,
+                ledger=ledger,
+                ready=False,
+                coverage_missing_items=coverage_missing,
+                reason="coverage_missing_targets",
             )
         report = self._render_operational_contract_report(contract, ledger)
         return OperationalGateDecision(contract=contract, ledger=ledger, ready=True, report=report, reason="ready")
@@ -925,6 +1046,27 @@ class BatchExecutionService:
                 f"{contract.retry_max_attempts} attempts, merge retry results with the original result, and only then report final success/failure. "
                 + " | ".join(retry_chunks)
             )
+        if decision.coverage_missing_items:
+            coverage_chunks = []
+            for facet, items in decision.coverage_missing_items.items():
+                preview = ", ".join(items[:10])
+                more = "..." if len(items) > 10 else ""
+                coverage_chunks.append(f"{facet_label(facet)}: missing {len(items)} requested target(s): {preview}{more}")
+            parts.append(
+                "Final Coverage Gate failed: observed item-level rows do not cover every target requested by the user. "
+                "Do not accept aggregate success counts or a single-item summary as final. "
+                "First read/poll any existing result or log artifact; if the artifact truly lacks those targets, rerun only the missing target(s) for the affected facet(s), merge with existing rows, and final-answer only with per-target rows for all requested targets. "
+                + " | ".join(coverage_chunks)
+            )
+            detail_paths: list[str] = []
+            if decision.ledger is not None:
+                for facet in decision.coverage_missing_items:
+                    evidence = decision.ledger.facets.get(facet)
+                    if evidence:
+                        detail_paths.extend(path for path in (evidence.result_path, evidence.log_path) if path)
+            if detail_paths:
+                paths = ", ".join(dict.fromkeys(detail_paths))
+                parts.append(f"Relevant observed artifact(s) to inspect before rerun: {paths}.")
         if contract.requires_file_batch:
             parts.append(
                 "For multi-item operational work, preserve the file-driven workflow: write the target list to a stable ~/.pyclaw input file, "
@@ -956,6 +1098,8 @@ class BatchExecutionService:
         for msg in messages:
             content = str(getattr(msg, "content", "") or "")
             msg_facets = self._facets_from_observation(content)
+            structured_facets = self._facets_from_structured_evidence(contract=contract, msg=msg)
+            msg_facets = tuple(dict.fromkeys((*msg_facets, *structured_facets)))
             if not msg_facets:
                 fallback_messages.append(msg)
                 continue
@@ -989,6 +1133,25 @@ class BatchExecutionService:
                 facets[facet] = facet_evidence
         return OperationalEvidenceLedger(contract=contract, facets=facets)
 
+    def _facets_from_structured_evidence(
+        self,
+        *,
+        contract: OperationalTaskContract,
+        msg: Message,
+    ) -> tuple[str, ...]:
+        evidence = self.evidence_from_messages([msg])
+        facets: list[str] = []
+        for facet in contract.required_facets:
+            facet_evidence = self._facet_evidence_from_batch_evidence(
+                facet,
+                evidence,
+                [msg],
+                contract=contract,
+            )
+            if facet_evidence is not None:
+                facets.append(facet)
+        return tuple(facets)
+
     def _dedupe_messages(self, messages: Sequence[Message]) -> list[Message]:
         deduped: list[Message] = []
         seen: set[tuple[str, str]] = set()
@@ -1009,7 +1172,15 @@ class BatchExecutionService:
             facets.append(FACET_POD_MODEL)
         if self._has_pod_egress_signal(content):
             facets.append(FACET_POD_EGRESS)
-        if any(marker in normalized for marker in ("update-image", "更新云手机实例镜像", "requestid", "statuscode", "升级镜像")):
+        if self._has_pod_adb_signal(content):
+            facets.append(FACET_POD_ADB)
+        if any(
+            marker in normalized
+            for marker in (
+                "update-image", "更新云手机实例镜像", "requestid", "statuscode",
+                "升级镜像", "目标镜像", "批量更新", "更新成功",
+            )
+        ):
             facets.append(FACET_IMAGE_UPDATE_SUBMISSION)
         return tuple(dict.fromkeys(facets))
 
@@ -1045,6 +1216,13 @@ class BatchExecutionService:
             or "Pod出口IP/运营商批量查询完成报告" in (content or "")
         )
 
+    def _has_pod_adb_signal(self, content: str) -> bool:
+        normalized = (content or "").lower()
+        return bool(
+            any(marker in normalized for marker in ("adb", "android debug bridge", "调试桥"))
+            or "Pod ADB地址批量查询完成报告" in (content or "")
+        )
+
     def _facet_evidence_from_batch_evidence(
         self,
         facet: str,
@@ -1058,6 +1236,10 @@ class BatchExecutionService:
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
             retryable = self._retryable_failed_items_from_item_results(evidence.model_items)
+            if evidence.model_items:
+                total = len(evidence.model_items)
+                failed = len(retryable)
+                success = max(0, total - failed)
             status = "complete"
             if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
                 evidence.model_items,
@@ -1074,18 +1256,23 @@ class BatchExecutionService:
                 failed=failed,
                 result_path=evidence.result_path,
                 log_path=evidence.log_path,
-                report=evidence.structured_report or self._aggregate_facet_report(facet, evidence),
+                report=evidence.model_structured_report or evidence.structured_report or self._aggregate_facet_report(facet, evidence),
                 item_results=evidence.model_items,
                 retryable_failed_items=retryable,
             )
         if facet == FACET_POD_EGRESS:
-            has_egress_report = "Pod出口IP/运营商批量查询完成报告" in evidence.structured_report
+            has_egress_report = bool(evidence.egress_structured_report) or "Pod出口IP/运营商批量查询完成报告" in evidence.structured_report
             has_distribution = bool(evidence.ip_distribution or evidence.operator_distribution or evidence.region_distribution)
             has_completion_summary = bool(evidence.stats_line and (evidence.completion_line or evidence.result_path))
             has_egress_signal = self._has_pod_egress_evidence_signal(messages=messages, evidence=evidence)
             if not has_distribution and not has_egress_report and not (has_egress_signal and has_completion_summary):
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
+            retryable = self._retryable_failed_items_from_item_results(evidence.item_results)
+            if evidence.item_results:
+                total = len(evidence.item_results)
+                failed = len(retryable)
+                success = max(0, total - failed)
             status = "complete"
             if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
                 evidence.item_results,
@@ -1102,14 +1289,61 @@ class BatchExecutionService:
                 failed=failed,
                 result_path=evidence.result_path,
                 log_path=evidence.log_path,
-                report=evidence.structured_report or self._aggregate_facet_report(facet, evidence),
+                report=evidence.egress_structured_report or evidence.structured_report or self._aggregate_facet_report(facet, evidence),
                 item_results=evidence.item_results,
+                retryable_failed_items=retryable,
+            )
+        if facet == FACET_POD_ADB:
+            if not evidence.adb_items and "Pod ADB地址批量查询完成报告" not in evidence.structured_report:
+                return None
+            total, success, failed = self._counts_from_evidence(evidence)
+            retryable = self._retryable_failed_items_from_item_results(evidence.adb_items)
+            if evidence.adb_items:
+                total = len(evidence.adb_items)
+                failed = len(retryable)
+                success = max(0, total - failed)
+            status = "complete"
+            if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
+                evidence.adb_items,
+                total=total,
+                success=success,
+                targets=contract.targets,
+            ):
+                status = "needs_detail"
+            return OperationalFacetEvidence(
+                facet=facet,
+                status=status,
+                total=total,
+                success=success,
+                failed=failed,
+                result_path=evidence.result_path,
+                log_path=evidence.log_path,
+                report=evidence.adb_structured_report or evidence.structured_report or self._aggregate_facet_report(facet, evidence),
+                item_results=evidence.adb_items,
+                retryable_failed_items=retryable,
             )
         if facet == FACET_IMAGE_UPDATE_SUBMISSION:
             rendered = self._render_image_update_submission(messages)
             if not rendered:
                 return None
-            return OperationalFacetEvidence(facet=facet, status="submitted", total=1, success=1, report=rendered)
+            image_rows = self._image_update_rows_from_messages(messages)
+            if image_rows:
+                total = len(image_rows)
+                failed = sum(1 for row in image_rows if self._is_failed_value(row.get("status", "")))
+                success = max(0, total - failed)
+                item_results = tuple(f"{row['pod']}: {row.get('status', '')}" for row in image_rows if row.get("pod"))
+                return OperationalFacetEvidence(
+                    facet=facet,
+                    status="submitted",
+                    total=total,
+                    success=success,
+                    failed=failed,
+                    report=rendered,
+                    item_results=item_results,
+                )
+            status_code = self._jsonish_field("\n".join(str(getattr(msg, "content", "") or "") for msg in messages), "StatusCode")
+            failed = 1 if status_code and status_code != "0" else 0
+            return OperationalFacetEvidence(facet=facet, status="submitted", total=1, success=1 - failed, failed=failed, report=rendered)
         if facet == FACET_GENERIC_RESULT:
             has_completion_summary = bool(evidence.stats_line and (evidence.completion_line or evidence.result_path))
             if not evidence.item_results and not evidence.result_distribution and not evidence.structured_report and not has_completion_summary:
@@ -1161,10 +1395,11 @@ class BatchExecutionService:
         title = {
             FACET_POD_MODEL: "Pod机型批量查询完成报告",
             FACET_POD_EGRESS: "Pod出口IP/运营商批量查询完成报告",
+            FACET_POD_ADB: "Pod ADB地址批量查询完成报告",
             FACET_GENERIC_RESULT: "批量任务完成报告",
         }.get(facet, facet_label(facet))
-        unit = "台" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS} else "条"
-        action = "查询" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS} else "处理"
+        unit = "台" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS, FACET_POD_ADB} else "条"
+        action = "查询" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS, FACET_POD_ADB} else "处理"
 
         lines = [f"## ✅ {title}", "", "### 📊 总体执行情况"]
         if evidence.stats_line:
@@ -1218,6 +1453,77 @@ class BatchExecutionService:
             return False
         return total <= 0 or total > 1
 
+    def _coverage_missing_targets(
+        self,
+        contract: OperationalTaskContract,
+        ledger: OperationalEvidenceLedger,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return requested targets missing from each observed facet's item rows.
+
+        This is the final, domain-neutral coverage gate.  Facet detection and
+        rendering can stay specialized, but no multi-target operational task is
+        complete until every required facet has item-level evidence mentioning
+        each explicit user target.  Aggregate counters such as ``成功: 3`` are
+        deliberately insufficient here: they can only prove that some batch ran,
+        not that the final answer covers the user's exact target set.
+        """
+        targets = self._unique_nonempty_targets(contract.targets)
+        if len(targets) <= 1:
+            return {}
+
+        missing_by_facet: dict[str, tuple[str, ...]] = {}
+        for facet in contract.required_facets:
+            evidence = ledger.facets.get(facet)
+            if evidence is None:
+                continue
+            missing = self._missing_targets_from_item_results(evidence.item_results, targets)
+            if missing:
+                missing_by_facet[facet] = missing
+        return missing_by_facet
+
+    def _unique_nonempty_targets(self, targets: Sequence[str]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(str(target).strip() for target in targets if str(target).strip()))
+
+    def _missing_targets_from_item_results(
+        self,
+        item_results: Sequence[str],
+        targets: Sequence[str],
+    ) -> tuple[str, ...]:
+        rows = [str(row or "").strip() for row in item_results if str(row or "").strip()]
+        unique_targets = self._unique_nonempty_targets(targets)
+        if not unique_targets:
+            return ()
+        if not rows:
+            return unique_targets
+        return tuple(
+            target for target in unique_targets
+            if not any(self._row_mentions_target(row, target) for row in rows)
+        )
+
+    def _row_mentions_target(self, row: str, target: str) -> bool:
+        row_text = str(row or "").strip()
+        target_text = str(target or "").strip()
+        if not row_text or not target_text:
+            return False
+        if row_text == target_text:
+            return True
+        if row_text.startswith(
+            (
+                f"{target_text}:",
+                f"{target_text}：",
+                f"{target_text} |",
+                f"{target_text}\t",
+                f"{target_text} ->",
+                f"{target_text} =>",
+                f"{target_text} ",
+                f"`{target_text}`",
+            )
+        ):
+            return True
+        if self._looks_like_pod_id(target_text):
+            return bool(re.search(rf"(?<!\d){re.escape(target_text)}(?!\d)", row_text))
+        return False
+
     def _has_full_item_detail(
         self,
         item_results: Sequence[str],
@@ -1228,8 +1534,6 @@ class BatchExecutionService:
     ) -> bool:
         if not item_results:
             return False
-        if targets and not self._item_results_cover_targets(item_results, targets):
-            return False
         expected = max(total, success, len(tuple(dict.fromkeys(str(target).strip() for target in targets if str(target).strip()))))
         if expected <= 1:
             return True
@@ -1237,19 +1541,9 @@ class BatchExecutionService:
 
     def _item_results_cover_targets(self, item_results: Sequence[str], targets: Sequence[str]) -> bool:
         rows = [str(row or "").strip() for row in item_results if str(row or "").strip()]
-        if not rows:
-            return False
-        for raw_target in dict.fromkeys(str(target).strip() for target in targets if str(target).strip()):
-            target = str(raw_target).strip()
-            if not any(
-                row == target
-                or row.startswith(f"{target}:")
-                or row.startswith(f"{target} |")
-                or row.startswith(f"{target}\t")
-                for row in rows
-            ):
-                return False
-        return True
+        if not targets:
+            return bool(rows)
+        return not self._missing_targets_from_item_results(item_results, targets)
 
     def _has_pod_egress_evidence_signal(self, *, messages: Sequence[Message], evidence: BatchEvidence) -> bool:
         text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
@@ -1299,11 +1593,12 @@ class BatchExecutionService:
         title = {
             FACET_POD_MODEL: "Pod机型批量查询完成报告",
             FACET_POD_EGRESS: "Pod出口IP/运营商批量查询完成报告",
+            FACET_POD_ADB: "Pod ADB地址批量查询完成报告",
             FACET_GENERIC_RESULT: "批量任务完成报告",
         }.get(facet, facet_label(facet))
         lines = [f"## ✅ {title}", "", "### 📊 总体执行情况"]
         if evidence.total:
-            unit = "台" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS} else "条"
+            unit = "台" if facet in {FACET_POD_MODEL, FACET_POD_EGRESS, FACET_POD_ADB} else "条"
             lines.extend([
                 f"- 总数：{evidence.total} {unit}",
                 f"- 成功：{evidence.success} {unit}",
@@ -1361,26 +1656,72 @@ class BatchExecutionService:
             if not text:
                 continue
             left, _, right = text.partition(":")
-            if self._is_retryable_failed_value(right or text):
+            candidate = right or text
+            primary = self._primary_result_value(candidate)
+            if self._is_retryable_failed_value(primary) or self._is_retryable_failed_value(candidate):
                 failed.append(left.strip() or text)
         return tuple(dict.fromkeys(failed))
+
+    def _primary_result_value(self, value: str) -> str:
+        text = str(value or "").strip()
+        if "|" not in text:
+            return text
+        return text.split("|", 1)[0].strip()
 
     def _is_retryable_failed_value(self, value: str) -> bool:
         normalized = str(value or "").strip().lower()
         if not normalized:
             return True
+        if self._is_shell_sentinel_or_prompt(normalized):
+            return True
         return any(
             marker in normalized
             for marker in (
                 "failed_to_get_wss", "timeout", "timed out", "connection reset", "connection refused",
-                "temporarily unavailable", "temporary", "empty", "未获取", "获取失败", "网络", "重试",
+                "temporarily unavailable", "temporary", "empty", "unknown", "not found", "未找到",
+                "未获取", "获取失败", "解析失败", "未知", "网络", "重试",
             )
         )
 
     def _render_image_update_submission(self, messages: Sequence[Message]) -> str:
         text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
         normalized = text.lower()
-        if "update-image" not in normalized and "statuscode" not in normalized and "requestid" not in normalized:
+        batch_rows = self._image_update_rows_from_text(text)
+        if batch_rows:
+            image = self._image_from_update_command(text) or self._image_from_batch_update_log(text)
+            total = len(batch_rows)
+            failures = [row for row in batch_rows if self._is_failed_value(row.get("status", ""))]
+            success = total - len(failures)
+            heading_icon = "⚠️" if failures else "✅"
+            lines = [
+                f"## {heading_icon} Pod镜像升级请求批量提交完成",
+                "",
+                "### 📊 总体提交情况",
+                f"- 总提交量：{total} 台",
+                f"- 提交成功：{success} 台",
+                f"- 提交失败：{len(failures)} 台",
+            ]
+            if image:
+                lines.append(f"- 目标镜像：`{image}`")
+            lines.extend(["", "### 📋 Pod提交明细", "| Pod ID | 提交状态 | RequestId |", "|---|---|---|"])
+            for row in batch_rows:
+                request_id = row.get("request_id") or "-"
+                lines.append(
+                    "| "
+                    f"{self._escape_markdown_table_cell(row.get('pod', ''))} | "
+                    f"{self._escape_markdown_table_cell(row.get('status', ''))} | "
+                    f"{self._escape_markdown_table_cell(request_id)} |"
+                )
+            lines.extend([
+                "",
+                "说明：当前只观察到镜像升级请求已提交；镜像升级通常是异步流程，未观察到后续验证证据前不能表述为镜像已经完成升级，也不能表述为运行实例已经切到新镜像。",
+            ])
+            return "\n".join(lines)
+
+        if not any(
+            marker in normalized
+            for marker in ("update-image", "statuscode", "requestid", "升级镜像", "目标镜像", "更新成功")
+        ):
             return ""
         status_code = self._jsonish_field(text, "StatusCode")
         request_id = self._jsonish_field(text, "RequestId")
@@ -1423,6 +1764,95 @@ class BatchExecutionService:
                 return match.group(1).strip().strip('"')
         return ""
 
+    def _image_update_rows_from_messages(self, messages: Sequence[Message]) -> list[dict[str, str]]:
+        text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
+        return self._image_update_rows_from_text(text)
+
+    def _image_update_rows_from_text(self, text: str) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        current_pod = ""
+        current_request_id = ""
+        current_status = ""
+        start_pattern = re.compile(
+            r"^\s*\[\s*\d+\s*/\s*\d+\s*\]\s*(?:处理|更新|升级)?\s*(?:Pod\s*)?[:：]?\s*(?P<pod>\d{12,})",
+            re.IGNORECASE,
+        )
+        status_pattern = re.compile(
+            r"(?P<ok>[✅✓✔])?\s*(?P<status>(?:更新|升级|提交)?\s*(?:成功|失败)|success|failed|fail|error)"
+            r"(?:\s*\|\s*RequestId\s*[:：]\s*(?P<request_id>[^\s|]+))?",
+            re.IGNORECASE,
+        )
+        table_pattern = re.compile(
+            r"^\s*\d+\s+(?P<pod>\d{12,})\s+"
+            r"(?P<status>[✅✓✔❌✗✘]?\s*(?:成功|失败|success|failed|fail|error))"
+            r"(?:\s+(?P<request_id>[^\s|]+))?\s*$",
+            re.IGNORECASE,
+        )
+
+        def flush_current() -> None:
+            nonlocal current_pod, current_status, current_request_id
+            if current_pod and current_status:
+                rows.append({
+                    "pod": current_pod,
+                    "status": self._normalize_image_update_status(current_status),
+                    "request_id": self._normalize_request_id(current_request_id),
+                })
+            current_pod = ""
+            current_status = ""
+            current_request_id = ""
+
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            start_match = start_pattern.match(line)
+            if start_match:
+                flush_current()
+                current_pod = start_match.group("pod")
+                status_match = status_pattern.search(line)
+                if status_match:
+                    current_status = status_match.group("status")
+                    current_request_id = status_match.group("request_id") or ""
+                    flush_current()
+                continue
+            if current_pod:
+                status_match = status_pattern.search(line)
+                if status_match:
+                    current_status = status_match.group("status")
+                    current_request_id = status_match.group("request_id") or ""
+                    flush_current()
+                    continue
+            table_match = table_pattern.match(line)
+            if table_match:
+                pod = table_match.group("pod")
+                if not self._looks_like_pod_id(pod):
+                    continue
+                status = table_match.group("status").strip()
+                if status in {"状态", "Pod"}:
+                    continue
+                rows.append({
+                    "pod": pod,
+                    "status": self._normalize_image_update_status(status),
+                    "request_id": self._normalize_request_id(table_match.group("request_id") or ""),
+                })
+        flush_current()
+        return self._dedupe_rows_by_key(rows, "pod")
+
+    def _normalize_image_update_status(self, value: str) -> str:
+        text = str(value or "").strip()
+        normalized = text.lower()
+        if any(marker in normalized for marker in ("失败", "failed", "fail", "error")):
+            return "提交失败"
+        if any(marker in normalized for marker in ("成功", "success")):
+            return "提交成功"
+        return text or "提交成功"
+
+    def _normalize_request_id(self, value: str) -> str:
+        text = str(value or "").strip().strip("`'\"")
+        if not text or text.lower() in {"none", "null", "-"}:
+            return "-"
+        return text
+
     def _first_pod_id(self, text: str) -> str:
         match = re.search(r"\b\d{12,}\b", text or "")
         return match.group(0) if match else ""
@@ -1430,6 +1860,10 @@ class BatchExecutionService:
     def _image_from_update_command(self, text: str) -> str:
         match = re.search(r"--image\s+([^\s]+)", text or "")
         return match.group(1).strip().strip('"\'') if match else ""
+
+    def _image_from_batch_update_log(self, text: str) -> str:
+        match = re.search(r"(?:目标镜像|image)\s*[:：]\s*(?P<image>\S+)", text or "", flags=re.IGNORECASE)
+        return match.group("image").strip().strip('"\'') if match else ""
 
     def _field_value_from_opencli_table(self, text: str, field: str) -> str:
         pattern = re.compile(
@@ -1449,12 +1883,36 @@ class BatchExecutionService:
     ) -> dict[str, Any]:
         csv_rows, csv_path = self._csv_rows_from_text(content)
         if csv_rows:
+            pod_detail = self._pod_model_egress_rows_from_csv_rows(csv_rows)
+            if pod_detail:
+                return self._pod_model_egress_rows_evidence(
+                    pod_detail,
+                    result_path=csv_path or result_path_hint,
+                    operator_distribution_hint=operator_distribution_hint,
+                    region_distribution_hint=region_distribution_hint,
+                )
+            adb_rows = self._adb_rows_from_csv_rows(csv_rows)
+            if adb_rows:
+                return self._adb_rows_evidence(adb_rows, result_path=csv_path or result_path_hint)
             return self._egress_rows_evidence(
                 csv_rows,
                 result_path=csv_path or result_path_hint,
                 operator_distribution_hint=operator_distribution_hint,
                 region_distribution_hint=region_distribution_hint,
             )
+
+        pod_detail_terminal_rows = self._pod_model_egress_rows_from_terminal_blocks(content)
+        if pod_detail_terminal_rows and self._text_has_completion_evidence(content):
+            return self._pod_model_egress_rows_evidence(
+                pod_detail_terminal_rows,
+                result_path=result_path_hint,
+                operator_distribution_hint=operator_distribution_hint,
+                region_distribution_hint=region_distribution_hint,
+            )
+
+        terminal_adb_rows = self._adb_rows_from_terminal_rows(content)
+        if terminal_adb_rows and self._terminal_rows_cover_completion_summary(content, row_count=len(terminal_adb_rows)):
+            return self._adb_rows_evidence(terminal_adb_rows, result_path=result_path_hint)
 
         terminal_egress_rows = self._egress_rows_from_terminal_rows(content)
         if terminal_egress_rows and self._terminal_rows_cover_completion_summary(content, row_count=len(terminal_egress_rows)):
@@ -1649,6 +2107,247 @@ class BatchExecutionService:
             if item and result and not self._looks_like_pod_id(item):
                 items.append({"item": item[:180], "result": result[:260]})
         return items
+
+    def _pod_model_egress_rows_from_csv_rows(self, rows: Sequence[dict[str, str]]) -> list[dict[str, str]]:
+        if not rows:
+            return []
+        headers = list(rows[0].keys())
+        pod_header = self._choose_header(headers, ("Pod ID", "pod_id", "pod", "id", "实例ID", "实例id"))
+        model_header = self._choose_header(headers, ("机型", "型号", "设备型号", "model", "device_model"))
+        ip_header = self._choose_header(headers, ("出口IP", "出口ip", "公网IP", "公网ip", "ip", "public_ip", "egress_ip"))
+        if not pod_header or not model_header or not ip_header:
+            return []
+
+        parsed: list[dict[str, str]] = []
+        for row in rows:
+            pod = self._row_get(row, (pod_header,))
+            model = self._row_get(row, (model_header,))
+            ip = self._row_get(row, (ip_header,))
+            if not self._looks_like_pod_id(pod) or not model:
+                continue
+            parsed.append({
+                "Pod ID": pod,
+                "机型": model,
+                "出口IP": ip,
+                "运营商": self._row_get(row, ("运营商", "operator", "isp", "org", "carrier")),
+                "地域": self._row_get(row, ("地域", "地区", "region", "location", "city")),
+            })
+        return parsed
+
+    def _adb_rows_from_csv_rows(self, rows: Sequence[dict[str, str]]) -> list[dict[str, str]]:
+        if not rows:
+            return []
+        headers = list(rows[0].keys())
+        pod_header = self._choose_header(headers, ("Pod ID", "pod_id", "pod", "id", "实例ID", "实例id"))
+        adb_header = self._choose_header(
+            headers,
+            (
+                "ADB 地址", "ADB地址", "adb 地址", "adb地址", "adb", "adb_address",
+                "adb_addr", "android_debug_bridge", "调试桥",
+            ),
+        )
+        status_header = self._choose_header(headers, ("状态", "结果", "status", "result"))
+        if not pod_header or not (adb_header or status_header):
+            return []
+
+        parsed: list[dict[str, str]] = []
+        for row in rows:
+            pod = self._row_get(row, (pod_header,))
+            adb = self._row_get(row, (adb_header,)) if adb_header else ""
+            status = self._row_get(row, (status_header,)) if status_header else ""
+            value = adb or status
+            if not self._looks_like_pod_id(pod) or not value:
+                continue
+            parsed.append({"Pod ID": pod, "ADB地址": value})
+        return parsed
+
+    def _adb_rows_from_terminal_rows(self, content: str) -> list[dict[str, str]]:
+        """Extract Pod -> ADB endpoint rows from common batch query logs."""
+        rows: list[dict[str, str]] = []
+        current_pod = ""
+        pod_pattern = re.compile(
+            r"^\s*\[\s*\d+\s*/\s*\d+\s*\]\s*"
+            r"(?:处理|查询|check|query)?\s*(?:Pod\s*)?[:：]?\s*(?P<pod>\d{12,})",
+            re.IGNORECASE,
+        )
+        adb_pattern = re.compile(
+            r"(?:[✅✓✔]\s*)?(?:adb\s*(?:地址)?|android\s+debug\s+bridge|调试桥)\s*[:：]\s*(?P<adb>\S.*)$",
+            re.IGNORECASE,
+        )
+        failed_pattern = re.compile(
+            r"(?P<failed>(?:[❌✗✘xX]\s*)?(?:未找到|未获取|获取失败|查询失败|失败|错误|异常|not\s+found|failed|fail|error)[^\n\r]*(?:adb|地址)?[^\n\r]*)",
+            re.IGNORECASE,
+        )
+        endpoint_table_pattern = re.compile(
+            r"^\s*(?P<pod>\d{12,})\s+"
+            r"(?P<adb>(?:(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9_.-]+):\d+)\s*$"
+        )
+        failed_table_pattern = re.compile(
+            r"^\s*(?P<pod>\d{12,})\s+(?P<adb>(?:[❌✗✘xX]\s*)?(?:未找到|未获取|获取失败|查询失败|失败|错误|异常|not\s+found|failed|fail|error)[^\n\r]*(?:adb|地址)?[^\n\r]*)\s*$",
+            re.IGNORECASE,
+        )
+
+        def append_row(pod: str, adb: str) -> None:
+            pod_id = str(pod or "").strip()
+            value = str(adb or "").strip()
+            if self._looks_like_pod_id(pod_id) and value:
+                rows.append({"Pod ID": pod_id, "ADB地址": value})
+
+        for raw in (content or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            endpoint_match = endpoint_table_pattern.match(line)
+            if endpoint_match:
+                append_row(endpoint_match.group("pod"), endpoint_match.group("adb"))
+                continue
+            failed_table_match = failed_table_pattern.match(line)
+            if failed_table_match:
+                append_row(failed_table_match.group("pod"), failed_table_match.group("adb"))
+                continue
+
+            pod_match = pod_pattern.match(line)
+            if pod_match:
+                current_pod = pod_match.group("pod")
+                adb_match = adb_pattern.search(line)
+                if adb_match:
+                    append_row(current_pod, adb_match.group("adb"))
+                    current_pod = ""
+                continue
+
+            if not current_pod:
+                continue
+            adb_match = adb_pattern.search(line)
+            if adb_match:
+                append_row(current_pod, adb_match.group("adb"))
+                current_pod = ""
+                continue
+            failed_match = failed_pattern.search(line)
+            if failed_match:
+                append_row(current_pod, failed_match.group("failed"))
+                current_pod = ""
+
+        return self._dedupe_rows_by_key(rows, "Pod ID")
+
+    def _adb_rows_evidence(self, rows: Sequence[dict[str, str]], *, result_path: str) -> dict[str, Any]:
+        normalized_rows: list[dict[str, str]] = []
+        for row in rows:
+            pod = self._row_get(row, ("Pod ID", "pod", "pod_id", "id", "实例ID", "实例id"))
+            adb = self._row_get(
+                row,
+                (
+                    "ADB地址", "ADB 地址", "adb地址", "adb 地址", "adb", "adb_address",
+                    "adb_addr", "android_debug_bridge", "调试桥", "结果", "状态", "result", "status",
+                ),
+            )
+            if not self._looks_like_pod_id(pod):
+                continue
+            normalized_rows.append({"pod": pod, "adb": adb})
+        normalized_rows = self._dedupe_rows_by_key(normalized_rows, "pod")
+
+        total = len(normalized_rows)
+        failures = [row for row in normalized_rows if not row.get("adb") or self._is_failed_value(row.get("adb", ""))]
+        success = total - len(failures)
+        adb_counter = Counter(row["adb"] for row in normalized_rows if row.get("adb") and not self._is_failed_value(row.get("adb", "")))
+        stats_line = f"总数={total} 成功={success} 失败={len(failures)}"
+        report_lines = [
+            f"## {self._report_status_icon(failures)} Pod ADB地址批量查询完成报告",
+            "",
+            "### 📊 总体执行情况",
+            f"- 总查询量：{total} 台",
+            f"- 查询成功：{success} 台",
+            f"- 查询失败：{len(failures)} 台",
+        ]
+        if result_path:
+            report_lines.append(f"- 结果文件：{result_path}")
+        if normalized_rows:
+            report_lines.extend(["", "### 📋 Pod ADB地址明细", "| Pod ID | ADB 地址 |", "|---|---|"])
+            for row in normalized_rows:
+                report_lines.append(
+                    "| "
+                    f"{self._escape_markdown_table_cell(row['pod'])} | "
+                    f"{self._escape_markdown_table_cell(row['adb'])} |"
+                )
+        if adb_counter:
+            report_lines.extend(["", "### 🔌 ADB地址分布", "| ADB 地址 | 数量 |", "|---|---:|"])
+            for adb, count in adb_counter.most_common(30):
+                report_lines.append(f"| {self._escape_markdown_table_cell(adb)} | {count} 台 |")
+        if failures:
+            report_lines.extend(["", "### ⚠️ 未成功项", "| Pod ID | 结果 |", "|---|---|"])
+            for row in failures[:30]:
+                report_lines.append(
+                    f"| {self._escape_markdown_table_cell(row['pod'])} | {self._escape_markdown_table_cell(row['adb'])} |"
+                )
+
+        report = "\n".join(report_lines)
+        return {
+            "stats_line": stats_line,
+            "completion_line": "查询完成",
+            "result_path": result_path,
+            "adb_items": tuple(f"{row['pod']}: {row['adb']}" for row in normalized_rows),
+            "adb_structured_report": report,
+            "structured_report": report,
+        }
+
+    def _pod_model_egress_rows_from_terminal_blocks(self, content: str) -> list[dict[str, str]]:
+        """Parse logs that emit ``Processing <pod>`` followed by ``Result: model / ip``.
+
+        Some one-off operational scripts collect multiple requested facets in a
+        single loop rather than writing a typed CSV/JSON artifact first.  This
+        parser keeps the controller facet-aware so a completed composite log is
+        not downgraded to a vague "background task started" message.
+        """
+        rows: list[dict[str, str]] = []
+        current_pod = ""
+        pod_pattern = re.compile(r"(?:processing|查询|处理|check|query)\s+(?P<pod>\d{12,})", re.IGNORECASE)
+        result_pattern = re.compile(r"(?:result|结果)\s*[:：]\s*(?P<model>[^/\n\r]+?)\s*/\s*(?P<ip>[^\n\r]+)", re.IGNORECASE)
+        field_patterns = {
+            "机型": re.compile(r"(?:✅\s*)?(?:机型|型号|设备型号|model)\s*[:：]\s*(?P<value>.+?)\s*$", re.IGNORECASE),
+            "出口IP": re.compile(r"(?:✅\s*)?(?:出口\s*IP|出口IP|公网\s*IP|公网IP|egress\s*ip|ip)\s*[:：]\s*(?P<value>.+?)\s*$", re.IGNORECASE),
+            "运营商": re.compile(r"(?:✅\s*)?(?:运营商|operator|carrier|isp|org)\s*[:：]\s*(?P<value>.+?)\s*$", re.IGNORECASE),
+        }
+        current_row: dict[str, str] = {}
+
+        def flush_current_row() -> None:
+            nonlocal current_pod, current_row
+            if current_pod and (current_row.get("机型") or current_row.get("出口IP")):
+                rows.append({
+                    "Pod ID": current_pod,
+                    "机型": current_row.get("机型", "").strip(),
+                    "出口IP": current_row.get("出口IP", "").strip(),
+                    "运营商": current_row.get("运营商", "").strip(),
+                    "地域": current_row.get("地域", "").strip(),
+                })
+            current_pod = ""
+            current_row = {}
+
+        for raw in (content or "").splitlines():
+            pod_match = pod_pattern.search(raw)
+            if pod_match:
+                flush_current_row()
+                current_pod = pod_match.group("pod")
+                continue
+            result_match = result_pattern.search(raw)
+            if result_match and current_pod:
+                rows.append({
+                    "Pod ID": current_pod,
+                    "机型": result_match.group("model").strip(),
+                    "出口IP": result_match.group("ip").strip(),
+                    "运营商": "",
+                    "地域": "",
+                })
+                current_pod = ""
+                current_row = {}
+                continue
+            if not current_pod:
+                continue
+            for field, pattern in field_patterns.items():
+                match = pattern.search(raw)
+                if match:
+                    current_row[field] = match.group("value").strip()
+                    break
+        flush_current_row()
+        return rows
 
     def _choose_header(self, headers: Sequence[str], candidates: Sequence[str]) -> str:
         lowered = {str(header).strip().lower(): str(header) for header in headers}
@@ -1888,7 +2587,7 @@ class BatchExecutionService:
         model_distribution = tuple(f"{model}: {count} 台" for model, count in distribution.most_common())
         stats_line = f"总数={total} 成功={success} 失败={len(failed_items)}"
         report_lines = [
-            f"## ✅ Pod机型批量查询完成报告",
+            f"## {self._report_status_icon(failed_items)} Pod机型批量查询完成报告",
             "",
             "### 📊 总体执行情况",
             f"- 总查询量：{total} 台",
@@ -1922,6 +2621,98 @@ class BatchExecutionService:
             "structured_report": "\n".join(report_lines),
         }
 
+    def _pod_model_egress_rows_evidence(
+        self,
+        rows: Sequence[dict[str, str]],
+        *,
+        result_path: str,
+        operator_distribution_hint: Sequence[str] = (),
+        region_distribution_hint: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        normalized_rows: list[dict[str, str]] = []
+        for row in rows:
+            pod = self._row_get(row, ("Pod ID", "pod", "pod_id", "id"))
+            model = self._row_get(row, ("机型", "型号", "设备型号", "model", "device_model"))
+            ip = self._row_get(row, ("出口IP", "ip", "public_ip", "egress_ip", "公网IP"))
+            operator = self._row_get(row, ("运营商", "operator", "isp", "org", "carrier"))
+            region = self._row_get(row, ("地域", "地区", "region", "location", "city"))
+            if not self._looks_like_pod_id(pod):
+                continue
+            normalized_rows.append({"pod": pod, "model": model, "ip": ip, "operator": operator, "region": region})
+        normalized_rows = self._dedupe_rows_by_key(normalized_rows, "pod")
+
+        model_mapping = {row["pod"]: row["model"] for row in normalized_rows if row.get("model")}
+        model_evidence = self._model_mapping_evidence(model_mapping, result_paths=[result_path] if result_path else [])
+        egress_rows = [
+            {
+                "Pod ID": row["pod"],
+                "出口IP": row["ip"],
+                "运营商": row["operator"],
+                "地域": row["region"],
+            }
+            for row in normalized_rows
+        ]
+        egress_evidence = self._egress_rows_evidence(
+            egress_rows,
+            result_path=result_path,
+            operator_distribution_hint=operator_distribution_hint,
+            region_distribution_hint=region_distribution_hint,
+        )
+
+        total = len(normalized_rows)
+        model_failed = [row for row in normalized_rows if self._is_failed_value(row.get("model", ""))]
+        egress_failed = [row for row in normalized_rows if self._is_failed_value(row.get("ip", ""))]
+        model_distribution = Counter(row["model"] for row in normalized_rows if row.get("model") and not self._is_failed_value(row.get("model", "")))
+        ip_distribution = Counter(row["ip"] for row in normalized_rows if row.get("ip") and not self._is_failed_value(row.get("ip", "")))
+
+        combined_lines = [
+            f"## {self._report_status_icon([*model_failed, *egress_failed])} Pod机型与出口IP批量查询完成报告",
+            "",
+            "### 📊 总体执行情况",
+            f"- 总查询量：{total} 台",
+            f"- 机型查询成功：{total - len(model_failed)} 台",
+            f"- 机型查询失败：{len(model_failed)} 台",
+            f"- 出口IP查询成功：{total - len(egress_failed)} 台",
+            f"- 出口IP查询失败：{len(egress_failed)} 台",
+        ]
+        if result_path:
+            combined_lines.append(f"- 结果文件：{result_path}")
+        if normalized_rows:
+            combined_lines.extend(["", "### 📋 Pod明细", "| Pod ID | 机型 | 出口IP | 运营商 | 地域 |", "|---|---|---|---|---|"])
+            for row in normalized_rows:
+                combined_lines.append(
+                    "| "
+                    f"{self._escape_markdown_table_cell(row['pod'])} | "
+                    f"{self._escape_markdown_table_cell(row['model'])} | "
+                    f"{self._escape_markdown_table_cell(row['ip'])} | "
+                    f"{self._escape_markdown_table_cell(row['operator'])} | "
+                    f"{self._escape_markdown_table_cell(row['region'])} |"
+                )
+        if model_distribution:
+            combined_lines.extend(["", "### 📱 机型分布", "| 机型代码 | 数量 | 占比 |", "|---|---:|---:|"])
+            for model, count in model_distribution.most_common():
+                pct = (count / total * 100) if total else 0.0
+                combined_lines.append(f"| {self._escape_markdown_table_cell(model)} | {count} 台 | {pct:.1f}% |")
+        if ip_distribution:
+            combined_lines.extend(["", "### 🌐 出口IP分布", "| 出口IP | 数量 |", "|---|---:|"])
+            for ip, count in ip_distribution.most_common(30):
+                combined_lines.append(f"| {self._escape_markdown_table_cell(ip)} | {count} 台 |")
+
+        return {
+            "stats_line": f"总数={total} 机型成功={total - len(model_failed)} 机型失败={len(model_failed)} 出口IP成功={total - len(egress_failed)} 出口IP失败={len(egress_failed)}",
+            "completion_line": "查询完成",
+            "result_path": result_path,
+            "model_distribution": tuple(model_evidence.get("model_distribution") or ()),
+            "model_items": tuple(model_evidence.get("model_items") or ()),
+            "operator_distribution": tuple(egress_evidence.get("operator_distribution") or ()),
+            "region_distribution": tuple(egress_evidence.get("region_distribution") or ()),
+            "ip_distribution": tuple(egress_evidence.get("ip_distribution") or ()),
+            "item_results": tuple(egress_evidence.get("item_results") or ()),
+            "model_structured_report": str(model_evidence.get("structured_report") or ""),
+            "egress_structured_report": str(egress_evidence.get("structured_report") or ""),
+            "structured_report": "\n".join(combined_lines),
+        }
+
     def _csv_rows_from_text(self, content: str) -> tuple[list[dict[str, str]], str]:
         lines = (content or "").splitlines()
         header_index = -1
@@ -1929,7 +2720,7 @@ class BatchExecutionService:
             if "," not in line:
                 continue
             lowered = line.lower()
-            if ("pod" in lowered or "pod id" in lowered) and ("ip" in lowered or "出口" in line):
+            if ("pod" in lowered or "pod id" in lowered) and ("ip" in lowered or "出口" in line or "adb" in lowered):
                 header_index = index
                 break
         if header_index < 0:
@@ -2036,12 +2827,14 @@ class BatchExecutionService:
         total = len(normalized_rows)
         failures = [
             row for row in normalized_rows
-            if (bool(row.get("status")) and self._is_failed_value(row.get("status", ""))) or not row.get("ip")
+            if (bool(row.get("status")) and self._is_failed_value(row.get("status", "")))
+            or not row.get("ip")
+            or self._is_failed_value(row.get("ip", ""))
         ]
         success = total - len(failures)
         operator_counter = Counter(row["operator"] for row in normalized_rows if row.get("operator"))
         region_counter = Counter(row["region"] for row in normalized_rows if row.get("region"))
-        ip_counter = Counter(row["ip"] for row in normalized_rows if row.get("ip"))
+        ip_counter = Counter(row["ip"] for row in normalized_rows if row.get("ip") and not self._is_failed_value(row.get("ip", "")))
         operator_display = self._merge_distribution_display_names(operator_counter, operator_distribution_hint)
         region_display = self._merge_distribution_display_names(region_counter, region_distribution_hint)
         operator_distribution = tuple(f"{name}: {count} 台" for name, count in operator_display)
@@ -2049,7 +2842,7 @@ class BatchExecutionService:
         ip_distribution = tuple(f"{name}: {count} 台" for name, count in ip_counter.most_common())
         stats_line = f"总数={total} 成功={success} 失败={len(failures)}"
         report_lines = [
-            "## ✅ Pod出口IP/运营商批量查询完成报告",
+            f"## {self._report_status_icon(failures)} Pod出口IP/运营商批量查询完成报告",
             "",
             "### 📊 总体执行情况",
             f"- 总查询量：{total} 台",
@@ -2217,7 +3010,20 @@ class BatchExecutionService:
         normalized = str(value or "").strip().lower()
         if not normalized:
             return True
-        return any(marker in normalized for marker in ("failed", "fail", "error", "unknown", "timeout", "未获取", "失败", "异常", "错误"))
+        if self._is_shell_sentinel_or_prompt(normalized):
+            return True
+        return any(marker in normalized for marker in ("failed", "fail", "error", "unknown", "not found", "timeout", "未找到", "未获取", "解析失败", "未知", "失败", "异常", "错误"))
+
+    def _is_shell_sentinel_or_prompt(self, normalized_value: str) -> bool:
+        normalized = str(normalized_value or "").strip().lower()
+        if normalized in {"__begin__", "__done__", "__end__"}:
+            return True
+        if re.fullmatch(r"__done__\d*", normalized):
+            return True
+        return bool(re.fullmatch(r"[\w.-]+:/\s*#", normalized))
+
+    def _report_status_icon(self, failed_items: Sequence[object]) -> str:
+        return "⚠️" if failed_items else "✅"
 
     def _text_has_completion_evidence(self, content: str) -> bool:
         return bool(

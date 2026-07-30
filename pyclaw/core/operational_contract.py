@@ -7,12 +7,14 @@ from typing import Mapping, Sequence
 
 FACET_POD_MODEL = "pod_model"
 FACET_POD_EGRESS = "pod_egress"
+FACET_POD_ADB = "pod_adb"
 FACET_IMAGE_UPDATE_SUBMISSION = "image_update_submission"
 FACET_GENERIC_RESULT = "generic_result"
 
 FACET_LABELS: Mapping[str, str] = {
     FACET_POD_MODEL: "Pod机型",
     FACET_POD_EGRESS: "Pod出口IP/运营商",
+    FACET_POD_ADB: "Pod ADB地址",
     FACET_IMAGE_UPDATE_SUBMISSION: "镜像升级提交结果",
     FACET_GENERIC_RESULT: "批量处理结果",
 }
@@ -99,13 +101,18 @@ class OperationalGateDecision:
     ledger: OperationalEvidenceLedger | None = None
     ready: bool = False
     missing_facets: tuple[str, ...] = ()
+    coverage_missing_items: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     retryable_failed_items: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     report: str = ""
     reason: str = ""
 
     @property
     def needs_repair(self) -> bool:
-        return bool(self.contract and not self.ready and (self.missing_facets or self.retryable_failed_items))
+        return bool(
+            self.contract
+            and not self.ready
+            and (self.missing_facets or self.coverage_missing_items or self.retryable_failed_items)
+        )
 
 
 def infer_operational_task_contract(text: str) -> OperationalTaskContract | None:
@@ -127,6 +134,8 @@ def infer_operational_task_contract(text: str) -> OperationalTaskContract | None
         required_facets.append(FACET_POD_MODEL)
     if _mentions_egress(normalized):
         required_facets.append(FACET_POD_EGRESS)
+    if _mentions_adb(normalized):
+        required_facets.append(FACET_POD_ADB)
     if _mentions_image_update(normalized):
         required_facets.append(FACET_IMAGE_UPDATE_SUBMISSION)
 
@@ -228,6 +237,10 @@ def _mentions_egress(normalized: str) -> bool:
             "运营商", "operator", "isp", "地域", "地区", "region",
         )
     )
+
+
+def _mentions_adb(normalized: str) -> bool:
+    return any(marker in normalized for marker in ("adb", "android debug bridge", "调试桥"))
 
 
 def _mentions_image_update(normalized: str) -> bool:

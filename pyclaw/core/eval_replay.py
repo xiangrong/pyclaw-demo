@@ -123,6 +123,7 @@ class GoldenReplaySuite:
             "ready": decision.ready,
             "needs_repair": decision.needs_repair,
             "missing_facets": list(decision.missing_facets),
+            "coverage_missing_items": {key: list(value) for key, value in decision.coverage_missing_items.items()},
             "retryable_failed_items": {key: list(value) for key, value in decision.retryable_failed_items.items()},
             "reason": decision.reason,
         }
@@ -135,6 +136,8 @@ class GoldenReplaySuite:
             mismatches.append(
                 f"missing_facets: observed={observed['missing_facets']!r} expected={expected['missing_facets']!r}"
             )
+        if "coverage_missing_items" in expected and observed["coverage_missing_items"] != expected["coverage_missing_items"]:
+            mismatches.append("coverage_missing_items mismatch")
         if "retryable_failed_items" in expected and observed["retryable_failed_items"] != expected["retryable_failed_items"]:
             mismatches.append("retryable_failed_items mismatch")
         missing = [text for text in expected.get("contains", []) if str(text) not in final]

@@ -258,7 +258,15 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
                     "完整结果已保存到: pod_models_9_new_results.json\n"
                 ),
             },
-            expected={"needs_repair": True, "missing_facets": ["pod_model", "pod_egress"], "final_empty": True},
+            expected={
+                "needs_repair": True,
+                "reason": "missing_facets",
+                "missing_facets": ["pod_egress"],
+                "coverage_missing_items": {
+                    "pod_model": ["7667116783811681066", "7667116783811615530"],
+                },
+                "final_empty": True,
+            },
         ),
         ReplayCase(
             name="history-composite-pod-query-egress-only-needs-model",
@@ -335,6 +343,69 @@ def test_golden_replay_suite_covers_reliability_cases(tmp_path):
                 "needs_repair": True,
                 "missing_facets": ["generic_result"],
                 "final_empty": True,
+            },
+        ),
+        ReplayCase(
+            name="final-coverage-gate-blocks-generic-wrong-target-rows",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "批量检查这些服务的健康状态\n"
+                    "user-api\n"
+                    "pay-api\n"
+                    "search-api"
+                ),
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: cd /Users/bytedance/.pyclaw && python3 batch_health.py service_health_input.txt 2>&1\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "[1/3] user-api: OK\n"
+                    "[2/3] pay-api: OK\n"
+                    "[3/3] cache-api: OK\n"
+                    "处理完成！成功: 3, 失败: 0\n"
+                ),
+            },
+            expected={
+                "needs_repair": True,
+                "reason": "coverage_missing_targets",
+                "coverage_missing_items": {"generic_result": ["search-api"]},
+                "final_empty": True,
+            },
+        ),
+        ReplayCase(
+            name="final-coverage-gate-blocks-partial-image-update-rows",
+            category="operational_contract",
+            input={
+                "latest_task": (
+                    "升级下面三个pod镜像到 cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr202607282240\n"
+                    "7668229922166463273\n"
+                    "7668241538635881225\n"
+                    "7668233647811779337"
+                ),
+                "observation": (
+                    "OBSERVATION from terminal:\n"
+                    "Command: tail -120 /Users/bytedance/.pyclaw/batch_update_3pods.log\n"
+                    "Exit code: 0\n"
+                    "STDOUT:\n"
+                    "🚀 开始批量更新，共 3 台 Pod\n"
+                    "📦 目标镜像: cr-aic-cn-beijing.cr.volces.com/hhl/aosp13:xr202607282240\n"
+                    "[1/3] 处理 Pod: 7668229922166463273\n"
+                    "  ✅ 更新成功 | RequestId: None\n"
+                    "📊 批量更新完成！\n"
+                    "   总数: 3\n"
+                    "   成功: 3\n"
+                    "   失败: 0\n"
+                ),
+            },
+            expected={
+                "needs_repair": True,
+                "reason": "coverage_missing_targets",
+                "coverage_missing_items": {
+                    "image_update_submission": ["7668241538635881225", "7668233647811779337"],
+                },
+                "final_empty": True,
+                "not_contains": ["Pod镜像升级请求批量提交完成"],
             },
         ),
         ReplayCase(
