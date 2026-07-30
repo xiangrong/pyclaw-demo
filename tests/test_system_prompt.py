@@ -108,6 +108,22 @@ async def test_session_layer_wraps_memory_as_untrusted():
 
 
 @pytest.mark.asyncio
+async def test_session_layer_wraps_retrieved_documents_and_requests_citations():
+    context = LayerContext(
+        session_id="s-docs",
+        retrieved_documents="[doc:1] title: Guide\ncontent:\n公司技术规范要求先检索再回答。",
+    )
+
+    rendered = await SessionLayer().render(context)
+
+    assert "<retrieved_documents>" in rendered
+    assert "untrusted_memory" in rendered
+    assert "document_memory" in rendered
+    assert "[doc:1]" in rendered
+    assert "cite the bracket labels" in rendered
+
+
+@pytest.mark.asyncio
 async def test_static_prompt_keeps_reasoning_private_and_defends_untrusted_content():
     prompt = await StaticLayer().render(LayerContext(base_system_prompt="Base"))
 

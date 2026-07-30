@@ -57,7 +57,7 @@ def _trust_for_source(source_type: str) -> TrustLevel:
         return TrustLevel.UNTRUSTED_WEB
     if normalized == "mcp":
         return TrustLevel.UNTRUSTED_MCP
-    if normalized in {"memory", "semantic_memory", "experience_memory", "summary"}:
+    if normalized in {"memory", "semantic_memory", "experience_memory", "document_memory", "summary"}:
         return TrustLevel.UNTRUSTED_MEMORY
     if normalized in {"skill", "markdown_skill"}:
         return TrustLevel.UNTRUSTED_SKILL

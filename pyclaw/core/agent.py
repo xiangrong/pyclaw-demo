@@ -14,6 +14,8 @@ from typing import Optional, Any
 from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.core.session import Session, SessionManager
 from pyclaw.core.memory import SemanticMemory
+from pyclaw.core.document_rag import DEFAULT_COLLECTION, DocumentKnowledgeStore
+from pyclaw.core.user_memory import MemoryExtractor, UserMemoryStore
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.core.system_prompt.manager import SystemPromptManager
@@ -76,6 +78,11 @@ class Agent:
         memory: Optional[SemanticMemory] = None,
         disable_memory: bool = False,
         disable_personal_context: bool = False,
+        user_memory: Optional[UserMemoryStore] = None,
+        document_store: Optional[DocumentKnowledgeStore] = None,
+        document_rag_auto_retrieve: bool = True,
+        document_rag_limit: int = 5,
+        document_rag_collection: str = DEFAULT_COLLECTION,
         max_iterations: int = 90,
         max_consecutive_failures: int = 8,
         exec_approval_service: Optional[ExecApprovalService] = None,
@@ -113,6 +120,17 @@ class Agent:
         else:
             print("  ℹ️  LanceDB not found, Semantic Memory (RAG) is disabled.")
             self.memory = None
+
+        self.user_memory = None if (disable_memory or disable_personal_context) else user_memory
+        self.document_store = None if disable_memory else document_store
+        self.document_rag_auto_retrieve = bool(document_rag_auto_retrieve)
+        self.document_rag_limit = max(1, min(int(document_rag_limit), 20))
+        self.document_rag_collection = document_rag_collection or DEFAULT_COLLECTION
+        self.memory_extractor = (
+            MemoryExtractor(model_provider, self.user_memory)
+            if self.user_memory is not None
+            else None
+        )
 
         self.system_prompt = system_prompt or (
             "You are PyClaw, an autonomous AI assistant.\n"
@@ -251,6 +269,53 @@ class Agent:
         status = self._status_by_session.get(target)
         return status.to_dict() if status is not None else {}
 
+    def _memory_project_id(self) -> str:
+        """Return a stable project/workspace identifier for scoped memory."""
+        return os.path.realpath(os.path.abspath(os.path.expanduser(self.work_dir)))
+
+    async def _get_user_memory_context(self, session: Session) -> tuple[str, str]:
+        """Render compact structured user and project memories for the prompt."""
+        if not self.user_memory:
+            return "", ""
+        try:
+            return await self.user_memory.render_profile(
+                user_id=session.user_id or "default",
+                channel=session.channel or "",
+                project_id=self._memory_project_id(),
+            )
+        except Exception as e:
+            print(f"  ⚠️  用户记忆检索失败: {e}")
+            return "", ""
+
+    async def _extract_user_memory_after_turn(
+        self,
+        *,
+        session: Session,
+        user_message: Message,
+        assistant_message: Message,
+    ) -> None:
+        """Extract durable structured user memories after a successful turn."""
+        if not self.memory_extractor or self.disable_personal_context:
+            return
+        try:
+            profile, project = await self._get_user_memory_context(session)
+            existing_profile = "\n".join(part for part in (profile, project) if part)
+            saved = await self.memory_extractor.extract_and_save(
+                user_id=session.user_id or user_message.user_id or "default",
+                channel=session.channel or user_message.channel or "",
+                project_id=self._memory_project_id(),
+                session_id=session.session_id,
+                user_message=user_message.content,
+                assistant_message=assistant_message.content,
+                source_message_ids=[user_message.id, assistant_message.id],
+                existing_profile=existing_profile,
+            )
+            if saved:
+                self.system_prompt_manager.invalidate_session_cache(session.session_id)
+                print(f"🧠 [UserMemory] Saved {len(saved)} structured memories.")
+        except Exception as e:
+            print(f"⚠️ [UserMemory] Failed to extract user memory: {e}")
+
     async def _get_semantic_memories(self, session: Session) -> tuple[str, str]:
         """获取语义记忆 (Semantic Memory / RAG)"""
         semantic_memory_content = ""
@@ -311,6 +376,49 @@ class Agent:
             
         return semantic_memory_content, experience_memory_content
 
+    async def _get_document_rag_context(self, session: Session) -> str:
+        """Retrieve learned company/technical document chunks for this turn."""
+        if not self.document_store or not self.document_rag_auto_retrieve:
+            return ""
+
+        query = session.metadata.get("current_objective")
+        if not query:
+            query = self._latest_external_user_text(session)
+        if not query:
+            return ""
+
+        try:
+            results = await self.document_store.search(
+                str(query),
+                limit=self.document_rag_limit,
+                collection=self.document_rag_collection,
+            )
+        except Exception as e:
+            print(f"  ⚠️  文档知识库检索失败: {e}")
+            return ""
+
+        if not results:
+            return ""
+
+        entries: list[str] = []
+        for idx, item in enumerate(results, 1):
+            snippet = item.chunk_text.strip()
+            if len(snippet) > 1200:
+                snippet = snippet[:1200].rstrip() + "\n[truncated]"
+            entries.append(
+                "\n".join(
+                    [
+                        f"[doc:{idx}] title: {item.title}",
+                        f"source: {item.source}",
+                        f"chunk_id: {item.chunk_id}",
+                        f"score: {item.score:.4f}",
+                        "content:",
+                        snippet,
+                    ]
+                )
+            )
+        return "\n\n---\n\n".join(entries)
+
     async def _get_dynamic_system_prompt(self, session: Optional[Session] = None) -> str:
         """动态生成增强版系统提示词 (采用三层架构: 静态 + 会话 + 实时)"""
         # 1. 准备 Context
@@ -353,10 +461,14 @@ class Agent:
             context.active_skills_context = self.skill_contexts.render_prompt_context(session)
             context.deliverable_workspace_context = self.skill_workspace.render_adapter_context(session, active_contract)
             
-            # 获取语义记忆
+            # 获取结构化用户/项目记忆与语义记忆
+            user_profile_memory, project_memory = await self._get_user_memory_context(session)
+            context.user_profile_memory = user_profile_memory
+            context.project_memory = project_memory
             semantic_memory, experience_memory = await self._get_semantic_memories(session)
             context.semantic_memory = semantic_memory
             context.experience_memory = experience_memory
+            context.retrieved_documents = await self._get_document_rag_context(session)
 
         # 2. 调用管理器生成
         return await self.system_prompt_manager.generate_prompt(context)
@@ -544,6 +656,7 @@ class Agent:
         # 执行 Agent 循环
         response_content, pending_files = await self._agent_loop(session)
         self._dedupe_pending_files(pending_files)
+        self._update_status(session, AgentPhase.DONE, message="Final answer ready", active_tool="")
 
         # 检查是否需要压缩历史消息 (PRD v0.7.0)
         if len(session.messages) > 30:
@@ -562,12 +675,18 @@ class Agent:
         )
         await self.sessions.save_message(session, response)
 
-        # 异步保存到语义记忆（不阻塞主流程回复）
+        # 异步保存到语义记忆与结构化用户记忆（不阻塞主流程回复）
         if self.memory:
             asyncio.create_task(self.memory.add_session_interaction(
                 user_msg=message.content,
                 assistant_msg=response_content,
                 session_id=session.session_id
+            ))
+        if self.memory_extractor:
+            asyncio.create_task(self._extract_user_memory_after_turn(
+                session=session,
+                user_message=message,
+                assistant_message=response,
             ))
 
         return response
@@ -1387,15 +1506,26 @@ class Agent:
                     if self._should_request_operational_progress_poll(session):
                         await self._request_operational_progress_poll(session)
                         continue
+                    allow_incomplete_operational_final = self._should_deliver_operational_incomplete_report(
+                        session,
+                        allow_partial_failures=True,
+                        is_final_iteration=is_final_iteration,
+                        force_final_answer=force_final_answer,
+                        soft_deadline_reached=soft_deadline_reached,
+                    )
                     if (
-                        not is_final_iteration
+                        not allow_incomplete_operational_final
+                        and not is_final_iteration
                         and not force_final_answer
                         and not soft_deadline_reached
                         and self._should_repair_operational_contract(session)
                     ):
                         await self._request_operational_contract_repair(session)
                         continue
-                    operational_final = self._operational_terminal_final_from_observations(session)
+                    operational_final = self._operational_terminal_final_from_observations(
+                        session,
+                        allow_incomplete_completed_report=allow_incomplete_operational_final,
+                    )
                     if operational_final.strip():
                         operational_final = self._sanitize_user_facing_content(operational_final)
                         self._touch_activity("operational_batch_finalized_after_tool_observation", session)
@@ -1447,8 +1577,16 @@ class Agent:
                         all_responses.pop()
                     await self._request_operational_progress_poll(session)
                     continue
+                allow_incomplete_operational_final = self._should_deliver_operational_incomplete_report(
+                    session,
+                    allow_partial_failures=True,
+                    is_final_iteration=is_final_iteration,
+                    force_final_answer=force_final_answer,
+                    soft_deadline_reached=soft_deadline_reached,
+                )
                 if (
-                    not is_final_iteration
+                    not allow_incomplete_operational_final
+                    and not is_final_iteration
                     and not force_final_answer
                     and not soft_deadline_reached
                     and self._should_repair_operational_contract(session)
@@ -1457,7 +1595,10 @@ class Agent:
                         all_responses.pop()
                     await self._request_operational_contract_repair(session)
                     continue
-                operational_final = self._operational_terminal_final_from_observations(session)
+                operational_final = self._operational_terminal_final_from_observations(
+                    session,
+                    allow_incomplete_completed_report=allow_incomplete_operational_final,
+                )
                 if operational_final.strip():
                     if content.strip() and all_responses and all_responses[-1] == content:
                         all_responses.pop()
@@ -2949,6 +3090,80 @@ class Agent:
         if self.batch_execution.operational_contract_repair_notice_count(session) >= 3:
             return False
         return True
+
+    def _should_deliver_operational_incomplete_report(
+        self,
+        session: Session,
+        *,
+        allow_partial_failures: bool = False,
+        is_final_iteration: bool = False,
+        force_final_answer: bool = False,
+        soft_deadline_reached: bool = False,
+    ) -> bool:
+        """Return True when controller evidence should be delivered despite an unsatisfied contract.
+
+        The normal operational gate asks the LLM to repair missing facets or
+        retry transient per-item failures.  That remains the default.  However,
+        once the controller has already asked for repairs several times, or a
+        later tool observation contains full item-level detail with a small
+        number of explicit failures, another LLM turn often only produces loops
+        or mock/test exhaustion.  In those cases deliver a transparent
+        completed-but-incomplete report instead of hiding the evidence or making
+        another speculative model call.
+        """
+        evidence_messages = self.batch_execution.evidence_messages_since_latest_user(session)
+        if not evidence_messages:
+            return False
+
+        latest_task = self._latest_external_user_text(session)
+        decision = self.batch_execution.evaluate_operational_contract(
+            latest_task=latest_task,
+            terminal_messages=evidence_messages,
+        )
+        if not decision.needs_repair:
+            return False
+
+        evidence = self.batch_execution.evidence_from_messages(evidence_messages)
+        if not (self.batch_execution._has_terminal_completion_evidence(evidence) or evidence.is_complete):
+            return False
+
+        if force_final_answer or soft_deadline_reached or is_final_iteration:
+            return True
+
+        repair_notice_count = self.batch_execution.operational_contract_repair_notice_count(session)
+        if repair_notice_count >= 3:
+            return True
+
+        if not allow_partial_failures:
+            return False
+        if decision.missing_facets:
+            return False
+
+        ledger = decision.ledger
+        contract = decision.contract
+        if ledger is None or contract is None or not decision.retryable_failed_items:
+            return False
+        if not contract.requires_file_batch or len(contract.required_facets) != 1:
+            return False
+        if not contract.targets:
+            return False
+
+        target_count = len(contract.targets)
+        failed_count = sum(len(items) for items in decision.retryable_failed_items.values())
+        if failed_count <= 0:
+            return False
+        # If most/all items failed (the historical __BEGIN__/未知/解析失败 case),
+        # the right next action is a repair/retry, not a premature final.  If a
+        # full result artifact is present and only a small tail failed, deliver
+        # the partial-failure report rather than asking for another LLM turn.
+        if failed_count > max(1, target_count // 10):
+            return False
+
+        return all(
+            bool(facet_evidence.item_results)
+            and self.batch_execution._item_results_cover_targets(facet_evidence.item_results, contract.targets)
+            for facet_evidence in ledger.facets.values()
+        )
 
     async def _request_operational_contract_repair(self, session: Session) -> None:
         decision = self.batch_execution.evaluate_operational_contract(
@@ -5074,7 +5289,10 @@ class Agent:
                 return content
             return ""
 
-        operational_final = self._operational_terminal_final_from_observations(session)
+        operational_final = self._operational_terminal_final_from_observations(
+            session,
+            allow_incomplete_completed_report=True,
+        )
         if operational_final:
             return operational_final
 
@@ -5090,11 +5308,17 @@ class Agent:
             )
         return ""
 
-    def _operational_terminal_final_from_observations(self, session: Session) -> str:
+    def _operational_terminal_final_from_observations(
+        self,
+        session: Session,
+        *,
+        allow_incomplete_completed_report: bool = False,
+    ) -> str:
         """Synthesize a safe final for operational tasks from observed evidence."""
         return self.batch_execution.final_from_observations(
             latest_task=self._latest_external_user_text(session),
             terminal_messages=self.batch_execution.evidence_messages_since_latest_user(session),
+            allow_incomplete_completed_report=allow_incomplete_completed_report,
         )
 
     async def _request_build_repair(self, session: Session) -> None:

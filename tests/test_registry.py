@@ -188,6 +188,38 @@ def test_registry_skips_unreviewed_python_skill(tmp_path):
     assert registry.get_tool("evil_tool") is None
 
 
+def test_registry_warns_once_for_unchanged_unreviewed_python_skill(tmp_path, capsys):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "draft.py").write_text("print('draft')\n", encoding="utf-8")
+    registry = ToolRegistry(skills_dirs=[skills_dir])
+
+    registry.get_all_specs()
+    first = capsys.readouterr().out
+    registry.get_all_specs()
+    second = capsys.readouterr().out
+
+    assert "Python skill skipped until reviewed/trusted: draft.py" in first
+    assert "Python skill skipped until reviewed/trusted: draft.py" not in second
+
+
+def test_registry_warns_again_when_unreviewed_python_skill_changes(tmp_path, capsys):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    skill_path = skills_dir / "draft.py"
+    skill_path.write_text("print('draft')\n", encoding="utf-8")
+    registry = ToolRegistry(skills_dirs=[skills_dir])
+
+    registry.get_all_specs()
+    capsys.readouterr()
+    skill_path.write_text("print('changed')\n", encoding="utf-8")
+    registry._untrusted_skill_mtimes[str(skill_path)] = -2.0
+    registry.get_all_specs()
+    changed = capsys.readouterr().out
+
+    assert "Python skill skipped until reviewed/trusted: draft.py" in changed
+
+
 def test_registry_loads_trusted_python_skill(tmp_path):
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir()

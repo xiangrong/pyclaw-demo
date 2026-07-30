@@ -27,6 +27,9 @@ class LayerContext(BaseModel):
     history_summary: str = ""
     semantic_memory: str = ""
     experience_memory: str = ""
+    retrieved_documents: str = ""
+    user_profile_memory: str = ""
+    project_memory: str = ""
     
     # Realtime data
     current_query: str = ""

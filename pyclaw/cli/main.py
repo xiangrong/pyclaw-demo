@@ -22,6 +22,9 @@ from pyclaw.channels.telegram import TelegramChannel
 from pyclaw.core.agent import Agent
 from pyclaw.core.session import SessionManager
 from pyclaw.core.memory import SemanticMemory
+from pyclaw.core.document_rag import DocumentKnowledgeStore
+from pyclaw.core.user_memory import UserMemoryStore
+from pyclaw.core.user_memory_backends import Mem0UserMemoryBackend, UserMemoryExternalBackend
 from pyclaw.core.path_discovery import discover_tool_paths
 from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
@@ -36,6 +39,13 @@ from pyclaw.tools.web_read import WebReadTool
 from pyclaw.tools.skill_activation import ActivateSkillTool, ListSkillsTool
 from pyclaw.tools.save_skill import SaveSkillTool
 from pyclaw.tools.memory_search import MemorySearchTool
+from pyclaw.tools.document_rag import IngestDocumentTool, SearchDocumentsTool
+from pyclaw.tools.user_memory import (
+    DeleteUserMemoryTool,
+    ListUserMemoriesTool,
+    SaveUserMemoryTool,
+    UpdateUserMemoryTool,
+)
 from skills.install_skill import InstallSkillTool, UninstallSkillTool
 from pyclaw.cron.tools import CronJobTool
 from pyclaw.cron.jobs import get_job
@@ -102,6 +112,68 @@ def _print_runtime_banner(
         ]
         if artifact_roots:
             print(f"  • terminal_artifact_paths: {artifact_roots}")
+
+
+async def _setup_user_memory(cfg: Config, tool_registry: ToolRegistry) -> Optional[UserMemoryStore]:
+    """Initialize structured user memory and register CRUD tools.
+
+    SQLite is always the canonical store. Optional external providers such as
+    Mem0 are best-effort sync/search extensions and must not block startup when
+    unavailable.
+    """
+    if not cfg.user_memory.enabled:
+        return None
+
+    external_backend: Optional[UserMemoryExternalBackend] = None
+    provider = (cfg.user_memory.external_provider or "").strip().lower()
+    backend = (cfg.user_memory.backend or "sqlite").strip().lower()
+    external_requested = cfg.user_memory.external_enabled or backend in {"hybrid", "mem0"}
+    if external_requested and provider in {"", "mem0"}:
+        try:
+            external_backend = Mem0UserMemoryBackend(
+                api_key=cfg.user_memory.mem0_api_key or "",
+                config=cfg.user_memory.mem0_config,
+            )
+            print("  🧠 User memory external backend: mem0 enabled")
+        except Exception as exc:
+            print(f"  ⚠️  Mem0 user memory backend disabled: {exc}")
+    elif external_requested:
+        print(f"  ⚠️  Unsupported user memory external provider: {provider or '(empty)'}")
+
+    user_memory = UserMemoryStore(
+        os.path.join(cfg.work_dir, "user_memory.db"),
+        external_backend=external_backend,
+        sync_external=cfg.user_memory.sync_external,
+        include_external_recall=cfg.user_memory.include_external_recall,
+        external_timeout_seconds=cfg.user_memory.external_timeout_seconds,
+    )
+    await user_memory.init_db()
+    tool_registry.register(ListUserMemoriesTool(user_memory))
+    tool_registry.register(SaveUserMemoryTool(user_memory))
+    tool_registry.register(UpdateUserMemoryTool(user_memory))
+    tool_registry.register(DeleteUserMemoryTool(user_memory))
+    return user_memory
+
+
+def _setup_document_rag(cfg: Config, model_provider: OpenAIProvider, tool_registry: ToolRegistry) -> Optional[DocumentKnowledgeStore]:
+    """Initialize learned document RAG and register its tools when available."""
+    if not cfg.document_rag.enabled:
+        return None
+    if not DocumentKnowledgeStore.is_available():
+        print("  ℹ️  LanceDB not found, Document RAG tools are disabled.")
+        return None
+
+    db_path = cfg.document_rag.db_path or os.path.join(cfg.work_dir, "lancedb")
+    document_store = DocumentKnowledgeStore(
+        model_provider=model_provider,
+        db_path=db_path,
+        table_name=cfg.document_rag.table_name,
+        chunk_chars=cfg.document_rag.chunk_chars,
+        chunk_overlap_chars=cfg.document_rag.chunk_overlap_chars,
+    )
+    tool_registry.register(IngestDocumentTool(document_store))
+    tool_registry.register(SearchDocumentsTool(document_store))
+    return document_store
 
 def version_callback(value: bool) -> None:
     if value:
@@ -216,17 +288,20 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             embedding_api_key=cfg.model.embedding_api_key,
         )
 
-        # 初始化语义记忆
+        # 初始化结构化用户记忆和语义记忆
+        user_memory = await _setup_user_memory(cfg, tool_registry)
+
         memory_db_path = os.path.join(cfg.work_dir, "lancedb")
         semantic_memory = None
         if SemanticMemory.is_available():
             semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
-            from pyclaw.tools.memory_search import MemorySearchTool
             from pyclaw.tools.memory_ops import SaveMemoryTool
             tool_registry.register(MemorySearchTool(semantic_memory))
             tool_registry.register(SaveMemoryTool(semantic_memory))
         else:
             print("  ℹ️  LanceDB not found, Memory Search tool is disabled.")
+
+        document_store = _setup_document_rag(cfg, model_provider, tool_registry)
 
         agent = Agent(
             model_provider=model_provider,
@@ -235,6 +310,11 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             work_dir=cfg.work_dir,
             config_dir=cfg.config_dir,
             memory=semantic_memory,
+            user_memory=user_memory,
+            document_store=document_store,
+            document_rag_auto_retrieve=cfg.document_rag.auto_retrieve,
+            document_rag_limit=cfg.document_rag.default_limit,
+            document_rag_collection=cfg.document_rag.collection,
             max_iterations=cfg.max_iterations,
             max_consecutive_failures=cfg.max_consecutive_failures,
             exec_approval_mode=cfg.exec_approval.mode,
@@ -387,17 +467,20 @@ def cron_exec(
             embedding_api_key=cfg.model.embedding_api_key,
         )
 
-        # 初始化语义记忆
+        # 初始化结构化用户记忆和语义记忆
+        user_memory = await _setup_user_memory(cfg, tool_registry)
+
         memory_db_path = os.path.join(cfg.work_dir, "lancedb")
         semantic_memory = None
         if SemanticMemory.is_available():
             semantic_memory = SemanticMemory(model_provider=model_provider, db_path=memory_db_path)
-            from pyclaw.tools.memory_search import MemorySearchTool
             from pyclaw.tools.memory_ops import SaveMemoryTool
             tool_registry.register(MemorySearchTool(semantic_memory))
             tool_registry.register(SaveMemoryTool(semantic_memory))
         else:
             print("  ℹ️  LanceDB not found, Memory Search tool is disabled.")
+
+        document_store = _setup_document_rag(cfg, model_provider, tool_registry)
 
         agent = Agent(
             model_provider=model_provider,
@@ -406,6 +489,11 @@ def cron_exec(
             work_dir=cfg.work_dir,
             config_dir=cfg.config_dir,
             memory=semantic_memory,
+            user_memory=user_memory,
+            document_store=document_store,
+            document_rag_auto_retrieve=cfg.document_rag.auto_retrieve,
+            document_rag_limit=cfg.document_rag.default_limit,
+            document_rag_collection=cfg.document_rag.collection,
             max_iterations=cfg.max_iterations,
             max_consecutive_failures=cfg.max_consecutive_failures,
             exec_approval_mode=cfg.exec_approval.mode,
@@ -513,6 +601,35 @@ web_search:
   tavily_api_key: ""
   # Brave Search API Key (备用搜索)
   brave_api_key: ""
+
+# 结构化用户记忆配置
+# SQLite 是可审查、可删除的本地权威存储；Mem0 仅作为可选的外部增强层。
+user_memory:
+  enabled: true
+  # sqlite: 仅本地结构化记忆；hybrid: 本地 SQLite + 外部后端 best-effort 同步
+  backend: "sqlite"
+  external_enabled: false
+  external_provider: "mem0"
+  # 可留空并通过环境变量 MEM0_API_KEY 注入
+  mem0_api_key: ""
+  mem0_config: {}
+  # 外部同步失败不会阻断本地记忆写入
+  sync_external: true
+  # 默认不把外部召回直接注入 prompt，避免非权威数据污染上下文
+  include_external_recall: false
+  external_timeout_seconds: 3.0
+
+# 公司/技术文档 RAG 知识库配置
+document_rag:
+  enabled: true
+  # 默认复用 work_dir/lancedb，但使用独立表 document_chunks，与会话语义记忆隔离
+  db_path: null
+  table_name: "document_chunks"
+  auto_retrieve: true
+  default_limit: 5
+  collection: "default"
+  chunk_chars: 1200
+  chunk_overlap_chars: 180
 
 # 工作目录 (Agent执行命令的默认目录)
 work_dir: "~/pyclaw"

@@ -28,6 +28,7 @@ class ToolRegistry:
         self._static_tools: set[str] = set()
         self.skills_dirs = [Path(d) for d in skills_dirs] if skills_dirs else []
         self._file_mtimes: dict[str, float] = {}
+        self._untrusted_skill_mtimes: dict[str, float] = {}
         self.work_dir = work_dir
         self.allowed_paths = allowed_paths or []
         self.orchestrator = ToolCallOrchestrator()
@@ -55,19 +56,22 @@ class ToolRegistry:
             for filepath in skills_dir.glob("**/*.py"):
                 if filepath.name.startswith("__"):
                     continue
-                if not self._is_trusted_python_skill(filepath):
-                    self._file_mtimes[str(filepath)] = -1.0
-                    print(
-                        f"⚠️  [ToolRegistry] Python skill skipped until reviewed/trusted: {filepath.name}"
-                    )
-                    continue
-
+                str_path = str(filepath)
                 try:
                     mtime = os.path.getmtime(filepath)
                 except OSError:
                     continue
 
-                str_path = str(filepath)
+                if not self._is_trusted_python_skill(filepath):
+                    if self._untrusted_skill_mtimes.get(str_path) != mtime:
+                        print(
+                            f"⚠️  [ToolRegistry] Python skill skipped until reviewed/trusted: {filepath.name}"
+                        )
+                    self._untrusted_skill_mtimes[str_path] = mtime
+                    self._file_mtimes[str_path] = -1.0
+                    continue
+                self._untrusted_skill_mtimes.pop(str_path, None)
+
                 if str_path in self._file_mtimes and self._file_mtimes[str_path] == mtime:
                     continue  # 文件没有改变
 

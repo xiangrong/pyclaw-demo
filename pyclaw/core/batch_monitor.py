@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import logging
+import hashlib
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +74,9 @@ class BatchMonitorService:
         """Store a monitor record when a durable background batch is observed."""
         if not evidence.has_durable_start or evidence.is_complete:
             return False
+        if self._completed_record_matches(session.metadata.get(DONE_KEY), latest_task=latest_task, evidence=evidence):
+            session.metadata.pop(ACTIVE_KEY, None)
+            return False
 
         existing = session.metadata.get(ACTIVE_KEY)
         record = BatchMonitorRecord.from_mapping(existing) if isinstance(existing, dict) else None
@@ -119,6 +124,14 @@ class BatchMonitorService:
         record = BatchMonitorRecord.from_mapping(raw)
         if record.delivered:
             return False
+        if self._agent_session_is_active(agent, session):
+            return False
+        if self._has_existing_delivery(session):
+            record.delivered = True
+            session.metadata.pop(ACTIVE_KEY, None)
+            session.metadata[DONE_KEY] = asdict(record)
+            await self._persist_session_metadata(agent, session)
+            return False
 
         text = self._read_evidence_text(record)
         if not text.strip():
@@ -139,6 +152,16 @@ class BatchMonitorService:
             session.metadata[ACTIVE_KEY] = asdict(record)
             await self._persist_session_metadata(agent, session)
             return False
+        if self._completed_record_matches(session.metadata.get(DONE_KEY), latest_task=record.latest_task, evidence=evidence):
+            session.metadata.pop(ACTIVE_KEY, None)
+            await self._persist_session_metadata(agent, session)
+            return False
+        if self._has_existing_assistant_completion(session, record=record, evidence_text=text):
+            record.delivered = True
+            session.metadata.pop(ACTIVE_KEY, None)
+            session.metadata[DONE_KEY] = asdict(record)
+            await self._persist_session_metadata(agent, session)
+            return False
 
         terminal_msg = Message(
             id=f"batch-monitor-tool-{int(datetime.now().timestamp())}-{session.session_id}",
@@ -153,9 +176,11 @@ class BatchMonitorService:
         final = self.batch_execution.final_from_observations(
             latest_task=record.latest_task,
             terminal_messages=[terminal_msg],
+            allow_incomplete_completed_report=True,
         ) or self.batch_execution.final_from_observations(
             latest_task=record.latest_task,
             terminal_messages=self.batch_execution.terminal_messages_since_latest_user(session),
+            allow_incomplete_completed_report=True,
         )
         if not final.strip():
             final = "批量任务已观察到完成证据，但未能生成结构化摘要；请查看日志或结果文件。"
@@ -171,7 +196,12 @@ class BatchMonitorService:
             type=MessageType.TEXT,
             role=MessageRole.ASSISTANT,
             content=final,
-            metadata={"batch_monitor_delivery": True},
+            metadata={
+                "batch_monitor_delivery": True,
+                "batch_monitor_latest_task_hash": self._stable_hash(record.latest_task),
+                "batch_monitor_log_path": record.log_path,
+                "batch_monitor_result_path": record.result_path,
+            },
         )
 
         if not await self._deliver(session, assistant_msg, adapters):
@@ -187,6 +217,108 @@ class BatchMonitorService:
         session.metadata[DONE_KEY] = asdict(record)
         await self._persist_session_metadata(agent, session)
         return True
+
+    def _agent_session_is_active(self, agent: Any, session: Session) -> bool:
+        get_status = getattr(agent, "get_status", None)
+        if not callable(get_status):
+            return False
+        try:
+            status = get_status(session.session_id)
+        except Exception:
+            return False
+        if not isinstance(status, dict):
+            return False
+        phase = str(status.get("phase") or "").strip().lower()
+        if not phase:
+            return False
+        if phase in {"done", "idle"} and not self._has_user_visible_assistant_after_latest_user(session):
+            try:
+                updated_at = float(status.get("updated_at") or 0.0)
+            except (TypeError, ValueError):
+                updated_at = 0.0
+            if updated_at and time.time() - updated_at < 120:
+                # The main agent can mark the status done just before the
+                # channel adapter persists/sends the final response.  During
+                # that short finalization window the background monitor must
+                # not race in with its own completion report.
+                return True
+        return phase not in {"idle", "done", "error"}
+
+    def _has_existing_delivery(self, session: Session) -> bool:
+        latest_user_index = -1
+        for index, msg in enumerate(getattr(session, "messages", []) or []):
+            metadata = getattr(msg, "metadata", {}) or {}
+            if getattr(msg, "role", None) == MessageRole.USER and not (
+                isinstance(metadata, dict) and metadata.get("internal_notice")
+            ):
+                latest_user_index = index
+        for msg in (getattr(session, "messages", []) or [])[latest_user_index + 1:]:
+            metadata = getattr(msg, "metadata", {}) or {}
+            if isinstance(metadata, dict) and metadata.get("batch_monitor_delivery"):
+                return True
+        return False
+
+    def _has_existing_assistant_completion(
+        self,
+        session: Session,
+        *,
+        record: BatchMonitorRecord,
+        evidence_text: str,
+    ) -> bool:
+        if not self._has_user_visible_assistant_after_latest_user(session):
+            return False
+        probe = Message(
+            id="batch-monitor-existing-completion-probe",
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.TOOL,
+            content="OBSERVATION from terminal:\n" + evidence_text,
+            metadata={"tool_name": "terminal", "tool_call_id": "batch-monitor-probe"},
+        )
+        final = self.batch_execution.final_from_observations(
+            latest_task=record.latest_task,
+            terminal_messages=[probe],
+            allow_incomplete_completed_report=False,
+        )
+        return bool(final.strip())
+
+    def _has_user_visible_assistant_after_latest_user(self, session: Session) -> bool:
+        latest_user_index = -1
+        messages = list(getattr(session, "messages", []) or [])
+        for index, msg in enumerate(messages):
+            metadata = getattr(msg, "metadata", {}) or {}
+            if getattr(msg, "role", None) == MessageRole.USER and not (
+                isinstance(metadata, dict) and metadata.get("internal_notice")
+            ):
+                latest_user_index = index
+        for msg in messages[latest_user_index + 1:]:
+            metadata = getattr(msg, "metadata", {}) or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if metadata.get("internal_notice") or metadata.get("batch_monitor_delivery"):
+                continue
+            if getattr(msg, "role", None) == MessageRole.ASSISTANT and str(getattr(msg, "content", "") or "").strip():
+                return True
+        return False
+
+    def _completed_record_matches(self, raw: Any, *, latest_task: str, evidence: BatchEvidence) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        record = BatchMonitorRecord.from_mapping(raw)
+        if not record.delivered:
+            return False
+        if record.latest_task and latest_task and record.latest_task != latest_task:
+            return False
+        if record.log_path and evidence.log_path and record.log_path != evidence.log_path:
+            return False
+        if record.result_path and evidence.result_path and record.result_path != evidence.result_path:
+            return False
+        return bool(record.log_path or record.result_path or record.pid)
+
+    def _stable_hash(self, value: str) -> str:
+        return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
 
     async def _active_sessions(self, agent: Any) -> list[Session]:
         sessions_manager = getattr(agent, "sessions", None)

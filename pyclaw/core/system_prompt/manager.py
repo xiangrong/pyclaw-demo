@@ -70,6 +70,9 @@ class SystemPromptManager:
             context.current_plan,
             context.semantic_memory,
             context.experience_memory,
+            context.retrieved_documents,
+            context.user_profile_memory,
+            context.project_memory,
             context.coding_task_status,
             context.active_skills_context,
             # Explicit deliverable/skill tasks inject a controller-owned

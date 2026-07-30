@@ -21,6 +21,8 @@ RESEARCH_TOOLS = {
     "web_extract",
     "web_read",
     "search_memory",
+    "search_documents",
+    "list_user_memories",
     "list_skills",
     "activate_skill",
 }
@@ -37,8 +39,12 @@ DANGEROUS_TOOLS = {
     "join_sub_agent",
     "send_file_to_user",
     "save_memory",
+    "save_user_memory",
+    "update_user_memory",
+    "delete_user_memory",
     "save_as_skill",
     "learn_skill_from_doc",
+    "ingest_document",
 }
 
 

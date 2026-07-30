@@ -16,7 +16,33 @@ class SessionLayer(BaseLayer):
     async def render(self, context: LayerContext) -> str:
         parts = []
         
-        # 1. Experiences (RAG)
+        # 1. Canonical structured user profile memory
+        if context.user_profile_memory:
+            parts.append(
+                "<user_profile_memory>\n"
+                + wrap_untrusted_content(
+                    context.user_profile_memory,
+                    source_type="memory",
+                    source_id=context.session_id,
+                    title="Reviewable structured user profile",
+                )
+                + "\n</user_profile_memory>"
+            )
+
+        # 2. Current project memory
+        if context.project_memory:
+            parts.append(
+                "<project_memory>\n"
+                + wrap_untrusted_content(
+                    context.project_memory,
+                    source_type="memory",
+                    source_id=context.session_id,
+                    title="Reviewable structured project memory",
+                )
+                + "\n</project_memory>"
+            )
+
+        # 3. Experiences (RAG)
         if context.experience_memory:
             parts.append(
                 "<past_experiences>\n"
@@ -29,7 +55,7 @@ class SessionLayer(BaseLayer):
                 + "\n</past_experiences>"
             )
 
-        # 2. Semantic Memory (RAG)
+        # 4. Semantic Memory (RAG)
         if context.semantic_memory:
             parts.append(
                 "<relevant_past_interactions>\n"
@@ -42,7 +68,23 @@ class SessionLayer(BaseLayer):
                 + "\n</relevant_past_interactions>"
             )
 
-        # 3. Session State (Objective & Plan)
+        # 5. Retrieved learned documents (Document RAG)
+        if context.retrieved_documents:
+            parts.append(
+                "<retrieved_documents>\n"
+                "Use these learned document chunks as evidence for the latest user request. "
+                "When your answer relies on them, cite the bracket labels such as [doc:1]. "
+                "If they are insufficient or off-topic, say so and call `search_documents` when available.\n"
+                + wrap_untrusted_content(
+                    context.retrieved_documents,
+                    source_type="document_memory",
+                    source_id=context.session_id,
+                    title="Relevant learned documents",
+                )
+                + "\n</retrieved_documents>"
+            )
+
+        # 6. Session State (Objective & Plan)
         if context.current_objective or context.current_plan:
             state_parts = []
             state_parts.append("<current_session_state>")
