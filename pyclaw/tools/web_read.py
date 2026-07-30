@@ -49,11 +49,8 @@ class WebReadTool(BaseTool):
         if not result.success:
             return result
 
-        content = result.content
-        marker = "Content:\n"
-        if content.startswith("Extracted 1:") and marker in content:
-            content = content.split(marker, 1)[1]
-
         metadata = dict(result.metadata)
         metadata["url"] = url
-        return ToolResult(success=True, content=content, metadata=metadata)
+        metadata.setdefault("trust_level", "untrusted_web")
+        metadata.setdefault("source_type", "web")
+        return ToolResult(success=True, content=result.content, metadata=metadata)

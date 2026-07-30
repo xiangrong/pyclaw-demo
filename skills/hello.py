@@ -1,3 +1,4 @@
+# pyclaw: trusted-skill
 from pyclaw.tools.base import BaseTool, ToolResult
 from pydantic import BaseModel
 

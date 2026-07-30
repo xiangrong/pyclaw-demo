@@ -7,7 +7,7 @@ import os
 import re
 import shlex
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Any
 
@@ -18,8 +18,10 @@ from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.core.system_prompt.manager import SystemPromptManager
 from pyclaw.core.system_prompt.models import LayerContext
+from pyclaw.core.context_compression import build_structured_compression, render_history_summary
 from pyclaw.core.answer_quality import AnswerQualityDecision, AnswerQualityGate
 from pyclaw.core.public_sanitize import sanitize_user_facing_content
+from pyclaw.core.status import AgentPhase, AgentStatus
 from pyclaw.core.exec_approval import ExecApprovalMode, ExecApprovalService
 from pyclaw.core.batch_execution import BatchExecutionService
 from pyclaw.core.artifacts import ArtifactManager
@@ -72,6 +74,8 @@ class Agent:
         work_dir: Optional[str] = None,
         config_dir: Optional[str] = None,
         memory: Optional[SemanticMemory] = None,
+        disable_memory: bool = False,
+        disable_personal_context: bool = False,
         max_iterations: int = 90,
         max_consecutive_failures: int = 8,
         exec_approval_service: Optional[ExecApprovalService] = None,
@@ -96,9 +100,13 @@ class Agent:
         self.max_iterations = max_iterations
         self.max_consecutive_failures = max_consecutive_failures
         self.system_prompt_manager = SystemPromptManager()
+        self.disable_memory = disable_memory
+        self.disable_personal_context = disable_personal_context
         
         # 仅在 LanceDB 可用时初始化语义记忆
-        if memory:
+        if disable_memory:
+            self.memory = None
+        elif memory:
             self.memory = memory
         elif SemanticMemory.is_available():
             self.memory = SemanticMemory(model_provider)
@@ -116,6 +124,7 @@ class Agent:
         self._last_activity_at = time.time()
         self._last_activity_event = "initialized"
         self._last_activity_session_id = ""
+        self._status_by_session: dict[str, AgentStatus] = {}
         self.answer_quality_gate = AnswerQualityGate()
         self.exec_approval = exec_approval_service or ExecApprovalService(exec_approval_mode)
         self.batch_execution = BatchExecutionService()
@@ -132,6 +141,17 @@ class Agent:
             skill_workspace=self.skill_workspace,
         )
         self._ensure_default_terminal_artifact_paths()
+        from pyclaw.core.subagent import SubAgentRuntime
+
+        self.subagents = SubAgentRuntime(
+            model_provider=self.model,
+            session_manager=self.sessions,
+            base_tool_registry=self.tools,
+            base_system_prompt=self.base_system_prompt,
+            work_dir=self.work_dir,
+            config_dir=self.config_dir,
+            exec_approval_service=self.exec_approval,
+        )
 
     def _ensure_default_terminal_artifact_paths(self) -> None:
         """Expose bounded local artifact roots to terminal commands.
@@ -179,16 +199,57 @@ class Agent:
         self._last_activity_event = event
         if session is not None:
             self._last_activity_session_id = session.session_id
+            status = self._status_for_session(session)
+            status.update(last_event=event)
 
     def get_activity_summary(self) -> dict[str, Any]:
         """Return lightweight progress information for schedulers/observers."""
+        status = self.get_status(self._last_activity_session_id) if self._last_activity_session_id else {}
         return {
             "activity_seq": self._activity_seq,
             "last_activity_at": self._last_activity_at,
             "last_event": self._last_activity_event,
             "session_id": self._last_activity_session_id,
             "max_iterations": self.max_iterations,
+            "status": status,
         }
+
+    def _status_for_session(self, session: Session) -> AgentStatus:
+        status = self._status_by_session.get(session.session_id)
+        if status is None:
+            status = AgentStatus(session_id=session.session_id, max_iterations=self.max_iterations)
+            self._status_by_session[session.session_id] = status
+        return status
+
+    def _update_status(
+        self,
+        session: Session,
+        phase: AgentPhase | str,
+        *,
+        message: str = "",
+        active_tool: str = "",
+        iteration: int | None = None,
+        max_iterations: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        status = self._status_for_session(session)
+        status.update(
+            phase=phase,
+            message=message,
+            active_tool=active_tool,
+            iteration=iteration,
+            max_iterations=max_iterations,
+            last_event=self._last_activity_event,
+            metadata=metadata,
+        )
+
+    def get_status(self, session_id: str = "") -> dict[str, Any]:
+        """Return structured Agent Status Bar state for one or the latest session."""
+        target = session_id or self._last_activity_session_id
+        if not target:
+            return {}
+        status = self._status_by_session.get(target)
+        return status.to_dict() if status is not None else {}
 
     async def _get_semantic_memories(self, session: Session) -> tuple[str, str]:
         """获取语义记忆 (Semantic Memory / RAG)"""
@@ -255,16 +316,31 @@ class Agent:
         # 1. 准备 Context
         context = LayerContext(
             base_system_prompt=self.base_system_prompt,
-            soul_content=self._load_soul_md(),
+            soul_content="" if self.disable_personal_context else self._load_soul_md(),
             agents_content=self._load_agents_md(),
-            memory_md_content=self._load_memory_md(),
-            user_md_content=self._load_user_md(),
+            memory_md_content="" if self.disable_personal_context else self._load_memory_md(),
+            user_md_content="" if self.disable_personal_context else self._load_user_md(),
             skills_index=self._get_skills_index(),
             mcp_info=self._get_mcp_info(),
+        )
+        context.extra.update(
+            {
+                "work_dir": self.work_dir,
+                "approval_mode": getattr(self.exec_approval.mode, "value", str(self.exec_approval.mode)),
+                "current_time": datetime.now(timezone.utc).isoformat(),
+                "timezone": "UTC",
+            }
         )
 
         if session:
             context.session_id = session.session_id
+            context.extra["agent_status"] = self.get_status(session.session_id)
+            # Prefer the controller's own real-user extractor over probing for
+            # ``Session.get_latest_user_message``.  Many unit tests use a
+            # ``MagicMock`` session; ``hasattr`` on a MagicMock fabricates the
+            # attribute and can leak mock reprs into the prompt as the current
+            # query, changing deterministic mocked LLM flows.
+            context.current_query = self._latest_external_user_text(session)
             context.current_objective = session.metadata.get("current_objective", "")
             context.current_plan = session.metadata.get("current_plan", "")
             if self._should_expose_coding_task_status(session):
@@ -366,7 +442,10 @@ class Agent:
         # baoyu-design/skills/baoyu-design do not trick the model into probing
         # the wrong top-level path.
         seen_markdown_names: set[str] = set()
-        for skills_dir in self._markdown_skill_dirs_for_resolution() or _available_skills_dirs():
+        markdown_skill_dirs = self._markdown_skill_dirs_for_resolution()
+        if markdown_skill_dirs is None:
+            markdown_skill_dirs = _available_skills_dirs()
+        for skills_dir in markdown_skill_dirs:
             skills_path = Path(skills_dir)
             if skills_path.exists():
                 for candidate in _discover_markdown_skills([str(skills_path)]):
@@ -603,12 +682,27 @@ class Agent:
             )
         if coding_task_status:
             await self._persist_coding_task_status(session, coding_task_status)
+        self._update_status(
+            session,
+            AgentPhase.PLANNING,
+            message="Agent loop initialized",
+            iteration=0,
+            max_iterations=max_iterations,
+        )
 
         for i in range(max_iterations):
             side_effect_call_counts.update(
                 self._current_turn_attempt_counted_side_effect_counts(session)
             )
             self._touch_activity(f"loop_iteration_{i + 1}", session)
+            self._update_status(
+                session,
+                AgentPhase.PLANNING,
+                message=f"Planning iteration {i + 1}/{max_iterations}",
+                active_tool="",
+                iteration=i + 1,
+                max_iterations=max_iterations,
+            )
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
 
             if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
@@ -640,6 +734,14 @@ class Agent:
                 tools = self.tools.get_all_specs(active_skills=active_skills)
 
             try:
+                self._update_status(
+                    session,
+                    AgentPhase.LLM_RUNNING,
+                    message="Waiting for model response",
+                    active_tool="",
+                    iteration=i + 1,
+                    max_iterations=max_iterations,
+                )
                 # 调用 LLM。网络抖动/上游超时属于瞬时故障，先短暂重试，
                 # 避免 cron 任务把一次 Request timed out 直接投递给用户。
                 result = await self._chat_with_retries(
@@ -650,6 +752,7 @@ class Agent:
                 )
                 self._touch_activity("llm_response", session)
             except Exception as e:
+                self._update_status(session, AgentPhase.ERROR, message=f"LLM error: {type(e).__name__}")
                 print(f"  ❌ LLM 调用出错: {e}")
                 error_msg = self._format_llm_error_for_user(e, session)
                 error_content = "\n\n".join(all_responses + [error_msg])
@@ -987,9 +1090,19 @@ class Agent:
                     last_tool_calls.pop(0)
 
                 # 打印工具调用信息
+                active_tool_names = [str(tc.get("function", {}).get("name", "unknown")) for tc in tool_calls]
                 for tc in tool_calls:
                     print(f"  🛠️  [Tool Call] {tc['function']['name']}({tc['function']['arguments']})")
                 self._touch_activity("tool_calls_requested", session)
+                self._update_status(
+                    session,
+                    AgentPhase.TOOL_RUNNING,
+                    message=f"Executing {len(tool_calls)} tool call(s)",
+                    active_tool=", ".join(active_tool_names[:3]),
+                    iteration=i + 1,
+                    max_iterations=max_iterations,
+                    metadata={"tool_names": active_tool_names},
+                )
 
                 for side_effect_key in pending_side_effect_key_queue:
                     if self._should_count_side_effect_attempt(side_effect_key):
@@ -1027,6 +1140,7 @@ class Agent:
                     self._touch_activity("tool_results_received", session)
                 except Exception as e:
                     self._touch_activity("tool_execution_error", session)
+                    self._update_status(session, AgentPhase.ERROR, message=f"Tool executor error: {type(e).__name__}")
                     tool_results = [
                         {
                             "role": "tool",
@@ -1492,6 +1606,14 @@ class Agent:
                     coding_task_status=coding_task_status,
                 )
             self._touch_activity("final_answer", session)
+            self._update_status(
+                session,
+                AgentPhase.DONE,
+                message="Final answer ready",
+                active_tool="",
+                iteration=i + 1,
+                max_iterations=max_iterations,
+            )
             if not final_content.strip():
                 # 如果所有周期都没有内容，且没有工具调用，说明模型可能返回了空响应
                 # 这种情况下尝试返回原始结果或给予提示
@@ -1519,6 +1641,14 @@ class Agent:
                 build_results=build_results,
                 coding_task_status=coding_task_status,
             )
+        self._update_status(
+            session,
+            AgentPhase.DONE,
+            message="Stopped at iteration limit",
+            active_tool="",
+            iteration=max_iterations,
+            max_iterations=max_iterations,
+        )
         return stop_content, pending_files
 
     def _get_session_int(self, session: Session, key: str, default: int) -> int:
@@ -2372,7 +2502,27 @@ class Agent:
 
     def _should_track_coding_changed_file(self, path: str) -> bool:
         """Return True when a written file should count as source-code progress."""
+        if self._is_user_skill_source_path(path):
+            return True
         return not self._is_operational_runtime_path(path)
+
+    def _is_user_skill_source_path(self, path: str) -> bool:
+        """Return True for user-authored skill files under ``~/.pyclaw/skills``.
+
+        PyClaw runtime scratch files under ``~/.pyclaw`` are deliberately not
+        counted as coding progress, but editing a user skill/script is a real
+        source change even though it also lives under the PyClaw home.  Keep
+        this exception narrow so batch output such as ``~/.pyclaw/pods.txt``
+        remains operational scratch material.
+        """
+        if not path:
+            return False
+        try:
+            candidate = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+            skills_root = os.path.abspath(os.path.expandvars(os.path.expanduser("~/.pyclaw/skills")))
+            return os.path.commonpath([candidate, skills_root]) == skills_root
+        except ValueError:
+            return False
 
     def _is_operational_runtime_path(self, path: str) -> bool:
         """Return True for PyClaw runtime scratch files outside this repo."""
@@ -2495,10 +2645,10 @@ class Agent:
         command = self._extract_terminal_command(arguments)
         if not command:
             return "unknown"
-        if self._looks_like_terminal_navigation(command):
-            return "navigation"
         if self._looks_like_validation_command(command) or self._looks_like_build_command(command):
             return "validation"
+        if self._looks_like_terminal_navigation(command):
+            return "navigation"
         if self._looks_like_terminal_mutation(command):
             return "mutation"
         return "unknown"
@@ -2506,6 +2656,8 @@ class Agent:
     def _looks_like_terminal_navigation(self, command: str) -> bool:
         """Return True for shell commands commonly used only to inspect code/files."""
         if not command:
+            return False
+        if self._looks_like_inline_script_heredoc(command):
             return False
         if is_read_only_terminal_command(command):
             return True
@@ -2536,6 +2688,55 @@ class Agent:
             if index > 0 and head not in {"head", "tail", "grep", "rg", "wc", "sed", "cat"}:
                 return False
         return True
+
+    def _looks_like_inline_script_heredoc(self, command: str) -> bool:
+        """Return True when a shell heredoc feeds an interpreter stdin script.
+
+        ``python3 - <<'PY'`` and friends are executable programs, not plain
+        navigation.  The shell parser strips heredoc bodies before classification,
+        so without this guard such snippets collapse to ``python3 -`` and look
+        read-only.  Treat them as side-effect candidates so duplicate generation
+        scripts are budgeted and skipped just like file/terminal mutations.
+        Data heredocs such as ``cat > file <<EOF`` remain handled by the normal
+        redirection/mutation logic.
+        """
+        if not command or "<<" not in command:
+            return False
+        script_heads = {"python", "python3", "node", "ruby", "perl", "bash", "sh", "zsh"}
+        for line in command.splitlines():
+            if "<<" not in line:
+                continue
+            prefix = re.split(r"<<-?", line, maxsplit=1)[0].strip()
+            if not prefix:
+                continue
+            # Only inspect the command segment immediately before the heredoc.
+            segment = re.split(r"\s*(?:&&|\|\||;|\|)\s*", prefix)[-1].strip()
+            if not segment:
+                continue
+            try:
+                parts = shlex.split(segment)
+            except ValueError:
+                continue
+            if not parts:
+                continue
+            head = os.path.basename(parts[0]).lower()
+            if head not in script_heads:
+                continue
+            args = parts[1:]
+            if head in {"bash", "sh", "zsh"}:
+                # ``bash <<'SH'`` feeds an inline shell program.  ``bash script.sh
+                # <<EOF`` is a script with stdin data, so leave it to normal
+                # command classification.
+                non_option_args = [arg for arg in args if not arg.startswith("-")]
+                if not non_option_args:
+                    return True
+                continue
+            # Python/Ruby/Perl/Node accept stdin programs either explicitly via
+            # ``-`` or implicitly when no script path is provided.
+            non_option_args = [arg for arg in args if not arg.startswith("-")]
+            if "-" in args or not non_option_args:
+                return True
+        return False
 
     def _looks_like_terminal_mutation(self, command: str) -> bool:
         if not command:
@@ -4519,16 +4720,45 @@ class Agent:
                 continue
             if path:
                 dirs.append(path)
-        # ToolRegistry historically left ``skills_dirs`` empty unless the
-        # caller passed explicit roots.  Markdown skill tools still discover
-        # ``~/.pyclaw/skills`` via ``_available_skills_dirs()``, so returning an
-        # empty list here split the controller from the skill tool: explicit
-        # requests such as "走完整的 baoyu design skill ..." could resolve only
-        # by fallback name inference while the system prompt/index claimed no
-        # skills existed.  Hermes/OpenClaw keep capability discovery in one
-        # place; mirror that by falling back to the shared resolver roots when
-        # the registry has no configured roots.
-        return dirs or None
+        # A real ToolRegistry historically leaves ``skills_dirs`` empty unless
+        # the caller passes explicit roots.  In production, keep controller
+        # discovery aligned with the markdown activation tool by falling back to
+        # shared resolver roots.  In tests and embedders, however, callers often
+        # pass a light MagicMock with ``skills_dirs=[]`` to mean "no skills"; do
+        # not silently discover the developer's personal ~/.pyclaw/skills there,
+        # or generic file-deliverable tests become environment-dependent.
+        if dirs:
+            return dirs
+        fallback_dirs = self._controlled_fallback_skill_dirs_for_empty_registry()
+        if fallback_dirs:
+            return fallback_dirs
+        return None if isinstance(registry, ToolRegistry) else []
+
+    def _controlled_fallback_skill_dirs_for_empty_registry(self) -> list[str]:
+        """Return non-default resolver roots for empty mock registries.
+
+        A real ``ToolRegistry(skills_dirs=[])`` should use the shared markdown
+        resolver, but many controller unit tests pass ``MagicMock.skills_dirs=[]``
+        to suppress ambient personal skills.  When a test or embedding explicitly
+        overrides ``_available_skills_dirs`` to a controlled root, that root is
+        neither the project ``./skills`` directory nor ``~/.pyclaw/skills``.  In
+        that case it is safe and necessary to use it so controller discovery stays
+        aligned with ``activate_skill`` without leaking personal skills into
+        unrelated tests.
+        """
+        default_roots = {
+            os.path.abspath(os.path.join(os.getcwd(), "skills")),
+            os.path.abspath(os.path.expanduser("~/.pyclaw/skills")),
+        }
+        controlled: list[str] = []
+        for raw in _available_skills_dirs():
+            try:
+                path = os.path.abspath(os.path.expanduser(str(raw)))
+            except (TypeError, ValueError):
+                continue
+            if path and path not in default_roots and path not in controlled:
+                controlled.append(path)
+        return controlled
 
     def _normalize_skill_name_for_lookup(self, name: str) -> str:
         clean = str(name or "").strip().strip("/ ").lower().replace("_", "-")
@@ -6560,6 +6790,7 @@ class Agent:
         """对过长的历史消息进行摘要并压缩"""
         try:
             print(f"📝 [History] Summarizing session {session.session_id}...")
+            self._update_status(session, AgentPhase.COMPRESSING, message="Compressing conversation history")
             
             # 1. 提取需要摘要的消息 (除了系统消息和最近 10 条之外的所有消息)
             limit = 10
@@ -6575,52 +6806,38 @@ class Agent:
             if not msgs_to_summarize:
                 return
 
-            # 2. 调用 LLM 生成摘要
-            summary_prompt = (
-                "Please provide a concise summary of the following conversation history. "
-                "Focus on the main objectives discussed and the outcomes achieved. "
-                "Keep it under 300 words.\n\n"
-                "CONVERSATION TO SUMMARIZE:\n"
+            # 2. Deterministic structured compression.  Historical text may be
+            # hostile prompt-injection data, so do not ask the model to create
+            # controller-owned instructions from it.
+            old_summary = session.metadata.get("history_summary", "")
+            compression = build_structured_compression(
+                msgs_to_summarize,
+                previous_summary=old_summary,
+                recent_message_count=limit,
             )
-            for m in msgs_to_summarize:
-                summary_prompt += f"{m.role.value.upper()}: {m.content[:500]}\n"
-            
-            summary_result = await self.model.chat(
-                messages=[{"role": "user", "content": summary_prompt}],
-                tools=None
-            )
-            
-            if summary_result:
-                new_summary = str(summary_result)
-                
-                # 3. 更新会话 Metadata
-                # 如果已有摘要，可以合并
-                old_summary = session.metadata.get("history_summary", "")
-                if old_summary:
-                    # 再次摘要合并后的内容
-                    combined_prompt = f"Combine the old summary and the new summary into a single cohesive summary:\nOld: {old_summary}\nNew: {new_summary}"
-                    summary_result = await self.model.chat(
-                        messages=[{"role": "user", "content": combined_prompt}],
-                        tools=None
-                    )
-                    if summary_result:
-                        new_summary = str(summary_result)
+            new_summary = render_history_summary(compression)
 
-                session.metadata["history_summary"] = new_summary
-                
-                # 4. 物理删除数据库中过旧的消息 (PRD: 30 轮之前丢弃)
-                # 在本实现中，我们通过 get_history 逻辑来过滤，但为了性能可以清理数据库
-                # 暂时只更新 metadata
-                async with self.sessions.db_connect() as db:
-                    await db.execute(
-                        "UPDATE sessions SET metadata = ? WHERE session_id = ?",
-                        (json.dumps(session.metadata), session.session_id)
-                    )
-                    await db.commit()
-                
-                print(f"✅ [History] Session {session.session_id} compressed.")
+            # 3. 更新会话 Metadata.  Preserve the legacy history_summary slot
+            # for Session.get_history while adding a structured object for UI
+            # and future layered context routing.
+            session.metadata["context_compression"] = compression
+            session.metadata["history_summary"] = new_summary
+
+            # 4. 物理删除数据库中过旧的消息 (PRD: 30 轮之前丢弃)
+            # 在本实现中，我们通过 get_history 逻辑来过滤，但为了性能可以清理数据库
+            # 暂时只更新 metadata
+            async with self.sessions.db_connect() as db:
+                await db.execute(
+                    "UPDATE sessions SET metadata = ? WHERE session_id = ?",
+                    (json.dumps(session.metadata), session.session_id)
+                )
+                await db.commit()
+
+            print(f"✅ [History] Session {session.session_id} compressed.")
+            self._update_status(session, AgentPhase.DONE, message="Conversation history compressed")
 
         except Exception as e:
+            self._update_status(session, AgentPhase.ERROR, message=f"History compression failed: {type(e).__name__}")
             print(f"⚠️ [History] Failed to summarize history: {e}")
 
     async def _extract_and_save_experience(self, session: Session, final_response: str) -> None:

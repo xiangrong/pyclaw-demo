@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import sys
+import ast
+import math
 import traceback
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
@@ -30,32 +29,102 @@ class PythonInterpreterTool(BaseTool):
     # 注意：生产环境建议配合 Docker Sandboxing 使用
     _session_states: Dict[str, Dict[str, Any]] = {}
 
+    _SAFE_BUILTINS: Dict[str, Any] = {
+        "abs": abs,
+        "all": all,
+        "any": any,
+        "bool": bool,
+        "dict": dict,
+        "enumerate": enumerate,
+        "filter": filter,
+        "float": float,
+        "int": int,
+        "isinstance": isinstance,
+        "issubclass": issubclass,
+        "len": len,
+        "list": list,
+        "map": map,
+        "max": max,
+        "min": min,
+        "pow": pow,
+        "print": print,
+        "range": range,
+        "repr": repr,
+        "round": round,
+        "set": set,
+        "slice": slice,
+        "sorted": sorted,
+        "str": str,
+        "sum": sum,
+        "tuple": tuple,
+        "zip": zip,
+        "Exception": Exception,
+        "ValueError": ValueError,
+        "TypeError": TypeError,
+        "RuntimeError": RuntimeError,
+    }
+
+    _DENIED_NAMES = {
+        "__builtins__",
+        "__import__",
+        "eval",
+        "exec",
+        "compile",
+        "open",
+        "input",
+        "globals",
+        "locals",
+        "vars",
+        "dir",
+        "getattr",
+        "setattr",
+        "delattr",
+        "help",
+        "breakpoint",
+        "memoryview",
+        "super",
+    }
+
+    def _sandbox_violation(self, code: str) -> str:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return ""
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                return "import statements are disabled in the in-process Python sandbox"
+            if isinstance(node, ast.Name) and node.id in self._DENIED_NAMES:
+                return f"use of '{node.id}' is disabled in the in-process Python sandbox"
+            if isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+                return "dunder attribute access is disabled in the in-process Python sandbox"
+            if isinstance(node, ast.Name) and node.id.startswith("__"):
+                return "dunder name access is disabled in the in-process Python sandbox"
+        return ""
+
     async def execute(self, code: str, session_id: Optional[str] = None) -> ToolResult:
         print(f"  🐍 [Python] Executing code snippet (Session: {session_id or 'global'})...")
         
-        # 简单代码沙箱化：拦截敏感操作 (仅限 Workspace Lockdown 模式)
-        if self.work_dir:
-            restricted_keywords = [
-                "open(", "os.listdir", "os.walk", "os.remove", "os.system", 
-                "subprocess", "shutil", "pathlib.Path.unlink", "Path.mkdir"
-            ]
-            # 这里可以用抽象语法树 (AST) 做更精确的检查，现在先用简单字符串匹配
-            for kw in restricted_keywords:
-                if kw in code:
-                    return ToolResult(
-                        success=False,
-                        content=f"⚠️ Python 解释器安全拦截: 检测到受限的文件系统或系统操作 `{kw}`。在沙箱模式下，请使用 FileTool 进行文件操作。"
-                    )
+        violation = self._sandbox_violation(code)
+        if violation:
+            return ToolResult(
+                success=False,
+                content=(
+                    "Python sandbox denied execution: "
+                    f"{violation}. Use dedicated file, terminal, or approved tools for I/O and system actions."
+                ),
+                metadata={"sandbox": "restricted", "denied_reason": violation},
+                error_code="python_sandbox_denied",
+                requires_model_repair=True,
+            )
 
         # 使用 global 作为默认 session
         sid = session_id or "global"
         
         if sid not in self._session_states:
             self._session_states[sid] = {
-                "__builtins__": __builtins__,
-                "os": os,
-                "sys": sys,
-                "asyncio": asyncio,
+                "__builtins__": dict(self._SAFE_BUILTINS),
+                "math": math,
             }
 
         # 捕获 stdout

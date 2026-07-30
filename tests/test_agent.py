@@ -1620,6 +1620,15 @@ def test_terminal_stderr_redirect_does_not_create_file_mutation_key():
     assert agent._terminal_file_redirect_target("python build_ppt.py > out.log 2>&1") == "out.log"
 
 
+def test_inline_script_heredoc_counts_as_terminal_side_effect():
+    agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
+    command = "python3 - <<'PY'\nprint('would create deck')\nPY"
+
+    assert agent._looks_like_inline_script_heredoc(command)
+    assert not agent._looks_like_terminal_navigation(command)
+    assert agent._terminal_side_effect_call_key(json.dumps({"command": command})) is not None
+
+
 def test_file_deliverable_auto_approves_artifact_scoped_terminal_command():
     agent = Agent(AsyncMock(), MagicMock(), AsyncMock())
     session = MagicMock()
@@ -12602,3 +12611,55 @@ async def test_agent_repairs_summary_only_pod_egress_by_reading_result_file():
     assert "TianjinTianjin | 3 台" in response.content
     assert "批量任务已有结果输出" not in response.content
     assert "NOTICE" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_history_compression_writes_structured_layers(tmp_path):
+    model = AsyncMock()
+    tools = MagicMock()
+    tools._tools = {}
+    tools._static_tools = set()
+    tools.skills_dirs = []
+    sessions = MagicMock()
+
+    class DummyDb:
+        async def execute(self, *args, **kwargs):
+            return None
+
+        async def commit(self):
+            return None
+
+    class DummyConnect:
+        async def __aenter__(self):
+            return DummyDb()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    sessions.db_connect.return_value = DummyConnect()
+    agent = Agent(model, tools, sessions)
+    session = Session(session_id="s-compress", user_id="u1", channel="t")
+    for idx in range(13):
+        role = MessageRole.USER if idx % 2 == 0 else MessageRole.ASSISTANT
+        content = "决定采用方案A" if idx == 2 else f"message {idx}"
+        if idx == 4:
+            content = "TODO: continue validation"
+        session.add_message(
+            Message(
+                id=f"m{idx}",
+                channel="t",
+                channel_user_id="u1",
+                session_id=session.session_id,
+                type=MessageType.TEXT,
+                role=role,
+                content=content,
+            )
+        )
+
+    await agent._summarize_and_compress_history(session)
+
+    assert "context_compression" in session.metadata
+    assert session.metadata["context_compression"]["version"] == "structured-v1"
+    assert "Structured context compression" in session.metadata["history_summary"]
+    assert "read-only data" in session.metadata["history_summary"]
+    assert model.chat.await_count == 0

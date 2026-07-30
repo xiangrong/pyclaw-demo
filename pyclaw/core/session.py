@@ -210,7 +210,7 @@ class SessionManager:
                     metadata=metadata
                 )
             
-            self._sessions[key] = session
+            self._cache_session(session, by_channel_user=True)
             return session
 
     async def list_sessions_with_metadata_key(self, key: str) -> list[Session]:
@@ -272,21 +272,50 @@ class SessionManager:
                     messages=messages,
                     metadata=metadata,
                 )
-                self._sessions[f"{channel}:{user_id}"] = session
+                self._cache_session(session, by_channel_user=True)
                 matches.append(session)
 
         return matches
 
-    async def create_session(self, session_id: str, user_id: str = "default", channel: str = "internal") -> Session:
-        """强制创建一个指定ID的会话（主要用于 Cron 等场景）"""
+    async def create_session(
+        self,
+        session_id: str,
+        user_id: str = "default",
+        channel: str = "internal",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Session:
+        """Create or load the exact session id requested by a controller.
+
+        This is used by synthetic controllers such as cron and sub-agents where
+        the session id is already part of the isolation boundary.  Do not route
+        through ``get_or_create(channel, user_id)`` here: that method is keyed by
+        channel/user and would collapse different explicit session ids such as
+        ``subagent-a`` and ``subagent-b`` into the same ``internal:default``
+        cached session.
+        """
+        initial_metadata = metadata or {}
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 "INSERT OR IGNORE INTO sessions (session_id, user_id, channel, metadata) VALUES (?, ?, ?, ?)",
-                (session_id, user_id, channel, json.dumps({}))
+                (session_id, user_id, channel, json.dumps(initial_metadata))
             )
             await db.commit()
-            
-        return await self.get_or_create(channel, user_id)
+
+        loaded = await self.get_by_session_id(session_id)
+        if loaded is None:
+            # Defensive fallback: INSERT OR IGNORE should have made the session
+            # visible, but return an isolated in-memory object instead of
+            # falling back to channel/user lookup if the DB read unexpectedly
+            # fails.
+            loaded = Session(
+                session_id=session_id,
+                user_id=user_id,
+                channel=channel,
+                messages=[],
+                metadata=initial_metadata,
+            )
+            self._cache_session(loaded, by_channel_user=False)
+        return loaded
 
     async def save_message(self, session: Session, message: Message) -> None:
         """保存消息到数据库，并同步到内存会话"""
@@ -364,9 +393,81 @@ class SessionManager:
             storage_ids.append(legacy_id)
         return storage_ids
 
+    def _cache_session(self, session: Session, *, by_channel_user: bool) -> None:
+        """Cache a session by id and, when safe, by channel/user identity.
+
+        Explicit controller-created sessions may intentionally share a
+        channel/user pair while differing by session id.  Those must not
+        overwrite the normal ``get_or_create(channel, user)`` cache entry.
+        """
+        self._sessions[f"session:{session.session_id}"] = session
+        if by_channel_user:
+            self._sessions[f"{session.channel}:{session.user_id}"] = session
+
+    async def get_by_session_id(self, session_id: str) -> Optional[Session]:
+        """Load one exact session id, including canonical and legacy messages."""
+        if not session_id:
+            return None
+        cached = self._sessions.get(f"session:{session_id}")
+        if cached is not None:
+            return cached
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row is None:
+                return None
+
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except json.JSONDecodeError:
+                metadata = {}
+
+            channel = row["channel"]
+            user_id = row["user_id"]
+            storage_ids = self._message_storage_ids(session_id, channel, user_id)
+            placeholders = ", ".join("?" for _ in storage_ids)
+            messages: list[Message] = []
+            async with db.execute(
+                f"SELECT * FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp ASC",
+                tuple(storage_ids),
+            ) as msg_cursor:
+                async for msg_row in msg_cursor:
+                    messages.append(Message(
+                        id=msg_row["id"],
+                        channel=msg_row["channel"],
+                        channel_user_id=msg_row["channel_user_id"],
+                        user_id=msg_row["user_id"],
+                        session_id=msg_row["session_id"],
+                        type=MessageType(msg_row["type"]),
+                        role=MessageRole(msg_row["role"]),
+                        content=msg_row["content"],
+                        timestamp=datetime.fromisoformat(msg_row["timestamp"]),
+                        metadata=json.loads(msg_row["metadata"] or "{}"),
+                    ))
+
+        session = Session(
+            session_id=session_id,
+            user_id=user_id,
+            channel=channel,
+            messages=messages,
+            metadata=metadata,
+        )
+        self._cache_session(session, by_channel_user=False)
+        return session
+
     def get_by_id(self, session_id: str) -> Optional[Session]:
         """通过会话ID从缓存获取"""
+        cached = self._sessions.get(f"session:{session_id}")
+        if cached is not None:
+            return cached
         for session in self._sessions.values():
             if session.session_id == session_id:
+                self._sessions[f"session:{session_id}"] = session
                 return session
         return None

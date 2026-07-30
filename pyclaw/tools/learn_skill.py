@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import json
 import re
 from typing import Any, Optional
 from pathlib import Path
@@ -11,6 +10,7 @@ from pydantic import BaseModel, Field
 import trafilatura
 
 from .base import BaseTool, ToolResult
+from .web_extract import unsafe_url_reason
 
 
 class LearnFromDocArgs(BaseModel):
@@ -37,6 +37,14 @@ class LearnFromDocTool(BaseTool):
             # 1. 获取文档内容
             content = ""
             if source.startswith(("http://", "https://")):
+                unsafe_reason = unsafe_url_reason(source)
+                if unsafe_reason:
+                    return ToolResult(
+                        success=False,
+                        content=f"Unsafe or unsupported URL '{source}': {unsafe_reason}",
+                        error_code="unsafe_url",
+                        requires_model_repair=True,
+                    )
                 print(f"  📥 [LearnSkill] Fetching documentation from URL: {source}")
                 def _fetch():
                     downloaded = trafilatura.fetch_url(source)
@@ -46,7 +54,16 @@ class LearnFromDocTool(BaseTool):
                 content = await loop.run_in_executor(None, _fetch)
             else:
                 print(f"  📥 [LearnSkill] Reading documentation from file: {source}")
-                path = Path(source)
+                try:
+                    resolved = self.validate_path(source)
+                except PermissionError as exc:
+                    return ToolResult(
+                        success=False,
+                        content=f"Access denied while reading documentation: {exc}",
+                        error_code="path_outside_workspace",
+                        requires_model_repair=True,
+                    )
+                path = Path(resolved)
                 if path.exists():
                     content = path.read_text(encoding="utf-8")
                 else:
@@ -90,23 +107,37 @@ class LearnFromDocTool(BaseTool):
                 return ToolResult(success=False, content="Error: Model failed to generate SKILL.md content.")
 
             # 4. 保存文件
-            skills_dir = Path(self.agent.work_dir) / "skills" / skill_name
+            safe_skill_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", skill_name).strip("_") or "learned_skill"
+            work_root = Path(self.agent.work_dir).resolve()
+            skills_dir = work_root / "skills" / safe_skill_name
+            if os.path.commonpath([str(skills_dir.resolve().parent.parent), str(work_root)]) != str(work_root):
+                return ToolResult(success=False, content="Error: Invalid skill path.", error_code="invalid_skill_path")
             skills_dir.mkdir(parents=True, exist_ok=True)
             
             (skills_dir / "SKILL.md").write_text(skill_md_content, encoding="utf-8")
+            review_path = ""
             
             if script_content and len(script_content) > 10:
-                script_path = skills_dir / f"{skill_name}_wrapper.py"
+                script_path = skills_dir / f"{safe_skill_name}_wrapper.py.review"
                 script_path.write_text(script_content, encoding="utf-8")
+                review_path = str(script_path)
                 print(f"  ✅ [LearnSkill] Wrapper script saved to {script_path}")
 
-            print(f"  ✅ [LearnSkill] Skill '{skill_name}' successfully learned and saved to {skills_dir}")
+            print(f"  ✅ [LearnSkill] Skill '{safe_skill_name}' successfully learned and saved to {skills_dir}")
 
             return ToolResult(
                 success=True,
-                content=f"SUCCESS: Skill '{skill_name}' has been learned from {source}.\n"
+                content=f"SUCCESS: Skill '{safe_skill_name}' has been learned from {source}.\n"
                         f"The new skill is located at {skills_dir}.\n"
-                        f"IMPORTANT: You can now see it in the <available_skills> index and use it by calling `activate_skill(name='{skill_name}')`."
+                        "If a helper script was generated it was saved as .py.review and is not executable until human review adds '# pyclaw: trusted-skill' and renames it to .py.\n"
+                        f"IMPORTANT: You can now see it in the <available_skills> index and use it by calling `activate_skill(name='{safe_skill_name}')`.",
+                metadata={
+                    "skill_name": safe_skill_name,
+                    "skill_dir": str(skills_dir),
+                    "script_review_path": review_path,
+                    "review_required": bool(review_path),
+                    "trust_level": "untrusted_skill",
+                },
             )
 
         except Exception as e:

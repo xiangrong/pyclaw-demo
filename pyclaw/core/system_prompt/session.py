@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Optional
 from .base import BaseLayer
 from .models import LayerContext
+from pyclaw.core.trust import wrap_untrusted_content
 
 
 class SessionLayer(BaseLayer):
@@ -17,11 +18,29 @@ class SessionLayer(BaseLayer):
         
         # 1. Experiences (RAG)
         if context.experience_memory:
-            parts.append(f"<past_experiences>\n{context.experience_memory}\n</past_experiences>")
+            parts.append(
+                "<past_experiences>\n"
+                + wrap_untrusted_content(
+                    context.experience_memory,
+                    source_type="experience_memory",
+                    source_id=context.session_id,
+                    title="Relevant past experience",
+                )
+                + "\n</past_experiences>"
+            )
 
         # 2. Semantic Memory (RAG)
         if context.semantic_memory:
-            parts.append(f"<relevant_past_interactions>\n{context.semantic_memory}\n</relevant_past_interactions>")
+            parts.append(
+                "<relevant_past_interactions>\n"
+                + wrap_untrusted_content(
+                    context.semantic_memory,
+                    source_type="semantic_memory",
+                    source_id=context.session_id,
+                    title="Relevant past interactions",
+                )
+                + "\n</relevant_past_interactions>"
+            )
 
         # 3. Session State (Objective & Plan)
         if context.current_objective or context.current_plan:

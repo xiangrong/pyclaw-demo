@@ -1,4 +1,7 @@
 import os
+import re
+from typing import Any
+
 from pydantic import BaseModel, Field
 from pyclaw.tools.base import BaseTool, ToolResult
 
@@ -10,10 +13,14 @@ class SaveSkillArgs(BaseModel):
 
 class SaveSkillTool(BaseTool):
     name = "save_as_skill"
-    description = "Persists successful complex procedures or custom Python tools as reusable skills in the local workspace. Use this to permanently expand PyClaw's capabilities."
+    description = (
+        "Persists successful complex procedures as reusable skills in the local workspace. "
+        "Markdown skills are immediately indexable. Python tool scripts are saved as .py.review "
+        "and require human review plus a trusted-skill marker before they can be executed."
+    )
     args_schema = SaveSkillArgs
 
-    async def execute(self, **kwargs) -> ToolResult:
+    async def execute(self, **kwargs: Any) -> ToolResult:
         name = kwargs.get("name")
         description = kwargs.get("description")
         content = kwargs.get("content")
@@ -22,20 +29,20 @@ class SaveSkillTool(BaseTool):
         if not name or not content:
             return ToolResult(success=False, content="Error: 'name' and 'content' are required.")
 
-        skills_dir = os.path.abspath(os.path.join(os.getcwd(), "skills"))
+        skills_root = os.path.join(self.work_dir or os.getcwd(), "skills")
+        skills_dir = self.validate_path(skills_root) if self.work_dir else os.path.abspath(skills_root)
         os.makedirs(skills_dir, exist_ok=True)
 
         # Sanitize name
-        import re
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
         
         if is_python:
             if not safe_name.endswith('.py'):
                 safe_name += '.py'
-            target_path = os.path.join(skills_dir, safe_name)
+            target_path = os.path.join(skills_dir, safe_name + ".review")
             
             # Security check
-            if not target_path.startswith(skills_dir):
+            if os.path.commonpath([os.path.abspath(target_path), skills_dir]) != skills_dir:
                 return ToolResult(success=False, content="Error: Invalid skill name.")
 
             try:
@@ -43,15 +50,26 @@ class SaveSkillTool(BaseTool):
                     f.write(content)
                 return ToolResult(
                     success=True, 
-                    content=f"✅ SUCCESS: Python tool skill saved to {target_path}.\n"
-                            f"The new Python tool will be dynamically loaded in the next turn if valid."
+                    content=(
+                        f"SUCCESS: Python tool draft saved to {target_path}.\n"
+                        "Security boundary: executable Python skills are NOT auto-loaded. "
+                        "A human must review the file, add '# pyclaw: trusted-skill', "
+                        "and rename it to .py before activation."
+                    ),
+                    metadata={
+                        "path": target_path,
+                        "review_required": True,
+                        "executable": False,
+                        "trust_level": "untrusted_skill",
+                    },
+                    structured={"path": target_path, "review_required": True},
                 )
             except Exception as e:
                 return ToolResult(success=False, content=f"Failed to save python skill: {str(e)}")
         else:
             target_dir = os.path.join(skills_dir, safe_name)
             # Security check
-            if not target_dir.startswith(skills_dir):
+            if os.path.commonpath([os.path.abspath(target_dir), skills_dir]) != skills_dir:
                 return ToolResult(success=False, content="Error: Invalid skill name.")
             
             os.makedirs(target_dir, exist_ok=True)

@@ -55,6 +55,12 @@ class ToolRegistry:
             for filepath in skills_dir.glob("**/*.py"):
                 if filepath.name.startswith("__"):
                     continue
+                if not self._is_trusted_python_skill(filepath):
+                    self._file_mtimes[str(filepath)] = -1.0
+                    print(
+                        f"⚠️  [ToolRegistry] Python skill skipped until reviewed/trusted: {filepath.name}"
+                    )
+                    continue
 
                 try:
                     mtime = os.path.getmtime(filepath)
@@ -93,6 +99,18 @@ class ToolRegistry:
                     if self._file_mtimes.get(str_path) != -1.0:
                         print(f"⚠️  [ToolRegistry] 技能脚本加载跳过 {filepath.name}: {e} (可能缺少依赖)")
                         self._file_mtimes[str_path] = -1.0 # 标记为加载失败，下次 refresh 不再重复尝试直到文件变动
+
+    def _is_trusted_python_skill(self, filepath: Path) -> bool:
+        """Return True only for reviewed executable Python skill files."""
+
+        if os.environ.get("PYCLAW_ALLOW_UNREVIEWED_PYTHON_SKILLS") == "1":
+            return True
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                head = f.read(4096)
+        except OSError:
+            return False
+        return "pyclaw: trusted-skill" in head
 
     def get_tool(self, name: str) -> Optional[BaseTool]:
         """获取工具"""

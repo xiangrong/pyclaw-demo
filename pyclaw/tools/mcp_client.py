@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 from typing import Any
 
-from pydantic import BaseModel, create_model
+from pydantic import Field, create_model
 
 from pyclaw.infra.config import MCPServerConfig
+from pyclaw.core.trust import wrap_untrusted_content
 from pyclaw.tools.base import BaseTool, ToolResult
 
 # MCP 相关依赖（在没有安装时可以延迟报错）
@@ -22,6 +22,29 @@ except ImportError:
 class MCPTool(BaseTool):
     """基于 MCP 的动态工具"""
 
+    MUTATING_VERBS = {
+        "create",
+        "update",
+        "delete",
+        "remove",
+        "write",
+        "edit",
+        "send",
+        "post",
+        "put",
+        "patch",
+        "move",
+        "copy",
+        "upload",
+        "trigger",
+        "run",
+        "execute",
+        "exec",
+        "apply",
+        "approve",
+        "archive",
+    }
+
     def __init__(
         self,
         name: str,
@@ -34,6 +57,7 @@ class MCPTool(BaseTool):
         self.original_name = original_name
         self.description = description
         self.session = session
+        self.requires_approval = self._requires_approval(original_name)
         
         # 动态创建 Pydantic Model 作为 args_schema
         # MCP 工具的 input_schema 符合 JSON Schema 草案规范
@@ -59,10 +83,40 @@ class MCPTool(BaseTool):
             else:
                 fields[k] = (field_type, ...)
 
+        fields["approved"] = (
+            bool | None,
+            Field(
+                default=None,
+                description="Set true only after explicit user approval for MCP tools that may change external state.",
+            ),
+        )
+
         self.args_schema = create_model(f"{name}_schema", **fields)  # type: ignore
+
+    @classmethod
+    def _requires_approval(cls, name: str) -> bool:
+        parts = [part for part in str(name or "").replace("-", "_").split("_") if part]
+        return any(part.lower() in cls.MUTATING_VERBS for part in parts[:3])
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         """执行 MCP 远程工具"""
+        approved = bool(kwargs.pop("approved", False))
+        if self.requires_approval and not approved:
+            return ToolResult(
+                success=False,
+                content=(
+                    f"MCP tool '{self.name}' may modify external state and requires explicit user approval. "
+                    "Ask the user for approval, then retry with approved=true only if approved."
+                ),
+                metadata={
+                    "trust_level": "untrusted_mcp",
+                    "source_type": "mcp",
+                    "mcp_tool": self.original_name,
+                    "approval_required": True,
+                },
+                error_code="mcp_approval_required",
+                requires_model_repair=True,
+            )
         try:
             result = await self.session.call_tool(self.original_name, arguments=kwargs)
             # result 结构通常包含 content 数组（可能有 text/image）
@@ -74,15 +128,35 @@ class MCPTool(BaseTool):
             
             # 如果出错，通常会有 isError 标志
             is_error = getattr(result, "isError", False)
+            raw_content = content.strip() if content else str(result)
 
             return ToolResult(
                 success=not is_error,
-                content=content.strip() if content else str(result),
+                content=wrap_untrusted_content(
+                    raw_content,
+                    source_type="mcp",
+                    source_id=self.name,
+                    title=self.original_name,
+                ),
+                metadata={
+                    "trust_level": "untrusted_mcp",
+                    "source_type": "mcp",
+                    "mcp_tool": self.original_name,
+                    "approval_required": self.requires_approval,
+                },
             )
         except Exception as e:
             return ToolResult(
                 success=False,
                 content=f"Error executing MCP tool {self.name}: {e}",
+                metadata={
+                    "trust_level": "untrusted_mcp",
+                    "source_type": "mcp",
+                    "mcp_tool": self.original_name,
+                    "approval_required": self.requires_approval,
+                },
+                error_code="mcp_tool_error",
+                retryable=True,
             )
 
 

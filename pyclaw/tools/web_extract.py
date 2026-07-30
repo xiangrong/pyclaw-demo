@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 import trafilatura
 
 from .base import BaseTool, ToolResult
+from pyclaw.core.trust import wrap_untrusted_content
 
 
 MAX_EXTRACT_URLS = 5
@@ -287,6 +288,8 @@ class WebExtractTool(BaseTool):
                     "count": len(extracted),
                     "urls": [result.url for result in extracted],
                     "fallback_errors": " | ".join(errors),
+                    "trust_level": "untrusted_web",
+                    "source_type": "web",
                 },
             )
 
@@ -301,6 +304,8 @@ class WebExtractTool(BaseTool):
                     "urls": [result.url for result in extracted],
                     "missing_urls": remaining_urls,
                     "fallback_errors": " | ".join(errors),
+                    "trust_level": "untrusted_web",
+                    "source_type": "web",
                 },
             )
 
@@ -333,7 +338,14 @@ class WebExtractTool(BaseTool):
             if result.title:
                 header.append(f"Title: {result.title}")
             header.append("Content:")
-            formatted.append("\n".join(header) + "\n" + result.content)
+            wrapped_content = wrap_untrusted_content(
+                result.content,
+                source_type="web",
+                source_id=str(idx),
+                uri=result.url,
+                title=result.title,
+            )
+            formatted.append("\n".join(header) + "\n" + wrapped_content)
         return "\n\n---\n\n".join(formatted)
 
 

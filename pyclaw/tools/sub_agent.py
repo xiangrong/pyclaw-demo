@@ -1,98 +1,110 @@
 from __future__ import annotations
 
-import asyncio
+import json
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+from pyclaw.core.subagent import ContextPolicy, SubAgentRole, SubAgentSpec, WorkspaceMode
 from pyclaw.tools.base import BaseTool, ToolResult
 
 
 class SubAgentArgs(BaseModel):
     prompt: str = Field(..., description="要发送给子 Agent 的详细指令")
     specialization: Optional[str] = Field(
-        None, description="子 Agent 的专业领域，例如 'Researcher', 'Coder', 'Reviewer', 'Planner' 等"
+        None, description="子 Agent 的专业领域，例如 researcher、coder、reviewer、planner"
     )
     context: Optional[str] = Field(
-        None, description="提供给子 Agent 的额外背景信息、参考资料或前置任务结果"
+        None, description="显式提供给子 Agent 的额外背景信息；默认不会继承父会话历史"
     )
+    allowed_tools: Optional[list[str]] = Field(
+        None, description="可选工具白名单；默认按角色使用最小权限工具集"
+    )
+    denied_tools: list[str] = Field(default_factory=list, description="额外禁止的工具名")
+    allowed_paths: list[str] = Field(default_factory=list, description="direct_edit_scoped 模式下允许写入的路径")
+    workspace_mode: WorkspaceMode = Field(default=WorkspaceMode.SCRATCH, description="子 Agent 工作区模式")
+    timeout_seconds: int = Field(default=300, ge=1, le=3600, description="子 Agent 超时时间")
+    max_iterations: int = Field(default=20, ge=1, le=90, description="子 Agent 最大推理轮数")
 
 
 class SubAgentTool(BaseTool):
-    """子 Agent 工具：允许主 Agent 委派任务"""
+    """子 Agent 工具：允许主 Agent 委派受控子任务。"""
 
     name = "invoke_sub_agent"
     description = (
-        "委派一个子 Agent 来处理特定的复杂子任务。子 Agent 拥有独立的环境和思考空间，"
-        "完成后会返回任务总结。适用于需要大量背景调研、代码重构或并行处理的任务。"
+        "委派一个隔离的子 Agent 来处理特定子任务。子 Agent 默认只接收显式上下文，"
+        "使用按角色裁剪的工具权限和独立 session，完成后返回结构化任务总结。"
     )
     args_schema = SubAgentArgs
 
     def __init__(self, agent_instance: Any):
-        # 传入主 Agent 实例以复用模型提供商、工具注册表和会话管理器
         self.main_agent = agent_instance
 
     async def execute(
-        self, 
-        prompt: str, 
+        self,
+        prompt: str,
         specialization: Optional[str] = None,
-        context: Optional[str] = None
+        context: Optional[str] = None,
+        allowed_tools: Optional[list[str]] = None,
+        denied_tools: Optional[list[str]] = None,
+        allowed_paths: Optional[list[str]] = None,
+        workspace_mode: WorkspaceMode | str = WorkspaceMode.SCRATCH,
+        timeout_seconds: int = 300,
+        max_iterations: int = 20,
     ) -> ToolResult:
         try:
-            from pyclaw.core.agent import Agent
-            
-            # 构造子 Agent 的系统提示词
-            sub_system_prompt = self.main_agent.base_system_prompt
-            
-            # 角色模板
-            role_prompts = {
-                "researcher": "You are a specialized RESEARCHER. Your goal is to gather accurate information, summarize findings, and provide citations where possible.",
-                "coder": "You are a specialized SOFTWARE ENGINEER. Your goal is to write clean, efficient, and well-documented code. Always prioritize safety and follow best practices.",
-                "reviewer": "You are a specialized CODE REVIEWER. Your goal is to find bugs, security vulnerabilities, and architectural flaws. Be critical and thorough.",
-                "planner": "You are a specialized STRATEGIST. Your goal is to break down complex tasks into manageable steps and identify potential risks.",
-            }
-
-            if specialization:
-                role_key = specialization.lower().strip()
-                role_prompt = role_prompts.get(role_key, f"Your specialization is: {specialization}. Focus on this expertise.")
-                sub_system_prompt += f"\n<role>\n{role_prompt}\n</role>\n"
-            
-            sub_system_prompt += (
-                "\nYou are a SUB-AGENT. Your goal is to complete the specific task assigned by the MAIN AGENT.\n"
-                "Once the task is complete, provide a detailed summary of your work and findings.\n"
+            role = self._resolve_role(specialization)
+            workspace = workspace_mode if isinstance(workspace_mode, WorkspaceMode) else WorkspaceMode(str(workspace_mode))
+            parent_session_id = getattr(self.main_agent, "_last_activity_session_id", "") or ""
+            spec = SubAgentSpec(
+                parent_session_id=parent_session_id,
+                role=role,
+                task=prompt,
+                context=context,
+                context_policy=ContextPolicy.EXPLICIT_ONLY,
+                workspace_mode=workspace,
+                allowed_tools=allowed_tools,
+                denied_tools=denied_tools or [],
+                allowed_paths=allowed_paths or [],
+                timeout_seconds=timeout_seconds,
+                max_iterations=max_iterations,
             )
-
-            if context:
-                sub_system_prompt += f"\n<task_context>\n{context}\n</task_context>\n"
-
-            # 创建子 Agent 实例
-            sub_agent = Agent(
-                model_provider=self.main_agent.model,
-                tool_registry=self.main_agent.tools,
-                session_manager=self.main_agent.sessions,
-                system_prompt=sub_system_prompt,
-                work_dir=self.main_agent.work_dir,
-                exec_approval_service=self.main_agent.exec_approval,
-            )
-
-            # 创建一个新的独立临时会话
-            import uuid
-            sub_session_id = f"subagent-{uuid.uuid4().hex[:8]}"
-            session = await self.main_agent.sessions.create_session(sub_session_id)
-            
-            print(f"  🤝 [SubAgent] Spawning sub-agent ({specialization or 'Generalist'}) for task...")
-            
-            # 运行子 Agent 循环
-            result = await sub_agent.run(session, prompt)
-            
-            print(f"  ✅ [SubAgent] Sub-agent completed task.")
-            
+            result = await self.main_agent.subagents.invoke(spec)
             return ToolResult(
-                success=True,
-                content=f"[Sub-Agent Result Summary]\n{result}",
+                success=result.status.value == "succeeded",
+                content=json.dumps(result.model_dump(mode="json"), ensure_ascii=False),
+                structured=result.model_dump(mode="json"),
+                metadata={
+                    "subagent_run_id": result.run_id,
+                    "subagent_status": result.status.value,
+                    "subagent_role": result.role.value,
+                },
+                error_code="" if result.status.value == "succeeded" else f"subagent_{result.status.value}",
+                retryable=result.status.value in {"failed", "timeout"},
+                requires_model_repair=result.status.value != "succeeded",
             )
-
-        except Exception as e:
+        except Exception as exc:
             return ToolResult(
                 success=False,
-                content=f"Error invoking sub-agent: {str(e)}",
+                content=f"Error invoking sub-agent: {type(exc).__name__}: {exc}",
+                error_code="subagent_invocation_error",
+                retryable=True,
+                requires_model_repair=True,
             )
+
+    def _resolve_role(self, specialization: Optional[str]) -> SubAgentRole:
+        value = (specialization or "generalist").lower().strip()
+        aliases = {
+            "research": "researcher",
+            "software engineer": "coder",
+            "engineer": "coder",
+            "code": "coder",
+            "code reviewer": "reviewer",
+            "strategy": "planner",
+            "strategist": "planner",
+        }
+        value = aliases.get(value, value)
+        try:
+            return SubAgentRole(value)
+        except ValueError:
+            return SubAgentRole.GENERALIST

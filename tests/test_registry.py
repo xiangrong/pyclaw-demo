@@ -1,6 +1,7 @@
 import pytest
 from pathlib import Path
 from pyclaw.tools.registry import ToolRegistry, BaseTool, ToolResult
+from pyclaw.tools.scoped_registry import ScopedToolRegistry
 from pydantic import BaseModel
 
 class DummyArgs(BaseModel):
@@ -118,3 +119,90 @@ async def test_execute_tool_calls_applies_web_extract_default_timeout():
 
     assert results[0]["success"] is True
     assert results[0]["content"] == "timeout=15"
+
+
+@pytest.mark.asyncio
+async def test_scoped_registry_blocks_forbidden_tool_calls():
+    registry = ToolRegistry()
+    tool = DummyTool()
+    tool.name = "terminal"
+    registry.register(tool)
+    scoped = ScopedToolRegistry(registry, role="researcher")
+
+    results = await scoped.execute_tool_calls(
+        '{"tool_calls":[{"id":"call1","function":{"name":"terminal","arguments":"{}"}}]}'
+    )
+
+    assert results[0]["success"] is False
+    assert results[0]["error_code"] == "tool_forbidden"
+
+
+@pytest.mark.asyncio
+async def test_scoped_registry_requires_write_scope_for_coder_writes(tmp_path):
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    tool = DummyTool()
+    tool.name = "write_file"
+    registry.register(tool)
+    scoped = ScopedToolRegistry(registry, role="coder")
+
+    result = await scoped.execute("write_file", path=str(tmp_path / "out.txt"), content="x")
+
+    assert result.success is False
+    assert result.error_code == "write_scope_required"
+
+
+@pytest.mark.asyncio
+async def test_scoped_registry_enforces_write_scope_paths(tmp_path):
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    tool = DummyTool()
+    tool.name = "write_file"
+    registry.register(tool)
+    scoped = ScopedToolRegistry(
+        registry,
+        role="coder",
+        allowed_write_roots=[str(tmp_path / "scratch")],
+    )
+
+    result = await scoped.execute("write_file", path=str(tmp_path / "outside.txt"), content="x")
+
+    assert result.success is False
+    assert result.error_code == "write_scope_denied"
+
+
+def test_registry_skips_unreviewed_python_skill(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "evil.py").write_text(
+        "from pyclaw.tools.base import BaseTool, ToolResult\n"
+        "from pydantic import BaseModel\n"
+        "class Args(BaseModel):\n    pass\n"
+        "class EvilTool(BaseTool):\n"
+        "    name = 'evil_tool'\n"
+        "    description = 'evil'\n"
+        "    args_schema = Args\n"
+        "    async def execute(self, **kwargs):\n        return ToolResult(success=True, content='bad')\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(skills_dirs=[skills_dir])
+
+    assert registry.get_tool("evil_tool") is None
+
+
+def test_registry_loads_trusted_python_skill(tmp_path):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "trusted.py").write_text(
+        "# pyclaw: trusted-skill\n"
+        "from pyclaw.tools.base import BaseTool, ToolResult\n"
+        "from pydantic import BaseModel\n"
+        "class Args(BaseModel):\n    pass\n"
+        "class TrustedTool(BaseTool):\n"
+        "    name = 'trusted_tool'\n"
+        "    description = 'trusted'\n"
+        "    args_schema = Args\n"
+        "    async def execute(self, **kwargs):\n        return ToolResult(success=True, content='ok')\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(skills_dirs=[skills_dir])
+
+    assert registry.get_tool("trusted_tool") is not None

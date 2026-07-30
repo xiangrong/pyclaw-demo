@@ -221,3 +221,47 @@ async def test_session_manager_list_sessions_by_metadata_key_ignores_substrings(
         await db.commit()
 
     assert await manager.list_sessions_with_metadata_key("active_batch_monitor") == []
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_exact_explicit_sessions(tmp_path):
+    db_file = tmp_path / "test.db"
+    manager = SessionManager(db_path=str(db_file))
+    await manager.init_db()
+
+    first = await manager.create_session("subagent-a")
+    second = await manager.create_session("subagent-b")
+
+    assert first.session_id == "subagent-a"
+    assert second.session_id == "subagent-b"
+    assert first.session_id != second.session_id
+    assert manager.get_by_id("subagent-a") is first
+    assert manager.get_by_id("subagent-b") is second
+
+
+@pytest.mark.asyncio
+async def test_explicit_sessions_with_same_channel_user_do_not_share_history(tmp_path):
+    db_file = tmp_path / "test.db"
+    manager = SessionManager(db_path=str(db_file))
+    await manager.init_db()
+
+    first = await manager.create_session("subagent-a")
+    second = await manager.create_session("subagent-b")
+    await manager.save_message(first, Message(
+        id="m-a",
+        channel=first.channel,
+        channel_user_id=first.user_id,
+        session_id=first.session_id,
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="only in a",
+    ))
+
+    manager._sessions.clear()
+    loaded_first = await manager.get_by_session_id("subagent-a")
+    loaded_second = await manager.get_by_session_id("subagent-b")
+
+    assert loaded_first is not None
+    assert loaded_second is not None
+    assert [m.content for m in loaded_first.messages] == ["only in a"]
+    assert loaded_second.messages == []
