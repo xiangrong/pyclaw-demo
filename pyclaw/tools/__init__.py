@@ -9,6 +9,14 @@ from .web_search import WebSearchTool
 from .web_extract import ExtractProvider, ExtractResult, TrafilaturaExtractProvider, WebExtractTool
 from .web_read import WebReadTool
 from .save_skill import SaveSkillTool
+from .sub_agent import (
+    CancelSubAgentTool,
+    JoinSubAgentTool,
+    ListAgentsTool,
+    SendMessageToSubAgentTool,
+    SpawnSubAgentTool,
+    SubAgentTool,
+)
 
 __all__ = [
     "BaseTool",
@@ -34,4 +42,10 @@ __all__ = [
     "TrafilaturaExtractProvider",
     "WebReadTool",
     "SaveSkillTool",
+    "SubAgentTool",
+    "SpawnSubAgentTool",
+    "JoinSubAgentTool",
+    "SendMessageToSubAgentTool",
+    "CancelSubAgentTool",
+    "ListAgentsTool",
 ]

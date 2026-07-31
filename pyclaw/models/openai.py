@@ -41,6 +41,19 @@ class OpenAIProvider(BaseModelProvider):
             self.embedding_model = embedding_model or "text-embedding-3-small"
             self.embed_client = self.client
 
+    def with_model(self, model: str) -> "OpenAIProvider":
+        """Return a lightweight provider clone using a different chat model.
+
+        Sub-agent orchestration can route a delegated task to a different
+        compatible model without rebuilding HTTP clients or embedding state.
+        """
+        clone = object.__new__(OpenAIProvider)
+        clone.client = self.client
+        clone.model = model
+        clone.embedding_model = self.embedding_model
+        clone.embed_client = self.embed_client
+        return clone
+
     async def chat(
         self,
         messages: list[dict[str, Any]],

@@ -11,7 +11,14 @@ from pyclaw.core.user_memory import MemoryUpsert, UserMemoryStore
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.base import BaseTool, ToolResult
 from pyclaw.tools.registry import ToolRegistry
-from pyclaw.tools.sub_agent import SubAgentTool
+from pyclaw.tools.sub_agent import (
+    CancelSubAgentTool,
+    JoinSubAgentTool,
+    ListAgentsTool,
+    SendMessageToSubAgentTool,
+    SpawnSubAgentTool,
+    SubAgentTool,
+)
 
 
 class RecordingModel(BaseModelProvider):
@@ -35,6 +42,20 @@ class RecordingModel(BaseModelProvider):
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         return [[0.0] for _ in texts]
+
+
+class CloneableRecordingModel(RecordingModel):
+    def __init__(self, responses: list[dict[str, Any]] | None = None, model: str = "default") -> None:
+        super().__init__(responses)
+        self.model = model
+        self.clones: list["CloneableRecordingModel"] = []
+
+    def with_model(self, model: str) -> "CloneableRecordingModel":
+        clone = CloneableRecordingModel(self.responses, model=model)
+        clone.calls = self.calls
+        clone.clones = self.clones
+        self.clones.append(clone)
+        return clone
 
 
 class NoArgs(BaseModel):
@@ -282,3 +303,151 @@ async def test_subagent_memory_policy_can_include_user_and_project_for_generalis
     rendered = json.dumps(model.calls, ensure_ascii=False)
     assert "prefers_language" in rendered
     assert "run pytest before final" in rendered
+
+
+@pytest.mark.asyncio
+async def test_spawn_join_and_list_subagent_tools(tmp_path):
+    model = RecordingModel([{"content": "spawned final", "__tool_calls__": False}])
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, max_iterations=3)
+
+    spawn = SpawnSubAgentTool(agent)
+    join = JoinSubAgentTool(agent)
+    list_agents = ListAgentsTool(agent)
+
+    spawned = await spawn.execute("do async work", specialization="researcher", name="r1", max_iterations=1)
+
+    assert spawned.success is True
+    run_id = spawned.structured["run_id"]
+    listing = await list_agents.execute()
+    assert any(run["run_id"] == run_id and run["name"] == "r1" for run in listing.structured["runs"])
+
+    joined = await join.execute(run_id, timeout_seconds=30)
+
+    assert joined.success is True
+    assert joined.structured["status"] == "succeeded"
+    assert joined.structured["answer"] == "spawned final"
+
+
+@pytest.mark.asyncio
+async def test_send_message_to_subagent_continues_same_run(tmp_path):
+    model = RecordingModel([
+        {"content": "first final", "__tool_calls__": False},
+        {"content": "second final", "__tool_calls__": False},
+    ])
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, max_iterations=3)
+
+    run_id = agent.subagents.spawn(SubAgentSpec(
+        role=SubAgentRole.PLANNER,
+        task="first task",
+        max_iterations=1,
+    ))
+    first = await agent.subagents.join(run_id, timeout_seconds=30)
+    assert first.status == SubAgentStatus.SUCCEEDED
+
+    send = SendMessageToSubAgentTool(agent)
+    second = await send.execute(run_id, "follow up task", wait=True, timeout_seconds=30)
+
+    assert second.success is True
+    assert second.structured["run_id"] == run_id
+    assert second.structured["answer"] == "second final"
+    child_session = sessions.get_by_id(run_id)
+    assert child_session is not None
+    user_messages = [msg.content for msg in child_session.messages if msg.role.value == "user"]
+    assert any("first task" in content for content in user_messages)
+    assert any("follow up task" in content for content in user_messages)
+
+
+@pytest.mark.asyncio
+async def test_cancel_subagent_tool_marks_running_task_cancelled(tmp_path):
+    class SlowModel(RecordingModel):
+        async def chat(self, messages, tools=None, stream=False, **kwargs):
+            self.calls.append({"messages": messages, "tools": tools, "kwargs": kwargs})
+            import asyncio
+
+            await asyncio.sleep(10)
+            return {"content": "too late", "__tool_calls__": False}
+
+    model = SlowModel()
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, max_iterations=3)
+
+    run_id = agent.subagents.spawn(SubAgentSpec(role=SubAgentRole.RESEARCHER, task="slow", max_iterations=3))
+    cancel = CancelSubAgentTool(agent)
+    result = await cancel.execute(run_id)
+    joined = await agent.subagents.join(run_id, timeout_seconds=30)
+
+    assert result.success is True
+    assert joined.status == SubAgentStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_list_agents_exposes_roles_and_model_override(tmp_path):
+    model = CloneableRecordingModel([{"content": "model final", "__tool_calls__": False}])
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, max_iterations=3)
+
+    spawn = SpawnSubAgentTool(agent)
+    list_agents = ListAgentsTool(agent)
+
+    spawned = await spawn.execute("use a special model", specialization="planner", model="special-model", wait=True, max_iterations=1)
+    listing = await list_agents.execute()
+
+    assert spawned.success is True
+    assert any(role["role"] == "planner" for role in listing.structured["roles"])
+    assert any(clone.model == "special-model" for clone in model.clones)
+
+
+@pytest.mark.asyncio
+async def test_collaboration_tools_are_registered_and_blocked_inside_subagents(tmp_path):
+    model = RecordingModel([
+        {
+            "content": "try nested spawn",
+            "__tool_calls__": True,
+            "tool_calls": [
+                {"id": "call1", "function": {"name": "spawn_subagent", "arguments": json.dumps({"prompt": "nested"})}}
+            ],
+        },
+        {"content": "blocked nested", "__tool_calls__": False},
+    ])
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, max_iterations=4)
+    registry.register(SubAgentTool(agent))
+    registry.register(SpawnSubAgentTool(agent))
+    registry.register(JoinSubAgentTool(agent))
+    registry.register(SendMessageToSubAgentTool(agent))
+    registry.register(CancelSubAgentTool(agent))
+    registry.register(ListAgentsTool(agent))
+
+    names = {spec["name"] for spec in registry.get_all_specs()}
+    assert {
+        "invoke_sub_agent",
+        "spawn_subagent",
+        "join_subagent",
+        "send_message_to_subagent",
+        "cancel_subagent",
+        "list_agents",
+    }.issubset(names)
+
+    result = await agent.subagents.invoke(SubAgentSpec(
+        role=SubAgentRole.GENERALIST,
+        task="try nested spawn",
+        max_iterations=4,
+    ))
+    child_session = sessions.get_by_id(result.metadata["session_id"])
+    assert child_session is not None
+    assert any(
+        msg.metadata.get("tool_name") == "spawn_subagent" and "not allowed" in msg.content
+        for msg in child_session.messages
+    )

@@ -341,8 +341,20 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
 
         # 注册需要 Agent 实例的工具
         tool_registry.register(SendFileTool(agent))
-        from pyclaw.tools.sub_agent import SubAgentTool
+        from pyclaw.tools.sub_agent import (
+            CancelSubAgentTool,
+            JoinSubAgentTool,
+            ListAgentsTool,
+            SendMessageToSubAgentTool,
+            SpawnSubAgentTool,
+            SubAgentTool,
+        )
         tool_registry.register(SubAgentTool(agent))
+        tool_registry.register(SpawnSubAgentTool(agent))
+        tool_registry.register(JoinSubAgentTool(agent))
+        tool_registry.register(SendMessageToSubAgentTool(agent))
+        tool_registry.register(CancelSubAgentTool(agent))
+        tool_registry.register(ListAgentsTool(agent))
         from pyclaw.tools.learn_skill import LearnFromDocTool
         tool_registry.register(LearnFromDocTool(agent))
 
@@ -523,8 +535,20 @@ def cron_exec(
 
         # 注册需要 Agent 实例的工具
         tool_registry.register(SendFileTool(agent))
-        from pyclaw.tools.sub_agent import SubAgentTool
+        from pyclaw.tools.sub_agent import (
+            CancelSubAgentTool,
+            JoinSubAgentTool,
+            ListAgentsTool,
+            SendMessageToSubAgentTool,
+            SpawnSubAgentTool,
+            SubAgentTool,
+        )
         tool_registry.register(SubAgentTool(agent))
+        tool_registry.register(SpawnSubAgentTool(agent))
+        tool_registry.register(JoinSubAgentTool(agent))
+        tool_registry.register(SendMessageToSubAgentTool(agent))
+        tool_registry.register(CancelSubAgentTool(agent))
+        tool_registry.register(ListAgentsTool(agent))
         from pyclaw.tools.learn_skill import LearnFromDocTool
         tool_registry.register(LearnFromDocTool(agent))
 

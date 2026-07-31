@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -17,7 +18,7 @@ from pyclaw.core.trust import wrap_untrusted_content
 from pyclaw.core.user_memory import MemoryUseTelemetry, UserMemoryItem, UserMemoryStore
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
-from pyclaw.tools.scoped_registry import ScopedToolRegistry
+from pyclaw.tools.scoped_registry import ROLE_DEFAULT_ALLOWED_TOOLS, ScopedToolRegistry
 
 
 class SubAgentRole(str, Enum):
@@ -49,6 +50,7 @@ class SubAgentMemoryPolicy(str, Enum):
 
 
 class SubAgentStatus(str, Enum):
+    RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     TIMEOUT = "timeout"
@@ -57,9 +59,12 @@ class SubAgentStatus(str, Enum):
 
 class SubAgentSpec(BaseModel):
     parent_session_id: str = ""
+    name: Optional[str] = None
     role: SubAgentRole = SubAgentRole.GENERALIST
     task: str
     context: Optional[str] = None
+    instructions: Optional[str] = None
+    model: Optional[str] = None
     context_policy: ContextPolicy = ContextPolicy.EXPLICIT_ONLY
     memory_policy: SubAgentMemoryPolicy = SubAgentMemoryPolicy.ROLE_DEFAULT
     workspace_mode: WorkspaceMode = WorkspaceMode.SCRATCH
@@ -110,6 +115,43 @@ ROLE_PROMPTS: dict[SubAgentRole, str] = {
 }
 
 
+@dataclass
+class SubAgentRunRecord:
+    """In-memory bookkeeping for one spawned sub-agent run."""
+
+    run_id: str
+    spec: SubAgentSpec
+    task: asyncio.Task[SubAgentResult]
+    created_at: str
+    updated_at: str
+    status: str = SubAgentStatus.RUNNING.value
+    last_result: Optional[SubAgentResult] = None
+    message_count: int = 1
+    continuation_count: int = 0
+    cancelled: bool = False
+    errors: list[str] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        result_metadata = self.last_result.metadata if self.last_result is not None else {}
+        return {
+            "run_id": self.run_id,
+            "name": self.spec.name or "",
+            "role": self.spec.role.value,
+            "status": self.status,
+            "parent_session_id": self.spec.parent_session_id,
+            "session_id": result_metadata.get("session_id", self.run_id),
+            "workspace_mode": self.spec.workspace_mode.value,
+            "model": self.spec.model or "default",
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "message_count": self.message_count,
+            "continuation_count": self.continuation_count,
+            "task": self.spec.task,
+            "summary": self.last_result.summary if self.last_result is not None else "",
+            "errors": list(self.errors),
+        }
+
+
 class SubAgentRuntime:
     """Controlled runtime for isolated sub-agent task execution."""
 
@@ -136,7 +178,7 @@ class SubAgentRuntime:
         self.user_memory = user_memory
         self.memory_telemetry = MemoryUseTelemetry(user_memory) if user_memory is not None else None
         self.memory_project_id = memory_project_id
-        self._runs: dict[str, asyncio.Task[SubAgentResult]] = {}
+        self._runs: dict[str, SubAgentRunRecord] = {}
 
     async def invoke(self, spec: SubAgentSpec) -> SubAgentResult:
         """Run one sub-agent synchronously and return a structured result."""
@@ -185,12 +227,20 @@ class SubAgentRuntime:
     def spawn(self, spec: SubAgentSpec) -> str:
         """Start one sub-agent in the background and return its run id."""
         run_id = f"subagent-{uuid.uuid4().hex[:12]}"
-        self._runs[run_id] = asyncio.create_task(self._invoke_with_run_id(spec, run_id))
+        now = self._now_iso()
+        task = asyncio.create_task(self._run_record_once(run_id=run_id, spec=spec))
+        self._runs[run_id] = SubAgentRunRecord(
+            run_id=run_id,
+            spec=spec,
+            task=task,
+            created_at=now,
+            updated_at=now,
+        )
         return run_id
 
     async def join(self, run_id: str, timeout_seconds: Optional[float] = None) -> SubAgentResult:
-        task = self._runs.get(run_id)
-        if task is None:
+        record = self._runs.get(run_id)
+        if record is None:
             return SubAgentResult(
                 run_id=run_id,
                 status=SubAgentStatus.FAILED,
@@ -198,28 +248,178 @@ class SubAgentRuntime:
                 summary=f"Unknown sub-agent run: {run_id}",
                 errors=["unknown_run"],
             )
+        task = record.task
+        if task.done():
+            return self._record_result(record, self._task_result(task, run_id=run_id, role=record.spec.role))
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            return self._running_result(record, "Sub-agent run is still running.")
         try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+            return self._record_result(record, result)
         except asyncio.TimeoutError:
-            return SubAgentResult(
+            return self._running_result(record, f"Sub-agent run {run_id} is still running.")
+        except asyncio.CancelledError:
+            result = SubAgentResult(
                 run_id=run_id,
-                status=SubAgentStatus.TIMEOUT,
-                role=SubAgentRole.GENERALIST,
-                summary=f"Sub-agent run {run_id} is still running.",
-                errors=["join_timeout"],
+                status=SubAgentStatus.CANCELLED,
+                role=record.spec.role,
+                summary="Sub-agent run was cancelled.",
+                errors=["cancelled"],
             )
+            return self._record_result(record, result)
 
     async def cancel(self, run_id: str) -> bool:
-        task = self._runs.get(run_id)
-        if task is None or task.done():
+        record = self._runs.get(run_id)
+        if record is None or record.task.done():
             return False
-        task.cancel()
+        record.cancelled = True
+        record.status = SubAgentStatus.CANCELLED.value
+        record.updated_at = self._now_iso()
+        record.task.cancel()
         return True
 
-    async def _invoke_with_run_id(self, spec: SubAgentSpec, run_id: str) -> SubAgentResult:
+    async def send_message(
+        self,
+        run_id: str,
+        message: str,
+        *,
+        wait: bool = True,
+        timeout_seconds: Optional[float] = None,
+    ) -> SubAgentResult:
+        """Append a message to a spawned sub-agent and optionally wait for its reply.
+
+        Messages are processed sequentially on the same child session.  If the
+        sub-agent is currently busy, the continuation is chained after the
+        current task, allowing parent agents to queue follow-up instructions
+        without racing the underlying chat transcript.
+        """
+        record = self._runs.get(run_id)
+        if record is None:
+            return SubAgentResult(
+                run_id=run_id,
+                status=SubAgentStatus.FAILED,
+                role=SubAgentRole.GENERALIST,
+                summary=f"Unknown sub-agent run: {run_id}",
+                errors=["unknown_run"],
+            )
+        if record.cancelled or record.status == SubAgentStatus.CANCELLED.value:
+            return SubAgentResult(
+                run_id=run_id,
+                status=SubAgentStatus.CANCELLED,
+                role=record.spec.role,
+                summary="Sub-agent run has been cancelled and cannot receive new messages.",
+                errors=["cancelled"],
+            )
+
+        continuation_spec = record.spec.model_copy(update={"task": message})
+        previous_task = record.task
+        record.continuation_count += 1
+        record.message_count += 1
+        record.status = SubAgentStatus.RUNNING.value
+        record.updated_at = self._now_iso()
+        record.task = asyncio.create_task(
+            self._continue_after_current(
+                record=record,
+                previous_task=previous_task,
+                spec=continuation_spec,
+            )
+        )
+        if not wait:
+            return self._running_result(record, "Message queued for sub-agent.")
+        return await self.join(run_id, timeout_seconds=timeout_seconds)
+
+    def list_agents(self, *, include_completed: bool = True) -> dict[str, Any]:
+        """Return available sub-agent roles plus spawned run state."""
+        roles = []
+        for role in SubAgentRole:
+            roles.append(
+                {
+                    "role": role.value,
+                    "description": ROLE_PROMPTS[role],
+                    "default_tools": sorted(ROLE_DEFAULT_ALLOWED_TOOLS.get(role.value, set())),
+                }
+            )
+
+        runs = []
+        for record in self._runs.values():
+            if record.task.done() and record.last_result is None:
+                self._record_result(record, self._task_result(record.task, run_id=record.run_id, role=record.spec.role))
+            if not include_completed and record.task.done():
+                continue
+            runs.append(record.to_summary())
+        return {"roles": roles, "runs": runs}
+
+    async def _run_record_once(self, *, run_id: str, spec: SubAgentSpec) -> SubAgentResult:
+        record = self._runs.get(run_id)
+        if record is not None:
+            record.status = SubAgentStatus.RUNNING.value
+            record.updated_at = self._now_iso()
+        result = await self._invoke_with_run_id(spec, run_id)
+        if record is not None:
+            self._record_result(record, result)
+        return result
+
+    async def _continue_after_current(
+        self,
+        *,
+        record: SubAgentRunRecord,
+        previous_task: asyncio.Task[SubAgentResult],
+        spec: SubAgentSpec,
+    ) -> SubAgentResult:
+        try:
+            if not previous_task.done():
+                previous_result = await previous_task
+                self._record_result(record, previous_result)
+        except asyncio.CancelledError:
+            result = SubAgentResult(
+                run_id=record.run_id,
+                status=SubAgentStatus.CANCELLED,
+                role=record.spec.role,
+                summary="Sub-agent run was cancelled before the queued message could run.",
+                errors=["cancelled"],
+            )
+            self._record_result(record, result)
+            return result
+        except Exception as exc:
+            record.errors.append(f"previous_task_error: {type(exc).__name__}: {exc}")
+
+        if record.cancelled:
+            result = SubAgentResult(
+                run_id=record.run_id,
+                status=SubAgentStatus.CANCELLED,
+                role=record.spec.role,
+                summary="Sub-agent run was cancelled before continuation.",
+                errors=["cancelled"],
+            )
+            self._record_result(record, result)
+            return result
+
+        record.status = SubAgentStatus.RUNNING.value
+        record.updated_at = self._now_iso()
+        result = await self._invoke_with_run_id(
+            spec,
+            record.run_id,
+            session_id=self._record_session_id(record),
+        )
+        self._record_result(record, result)
+        return result
+
+    async def _invoke_with_run_id(
+        self,
+        spec: SubAgentSpec,
+        run_id: str,
+        *,
+        session_id: Optional[str] = None,
+    ) -> SubAgentResult:
         try:
             return await asyncio.wait_for(
-                self._run_once(spec=spec, run_id=run_id, attempt=1, previous_error=""),
+                self._run_once(
+                    spec=spec,
+                    run_id=run_id,
+                    attempt=1,
+                    previous_error="",
+                    session_id=session_id,
+                ),
                 timeout=spec.timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -246,6 +446,7 @@ class SubAgentRuntime:
         run_id: str,
         attempt: int,
         previous_error: str,
+        session_id: Optional[str] = None,
     ) -> SubAgentResult:
         from pyclaw.core.agent import Agent
 
@@ -266,7 +467,7 @@ class SubAgentRuntime:
             memory_context=memory_context,
         )
         sub_agent = Agent(
-            model_provider=self.model_provider,
+            model_provider=self._model_provider_for_spec(spec),
             tool_registry=scoped_tools,  # type: ignore[arg-type]
             session_manager=self.session_manager,
             system_prompt=sub_system_prompt,
@@ -279,7 +480,7 @@ class SubAgentRuntime:
             exec_approval_service=self.exec_approval_service,
         )
 
-        session_id = run_id if attempt == 1 else f"{run_id}-attempt-{attempt}"
+        session_id = session_id or (run_id if attempt == 1 else f"{run_id}-attempt-{attempt}")
         session = await self.session_manager.create_session(
             session_id,
             user_id=self._subagent_user_id(spec, run_id),
@@ -341,6 +542,31 @@ class SubAgentRuntime:
         await sub_agent._persist_session_metadata(session)
         return result
 
+    def _model_provider_for_spec(self, spec: SubAgentSpec) -> BaseModelProvider:
+        """Return the model provider for one sub-agent run.
+
+        Providers can opt in to per-run model overrides by exposing a
+        ``with_model(model_name)`` method.  OpenAIProvider implements this while
+        tests and custom providers can ignore the feature and keep default model
+        behavior.
+        """
+        requested = (spec.model or "").strip()
+        if not requested:
+            return self.model_provider
+        current = str(getattr(self.model_provider, "model", "") or "").strip()
+        if current and current == requested:
+            return self.model_provider
+        factory = getattr(self.model_provider, "with_model", None)
+        if callable(factory):
+            provider = factory(requested)
+            if provider is not None:
+                return provider
+        raise ValueError(
+            f"Sub-agent requested model '{requested}', but provider "
+            f"'{getattr(self.model_provider, 'name', type(self.model_provider).__name__)}' "
+            "does not support per-run model selection."
+        )
+
     def _build_system_prompt(
         self,
         *,
@@ -352,11 +578,20 @@ class SubAgentRuntime:
         context_block = ""
         if spec.context:
             context_block = f"\n<explicit_context>\n{spec.context}\n</explicit_context>\n"
+        instructions_block = ""
+        if spec.instructions:
+            instructions_block = (
+                "\n<sub_agent_custom_instructions>\n"
+                f"{spec.instructions}\n"
+                "</sub_agent_custom_instructions>\n"
+            )
         return (
             f"{self.base_system_prompt}\n"
             "<sub_agent_runtime>\n"
             f"You are a SUB-AGENT run {run_id}. You are isolated from the parent conversation.\n"
+            f"Name: {spec.name or run_id}\n"
             f"Role: {spec.role.value}\n"
+            f"Model override: {spec.model or 'default'}\n"
             f"Role instructions: {ROLE_PROMPTS[spec.role]}\n"
             f"Context policy: {spec.context_policy.value}. Default means use only explicit context below.\n"
             f"Workspace mode: {spec.workspace_mode.value}. Scratch/artifacts directory: {workspace}\n"
@@ -365,6 +600,7 @@ class SubAgentRuntime:
             "Return a concise final answer. Prefer JSON matching SubAgentResult fields when possible.\n"
             "</sub_agent_runtime>\n"
             f"{memory_context}"
+            f"{instructions_block}"
             f"{context_block}"
         )
 
@@ -518,3 +754,70 @@ class SubAgentRuntime:
     def _subagent_user_id(self, spec: SubAgentSpec, run_id: str) -> str:
         parent = spec.parent_session_id or "root"
         return f"{parent}:{run_id}"
+
+    def _record_result(self, record: SubAgentRunRecord, result: SubAgentResult) -> SubAgentResult:
+        record.last_result = result
+        record.status = result.status.value
+        record.updated_at = self._now_iso()
+        if result.errors:
+            record.errors = list(dict.fromkeys(record.errors + result.errors))
+        if result.status == SubAgentStatus.CANCELLED:
+            record.cancelled = True
+        return result
+
+    def _task_result(
+        self,
+        task: asyncio.Task[SubAgentResult],
+        *,
+        run_id: str,
+        role: SubAgentRole,
+    ) -> SubAgentResult:
+        if task.cancelled():
+            return SubAgentResult(
+                run_id=run_id,
+                status=SubAgentStatus.CANCELLED,
+                role=role,
+                summary="Sub-agent run was cancelled.",
+                errors=["cancelled"],
+            )
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            return SubAgentResult(
+                run_id=run_id,
+                status=SubAgentStatus.CANCELLED,
+                role=role,
+                summary="Sub-agent run was cancelled.",
+                errors=["cancelled"],
+            )
+        except Exception as exc:
+            return SubAgentResult(
+                run_id=run_id,
+                status=SubAgentStatus.FAILED,
+                role=role,
+                summary="Sub-agent run failed before returning a structured result.",
+                errors=[f"{type(exc).__name__}: {exc}"],
+            )
+
+    def _running_result(self, record: SubAgentRunRecord, summary: str) -> SubAgentResult:
+        return SubAgentResult(
+            run_id=record.run_id,
+            status=SubAgentStatus.RUNNING,
+            role=record.spec.role,
+            summary=summary,
+            metadata={
+                "session_id": record.last_result.metadata.get("session_id", record.run_id)
+                if record.last_result is not None
+                else record.run_id,
+                "run": record.to_summary(),
+            },
+        )
+
+    def _record_session_id(self, record: SubAgentRunRecord) -> str:
+        if record.last_result is None:
+            return record.run_id
+        session_id = record.last_result.metadata.get("session_id", "")
+        return str(session_id or record.run_id)
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()

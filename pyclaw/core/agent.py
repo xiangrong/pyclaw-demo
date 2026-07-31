@@ -52,6 +52,10 @@ class Agent:
         "write_file",
         "delete_file",
         "copy_file",
+        "invoke_sub_agent",
+        "spawn_subagent",
+        "send_message_to_subagent",
+        "cancel_subagent",
     }
     SIDE_EFFECT_TOOL_KEYWORDS = (
         "send_email",
@@ -772,7 +776,7 @@ class Agent:
         """运行一次性任务（如 Cron 任务）"""
         # 创建并保存用户消息
         message = Message(
-            id=f"run-{session.session_id}-{int(datetime.now().timestamp())}",
+            id=f"run-{session.session_id}-{time.time_ns()}",
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,

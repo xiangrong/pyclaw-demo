@@ -36,8 +36,13 @@ EXEC_TOOLS = {"terminal", "python_interpreter"}
 DANGEROUS_TOOLS = {
     "cronjob",
     "invoke_sub_agent",
+    "spawn_subagent",
     "spawn_sub_agent",
+    "join_subagent",
     "join_sub_agent",
+    "cancel_subagent",
+    "send_message_to_subagent",
+    "list_agents",
     "send_file_to_user",
     "save_memory",
     "save_user_memory",
