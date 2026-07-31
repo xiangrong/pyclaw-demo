@@ -25,6 +25,9 @@ web_search:
     assert cfg.user_memory.enabled is True
     assert cfg.user_memory.backend == "sqlite"
     assert cfg.user_memory.external_enabled is False
+    assert cfg.user_memory.auto_consolidate is True
+    assert cfg.user_memory.consolidation_interval_hours == 24.0
+    assert cfg.user_memory.consolidation_stale_after_days == 90
     assert cfg.document_rag.enabled is True
     assert cfg.document_rag.table_name == "document_chunks"
     assert cfg.document_rag.auto_retrieve is True
@@ -43,6 +46,9 @@ model:
     monkeypatch.setenv("PYCLAW_USER_MEMORY_BACKEND", "hybrid")
     monkeypatch.setenv("PYCLAW_USER_MEMORY_EXTERNAL_PROVIDER", "mem0")
     monkeypatch.setenv("PYCLAW_USER_MEMORY_EXTERNAL_ENABLED", "true")
+    monkeypatch.setenv("PYCLAW_USER_MEMORY_AUTO_CONSOLIDATE", "false")
+    monkeypatch.setenv("PYCLAW_USER_MEMORY_CONSOLIDATION_INTERVAL_HOURS", "12")
+    monkeypatch.setenv("PYCLAW_USER_MEMORY_CONSOLIDATION_STALE_AFTER_DAYS", "45")
     monkeypatch.setenv("MEM0_API_KEY", "mem0-key")
 
     cfg = load_config(str(config_path))
@@ -51,6 +57,9 @@ model:
     assert cfg.user_memory.external_provider == "mem0"
     assert cfg.user_memory.external_enabled is True
     assert cfg.user_memory.mem0_api_key == "mem0-key"
+    assert cfg.user_memory.auto_consolidate is False
+    assert cfg.user_memory.consolidation_interval_hours == 12.0
+    assert cfg.user_memory.consolidation_stale_after_days == 45
 
 
 def test_config_loads_document_rag_settings(tmp_path: Path):

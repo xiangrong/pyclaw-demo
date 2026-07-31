@@ -6,7 +6,8 @@ from pydantic import BaseModel
 
 from pyclaw.core.agent import Agent
 from pyclaw.core.session import SessionManager
-from pyclaw.core.subagent import SubAgentRole, SubAgentSpec, SubAgentStatus, WorkspaceMode
+from pyclaw.core.subagent import SubAgentMemoryPolicy, SubAgentRole, SubAgentSpec, SubAgentStatus, WorkspaceMode
+from pyclaw.core.user_memory import MemoryUpsert, UserMemoryStore
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.base import BaseTool, ToolResult
 from pyclaw.tools.registry import ToolRegistry
@@ -179,3 +180,105 @@ async def test_subagent_coder_direct_edit_scope_blocks_outside_path(tmp_path):
     child_session = sessions.get_by_id(result.metadata["session_id"])
     assert child_session is not None
     assert any("outside the sub-agent write scope" in msg.content for msg in child_session.messages)
+
+
+@pytest.mark.asyncio
+async def test_subagent_memory_policy_passes_project_memory_to_coder_and_can_disable_researcher(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_language",
+        value="Chinese",
+        importance=5,
+    ))
+    project_memory = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="project",
+        kind="workflow",
+        subject="pyclaw",
+        predicate="validation_policy",
+        value="run pytest before final",
+        project_id=str(tmp_path.resolve()),
+        importance=5,
+    ))
+
+    model = RecordingModel([
+        {"content": "coder final", "__tool_calls__": False},
+        {"content": "researcher final", "__tool_calls__": False},
+    ])
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, user_memory=store, max_iterations=3)
+    parent = await sessions.create_session("parent", user_id="u1", channel="feishu")
+
+    await agent.subagents.invoke(SubAgentSpec(
+        parent_session_id=parent.session_id,
+        role=SubAgentRole.CODER,
+        task="use project policy",
+        max_iterations=3,
+    ))
+    researcher_start = len(model.calls)
+    await agent.subagents.invoke(SubAgentSpec(
+        parent_session_id=parent.session_id,
+        role=SubAgentRole.RESEARCHER,
+        task="no memory by default",
+        memory_policy=SubAgentMemoryPolicy.NONE,
+        max_iterations=3,
+    ))
+
+    first_call = json.dumps(model.calls[0], ensure_ascii=False)
+    second_call = json.dumps(model.calls[researcher_start], ensure_ascii=False)
+    assert "run pytest before final" in first_call
+    assert "prefers_language" not in first_call
+    assert "run pytest before final" not in second_call
+    counts = await store.usage_counts([project_memory.id])
+    assert counts[project_memory.id]["injected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_memory_policy_can_include_user_and_project_for_generalist(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_language",
+        value="Chinese",
+        importance=5,
+    ))
+    await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="project",
+        kind="workflow",
+        subject="pyclaw",
+        predicate="validation_policy",
+        value="run pytest before final",
+        project_id=str(tmp_path.resolve()),
+        importance=5,
+    ))
+
+    model = RecordingModel([{"content": "generalist final", "__tool_calls__": False}])
+    registry = ToolRegistry(work_dir=str(tmp_path))
+    sessions = SessionManager(str(tmp_path / "sessions.db"))
+    await sessions.init_db()
+    agent = Agent(model, registry, sessions, system_prompt="BASE", work_dir=str(tmp_path), memory=None, user_memory=store, max_iterations=3)
+    parent = await sessions.create_session("parent", user_id="u1", channel="feishu")
+
+    await agent.subagents.invoke(SubAgentSpec(
+        parent_session_id=parent.session_id,
+        role=SubAgentRole.GENERALIST,
+        task="use all relevant memory",
+        memory_policy=SubAgentMemoryPolicy.USER_AND_PROJECT,
+        max_iterations=3,
+    ))
+
+    rendered = json.dumps(model.calls, ensure_ascii=False)
+    assert "prefers_language" in rendered
+    assert "run pytest before final" in rendered

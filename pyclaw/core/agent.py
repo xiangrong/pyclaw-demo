@@ -15,7 +15,7 @@ from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.core.session import Session, SessionManager
 from pyclaw.core.memory import SemanticMemory
 from pyclaw.core.document_rag import DEFAULT_COLLECTION, DocumentKnowledgeStore
-from pyclaw.core.user_memory import MemoryExtractor, UserMemoryStore
+from pyclaw.core.user_memory import MemoryConsolidator, MemoryExtractor, MemoryUseTelemetry, UserMemoryStore
 from pyclaw.models.base import BaseModelProvider
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.core.system_prompt.manager import SystemPromptManager
@@ -87,6 +87,9 @@ class Agent:
         max_consecutive_failures: int = 8,
         exec_approval_service: Optional[ExecApprovalService] = None,
         exec_approval_mode: ExecApprovalMode | str = ExecApprovalMode.AUTO,
+        user_memory_auto_consolidate: bool = True,
+        user_memory_consolidation_interval_hours: float = 24.0,
+        user_memory_consolidation_stale_after_days: int = 90,
     ) -> None:
         self.model = model_provider
         self.tools = tool_registry
@@ -131,6 +134,14 @@ class Agent:
             if self.user_memory is not None
             else None
         )
+        self.memory_telemetry = MemoryUseTelemetry(self.user_memory) if self.user_memory is not None else None
+        self.memory_consolidator = (
+            MemoryConsolidator(self.user_memory)
+            if self.user_memory is not None and user_memory_auto_consolidate
+            else None
+        )
+        self.user_memory_consolidation_interval_hours = max(0.1, float(user_memory_consolidation_interval_hours))
+        self.user_memory_consolidation_stale_after_days = max(1, int(user_memory_consolidation_stale_after_days))
 
         self.system_prompt = system_prompt or (
             "You are PyClaw, an autonomous AI assistant.\n"
@@ -169,6 +180,8 @@ class Agent:
             work_dir=self.work_dir,
             config_dir=self.config_dir,
             exec_approval_service=self.exec_approval,
+            user_memory=self.user_memory,
+            memory_project_id=self._memory_project_id(),
         )
 
     def _ensure_default_terminal_artifact_paths(self) -> None:
@@ -273,16 +286,35 @@ class Agent:
         """Return a stable project/workspace identifier for scoped memory."""
         return os.path.realpath(os.path.abspath(os.path.expanduser(self.work_dir)))
 
-    async def _get_user_memory_context(self, session: Session) -> tuple[str, str]:
+    async def _get_user_memory_context(
+        self,
+        session: Session,
+        *,
+        record_usage: bool = True,
+        role: str = "main",
+        surface: str = "prompt",
+    ) -> tuple[str, str]:
         """Render compact structured user and project memories for the prompt."""
         if not self.user_memory:
             return "", ""
         try:
-            return await self.user_memory.render_profile(
+            profile, project, profile_items, project_items = await self.user_memory.render_profile_with_items(
                 user_id=session.user_id or "default",
                 channel=session.channel or "",
                 project_id=self._memory_project_id(),
             )
+            if record_usage and self.memory_telemetry is not None:
+                await self.memory_telemetry.record_injected(
+                    profile_items + project_items,
+                    session_id=session.session_id,
+                    user_id=session.user_id or "default",
+                    channel=session.channel or "",
+                    project_id=self._memory_project_id(),
+                    role=role,
+                    surface=surface,
+                    metadata={"prompt_layer": "session"},
+                )
+            return profile, project
         except Exception as e:
             print(f"  ⚠️  用户记忆检索失败: {e}")
             return "", ""
@@ -298,7 +330,7 @@ class Agent:
         if not self.memory_extractor or self.disable_personal_context:
             return
         try:
-            profile, project = await self._get_user_memory_context(session)
+            profile, project = await self._get_user_memory_context(session, record_usage=False)
             existing_profile = "\n".join(part for part in (profile, project) if part)
             saved = await self.memory_extractor.extract_and_save(
                 user_id=session.user_id or user_message.user_id or "default",
@@ -313,8 +345,34 @@ class Agent:
             if saved:
                 self.system_prompt_manager.invalidate_session_cache(session.session_id)
                 print(f"🧠 [UserMemory] Saved {len(saved)} structured memories.")
+                await self._maybe_evolve_user_memory(session=session, user_message=user_message)
         except Exception as e:
             print(f"⚠️ [UserMemory] Failed to extract user memory: {e}")
+
+    async def _maybe_evolve_user_memory(self, *, session: Session, user_message: Message) -> None:
+        """Best-effort periodic memory consolidation after new durable memories land."""
+        if self.memory_consolidator is None:
+            return
+        try:
+            ran, report = await self.memory_consolidator.maybe_consolidate(
+                user_id=session.user_id or user_message.user_id or "default",
+                channel=session.channel or user_message.channel or "",
+                project_id=self._memory_project_id(),
+                min_interval_hours=self.user_memory_consolidation_interval_hours,
+                stale_after_days=self.user_memory_consolidation_stale_after_days,
+            )
+        except Exception as e:
+            print(f"⚠️ [UserMemory] Failed to evolve user memory: {e}")
+            return
+        if not ran:
+            return
+        if report.superseded or report.decayed or report.boosted or report.conflicts:
+            self.system_prompt_manager.invalidate_session_cache(session.session_id)
+            print(
+                "🧠 [UserMemory] Evolved memory graph: "
+                f"superseded={len(report.superseded)}, boosted={len(report.boosted)}, "
+                f"decayed={len(report.decayed)}, conflicts={len(report.conflicts)}."
+            )
 
     async def _get_semantic_memories(self, session: Session) -> tuple[str, str]:
         """获取语义记忆 (Semantic Memory / RAG)"""

@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from pyclaw.core.subagent import ContextPolicy, SubAgentRole, SubAgentSpec, WorkspaceMode
+from pyclaw.core.subagent import ContextPolicy, SubAgentMemoryPolicy, SubAgentRole, SubAgentSpec, WorkspaceMode
 from pyclaw.tools.base import BaseTool, ToolResult
 
 
@@ -16,6 +16,10 @@ class SubAgentArgs(BaseModel):
     )
     context: Optional[str] = Field(
         None, description="显式提供给子 Agent 的额外背景信息；默认不会继承父会话历史"
+    )
+    memory_policy: SubAgentMemoryPolicy = Field(
+        default=SubAgentMemoryPolicy.ROLE_DEFAULT,
+        description="子 Agent 记忆注入策略：role_default、none、project_only、user_and_project",
     )
     allowed_tools: Optional[list[str]] = Field(
         None, description="可选工具白名单；默认按角色使用最小权限工具集"
@@ -49,12 +53,18 @@ class SubAgentTool(BaseTool):
         denied_tools: Optional[list[str]] = None,
         allowed_paths: Optional[list[str]] = None,
         workspace_mode: WorkspaceMode | str = WorkspaceMode.SCRATCH,
+        memory_policy: SubAgentMemoryPolicy | str = SubAgentMemoryPolicy.ROLE_DEFAULT,
         timeout_seconds: int = 300,
         max_iterations: int = 20,
     ) -> ToolResult:
         try:
             role = self._resolve_role(specialization)
             workspace = workspace_mode if isinstance(workspace_mode, WorkspaceMode) else WorkspaceMode(str(workspace_mode))
+            resolved_memory_policy = (
+                memory_policy
+                if isinstance(memory_policy, SubAgentMemoryPolicy)
+                else SubAgentMemoryPolicy(str(memory_policy))
+            )
             parent_session_id = getattr(self.main_agent, "_last_activity_session_id", "") or ""
             spec = SubAgentSpec(
                 parent_session_id=parent_session_id,
@@ -62,6 +72,7 @@ class SubAgentTool(BaseTool):
                 task=prompt,
                 context=context,
                 context_policy=ContextPolicy.EXPLICIT_ONLY,
+                memory_policy=resolved_memory_policy,
                 workspace_mode=workspace,
                 allowed_tools=allowed_tools,
                 denied_tools=denied_tools or [],

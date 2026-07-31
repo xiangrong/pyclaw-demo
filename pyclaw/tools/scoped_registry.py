@@ -23,6 +23,7 @@ RESEARCH_TOOLS = {
     "search_memory",
     "search_documents",
     "list_user_memories",
+    "audit_user_memory",
     "list_skills",
     "activate_skill",
 }
@@ -42,6 +43,8 @@ DANGEROUS_TOOLS = {
     "save_user_memory",
     "update_user_memory",
     "delete_user_memory",
+    "consolidate_user_memory",
+    "record_user_memory_feedback",
     "save_as_skill",
     "learn_skill_from_doc",
     "ingest_document",

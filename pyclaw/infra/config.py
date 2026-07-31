@@ -67,6 +67,9 @@ class UserMemoryConfig(BaseModel):
     sync_external: bool = True
     include_external_recall: bool = False
     external_timeout_seconds: float = 3.0
+    auto_consolidate: bool = True
+    consolidation_interval_hours: float = 24.0
+    consolidation_stale_after_days: int = 90
 
 
 class DocumentRAGConfig(BaseModel):
@@ -145,6 +148,17 @@ def load_config(config_path: Optional[str] = None) -> Config:
         user_memory["external_provider"] = os.environ["PYCLAW_USER_MEMORY_EXTERNAL_PROVIDER"]
     if os.environ.get("MEM0_API_KEY") and not user_memory.get("mem0_api_key"):
         user_memory["mem0_api_key"] = os.environ["MEM0_API_KEY"]
+    if os.environ.get("PYCLAW_USER_MEMORY_AUTO_CONSOLIDATE"):
+        user_memory["auto_consolidate"] = os.environ["PYCLAW_USER_MEMORY_AUTO_CONSOLIDATE"].lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if os.environ.get("PYCLAW_USER_MEMORY_CONSOLIDATION_INTERVAL_HOURS"):
+        user_memory["consolidation_interval_hours"] = float(os.environ["PYCLAW_USER_MEMORY_CONSOLIDATION_INTERVAL_HOURS"])
+    if os.environ.get("PYCLAW_USER_MEMORY_CONSOLIDATION_STALE_AFTER_DAYS"):
+        user_memory["consolidation_stale_after_days"] = int(os.environ["PYCLAW_USER_MEMORY_CONSOLIDATION_STALE_AFTER_DAYS"])
 
     # 默认注入高德地图 MCP
     if data.get("amap", {}).get("api_key"):

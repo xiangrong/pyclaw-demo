@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 
@@ -23,7 +24,7 @@ from pyclaw.core.agent import Agent
 from pyclaw.core.session import SessionManager
 from pyclaw.core.memory import SemanticMemory
 from pyclaw.core.document_rag import DocumentKnowledgeStore
-from pyclaw.core.user_memory import UserMemoryStore
+from pyclaw.core.user_memory import MemoryConsolidator, UserMemoryStore
 from pyclaw.core.user_memory_backends import Mem0UserMemoryBackend, UserMemoryExternalBackend
 from pyclaw.core.path_discovery import discover_tool_paths
 from pyclaw.gateway.gateway import Gateway
@@ -41,8 +42,11 @@ from pyclaw.tools.save_skill import SaveSkillTool
 from pyclaw.tools.memory_search import MemorySearchTool
 from pyclaw.tools.document_rag import IngestDocumentTool, SearchDocumentsTool
 from pyclaw.tools.user_memory import (
+    AuditUserMemoryTool,
+    ConsolidateUserMemoryTool,
     DeleteUserMemoryTool,
     ListUserMemoriesTool,
+    RecordUserMemoryFeedbackTool,
     SaveUserMemoryTool,
     UpdateUserMemoryTool,
 )
@@ -152,7 +156,18 @@ async def _setup_user_memory(cfg: Config, tool_registry: ToolRegistry) -> Option
     tool_registry.register(SaveUserMemoryTool(user_memory))
     tool_registry.register(UpdateUserMemoryTool(user_memory))
     tool_registry.register(DeleteUserMemoryTool(user_memory))
+    tool_registry.register(AuditUserMemoryTool(user_memory))
+    tool_registry.register(ConsolidateUserMemoryTool(user_memory))
+    tool_registry.register(RecordUserMemoryFeedbackTool(user_memory))
     return user_memory
+
+
+async def _open_user_memory_from_config(config: Optional[str]) -> UserMemoryStore:
+    cfg = load_config(config)
+    os.makedirs(cfg.work_dir, exist_ok=True)
+    store = UserMemoryStore(os.path.join(cfg.work_dir, "user_memory.db"))
+    await store.init_db()
+    return store
 
 
 def _setup_document_rag(cfg: Config, model_provider: OpenAIProvider, tool_registry: ToolRegistry) -> Optional[DocumentKnowledgeStore]:
@@ -315,6 +330,9 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             document_rag_auto_retrieve=cfg.document_rag.auto_retrieve,
             document_rag_limit=cfg.document_rag.default_limit,
             document_rag_collection=cfg.document_rag.collection,
+            user_memory_auto_consolidate=cfg.user_memory.auto_consolidate,
+            user_memory_consolidation_interval_hours=cfg.user_memory.consolidation_interval_hours,
+            user_memory_consolidation_stale_after_days=cfg.user_memory.consolidation_stale_after_days,
             max_iterations=cfg.max_iterations,
             max_consecutive_failures=cfg.max_consecutive_failures,
             exec_approval_mode=cfg.exec_approval.mode,
@@ -494,6 +512,9 @@ def cron_exec(
             document_rag_auto_retrieve=cfg.document_rag.auto_retrieve,
             document_rag_limit=cfg.document_rag.default_limit,
             document_rag_collection=cfg.document_rag.collection,
+            user_memory_auto_consolidate=cfg.user_memory.auto_consolidate,
+            user_memory_consolidation_interval_hours=cfg.user_memory.consolidation_interval_hours,
+            user_memory_consolidation_stale_after_days=cfg.user_memory.consolidation_stale_after_days,
             max_iterations=cfg.max_iterations,
             max_consecutive_failures=cfg.max_consecutive_failures,
             exec_approval_mode=cfg.exec_approval.mode,
@@ -528,6 +549,176 @@ def cron_tick(
     count = tick(verbose=verbose)
     if verbose:
         typer.echo(f"执行了 {count} 个任务")
+
+
+@app.command("memory-list")
+def memory_list(
+    user_id: str = typer.Option("default", "--user-id", help="User id to list."),
+    status: str = typer.Option("active", "--status", help="Memory status; empty lists all statuses."),
+    scope: Optional[list[str]] = typer.Option(None, "--scope", help="Optional scope filter; repeatable."),
+    kind: Optional[list[str]] = typer.Option(None, "--kind", help="Optional kind filter; repeatable."),
+    channel: str = typer.Option("", "--channel", help="Optional channel filter."),
+    project_id: str = typer.Option("", "--project-id", help="Optional project/workspace id filter."),
+    query: str = typer.Option("", "--query", "-q", help="Search subject/predicate/value."),
+    limit: int = typer.Option(50, "--limit", min=1, max=500, help="Maximum records."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON."),
+    config: str = typer.Option(None, "--config", help="Path to config file."),
+) -> None:
+    """List reviewable structured user memories."""
+
+    async def _run() -> None:
+        store = await _open_user_memory_from_config(config)
+        memories = await store.list_memories(
+            user_id=user_id,
+            scopes=scope or None,
+            kinds=kind or None,
+            status=status,
+            channel=channel,
+            project_id=project_id,
+            query=query,
+            limit=limit,
+        )
+        if json_output:
+            typer.echo(json.dumps([item.model_dump() for item in memories], ensure_ascii=False, indent=2))
+            return
+        if not memories:
+            typer.echo("No user memories found.")
+            return
+        for item in memories:
+            typer.echo(
+                f"{item.id}\t{item.kind}/{item.scope}/{item.status}\t"
+                f"importance={item.importance}\tconfidence={item.confidence:.2f}\t"
+                f"{item.subject} {item.predicate}: {item.value}"
+            )
+
+    asyncio.run(_run())
+
+
+@app.command("memory-update")
+def memory_update(
+    memory_id: str = typer.Argument(..., help="Memory id to update."),
+    value: Optional[str] = typer.Option(None, "--value", help="New memory value."),
+    subject: Optional[str] = typer.Option(None, "--subject", help="New subject."),
+    predicate: Optional[str] = typer.Option(None, "--predicate", help="New predicate."),
+    kind: Optional[str] = typer.Option(None, "--kind", help="New kind."),
+    scope: Optional[str] = typer.Option(None, "--scope", help="New scope."),
+    status: Optional[str] = typer.Option(None, "--status", help="New status."),
+    confidence: Optional[float] = typer.Option(None, "--confidence", min=0.0, max=1.0, help="New confidence."),
+    importance: Optional[int] = typer.Option(None, "--importance", min=1, max=5, help="New importance."),
+    channel: Optional[str] = typer.Option(None, "--channel", help="New channel for channel scope."),
+    project_id: Optional[str] = typer.Option(None, "--project-id", help="New project id for project scope."),
+    config: str = typer.Option(None, "--config", help="Path to config file."),
+) -> None:
+    """Patch one structured user memory by id."""
+
+    async def _run() -> None:
+        store = await _open_user_memory_from_config(config)
+        existing = await store.get(memory_id)
+        if existing is None:
+            typer.echo(f"User memory not found: {memory_id}", err=True)
+            raise typer.Exit(1)
+        updates: dict[str, object] = {
+            "value": value,
+            "subject": subject,
+            "predicate": predicate,
+            "kind": kind,
+            "scope": scope,
+            "status": status,
+            "confidence": confidence,
+            "importance": importance,
+            "channel": channel,
+            "project_id": project_id,
+        }
+        clean_updates = {key: update_value for key, update_value in updates.items() if update_value is not None}
+        updated = await store.update(
+            memory_id,
+            clean_updates,
+            user_id=str(clean_updates.get("user_id") or existing.user_id or "default"),
+            audit_source="memory_update_cli",
+        )
+        if updated is None:
+            typer.echo(f"User memory not found: {memory_id}", err=True)
+            raise typer.Exit(1)
+        typer.echo(json.dumps(updated.model_dump(), ensure_ascii=False, indent=2))
+
+    asyncio.run(_run())
+
+
+@app.command("memory-delete")
+def memory_delete(
+    memory_id: str = typer.Argument(..., help="Memory id to reject/delete."),
+    hard: bool = typer.Option(False, "--hard", help="Physically delete instead of marking rejected."),
+    config: str = typer.Option(None, "--config", help="Path to config file."),
+) -> None:
+    """Reject or physically delete one structured user memory."""
+
+    async def _run() -> None:
+        store = await _open_user_memory_from_config(config)
+        deleted = await store.delete(memory_id, hard=hard)
+        if not deleted:
+            typer.echo(f"User memory not found: {memory_id}", err=True)
+            raise typer.Exit(1)
+        typer.echo(("Deleted" if hard else "Rejected") + f" user memory {memory_id}.")
+
+    asyncio.run(_run())
+
+
+@app.command("memory-export")
+def memory_export(
+    user_id: str = typer.Option("default", "--user-id", help="User id to export."),
+    output: str = typer.Option("", "--output", "-o", help="Optional JSON output path; stdout when omitted."),
+    include_usage: bool = typer.Option(True, "--include-usage/--no-include-usage", help="Include telemetry counts."),
+    include_audit: bool = typer.Option(True, "--include-audit/--no-include-audit", help="Include audit events."),
+    limit: int = typer.Option(500, "--limit", min=1, max=1000, help="Maximum records/events."),
+    config: str = typer.Option(None, "--config", help="Path to config file."),
+) -> None:
+    """Export reviewable memory state as JSON."""
+
+    async def _run() -> None:
+        store = await _open_user_memory_from_config(config)
+        snapshot = await store.export_snapshot(
+            user_id=user_id,
+            include_usage=include_usage,
+            include_audit=include_audit,
+            limit=limit,
+        )
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        if output:
+            path = Path(output).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+            typer.echo(f"Exported user memory to {path}")
+        else:
+            typer.echo(payload)
+
+    asyncio.run(_run())
+
+
+@app.command("memory-consolidate")
+def memory_consolidate(
+    user_id: str = typer.Option("default", "--user-id", help="User id to consolidate."),
+    channel: str = typer.Option("", "--channel", help="Optional channel filter."),
+    project_id: str = typer.Option("", "--project-id", help="Optional project/workspace id filter."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Preview by default; use --apply to mutate."),
+    stale_after_days: int = typer.Option(90, "--stale-after-days", min=1, max=3650, help="Decay threshold."),
+    limit: int = typer.Option(500, "--limit", min=1, max=1000, help="Maximum active records to scan."),
+    config: str = typer.Option(None, "--config", help="Path to config file."),
+) -> None:
+    """Run memory consolidation, dedupe, conflict detection, and stale decay."""
+
+    async def _run() -> None:
+        store = await _open_user_memory_from_config(config)
+        report = await MemoryConsolidator(store).consolidate(
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            limit=limit,
+            dry_run=dry_run,
+            stale_after_days=stale_after_days,
+        )
+        typer.echo(json.dumps(report.model_dump(mode="json"), ensure_ascii=False, indent=2))
+
+    asyncio.run(_run())
 
 
 @app.command()
@@ -618,6 +809,10 @@ user_memory:
   # 默认不把外部召回直接注入 prompt，避免非权威数据污染上下文
   include_external_recall: false
   external_timeout_seconds: 3.0
+  # 后台自动进化：新记忆写入后按用户维度周期性去重/合并/冲突检测/衰减
+  auto_consolidate: true
+  consolidation_interval_hours: 24.0
+  consolidation_stale_after_days: 90
 
 # 公司/技术文档 RAG 知识库配置
 document_rag:

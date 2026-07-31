@@ -5,7 +5,8 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 
@@ -29,6 +30,17 @@ MemoryKind = Literal[
     "note",
 ]
 MemoryStatus = Literal["active", "superseded", "rejected", "expired"]
+MemoryFeedbackOutcome = Literal["helpful", "harmful", "neutral"]
+MemoryUsageOutcome = Literal["injected", "helpful", "harmful", "neutral"]
+MemoryAuditOperation = Literal[
+    "upsert",
+    "update",
+    "delete",
+    "status_change",
+    "feedback",
+    "consolidate",
+    "telemetry",
+]
 
 VALID_SCOPES: set[str] = {"global", "project", "channel", "session"}
 VALID_KINDS: set[str] = {
@@ -223,6 +235,54 @@ class MemoryExtractionResult(BaseModel):
     ignored_reason: str = ""
 
 
+class MemoryConflict(BaseModel):
+    """Reviewable conflict detected during memory consolidation."""
+
+    group_key: str
+    memory_ids: list[str] = Field(default_factory=list)
+    reason: str
+    severity: Literal["low", "medium", "high"] = "medium"
+
+
+class MemoryConsolidationReport(BaseModel):
+    """Structured result for periodic memory cleanup/evolution."""
+
+    scanned: int = 0
+    superseded: list[str] = Field(default_factory=list)
+    boosted: list[str] = Field(default_factory=list)
+    decayed: list[str] = Field(default_factory=list)
+    conflicts: list[MemoryConflict] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    dry_run: bool = False
+
+
+class MemoryUseEvent(BaseModel):
+    """Telemetry event for prompt injection and feedback outcomes."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    memory_id: str
+    user_id: str = "default"
+    session_id: str = ""
+    channel: str = ""
+    project_id: str = ""
+    role: str = "main"
+    surface: str = "prompt"
+    outcome: MemoryUsageOutcome = "injected"
+    created_at: str = Field(default_factory=lambda: utc_now_iso())
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemoryAuditEvent(BaseModel):
+    """Durable audit trail entry for memory mutations and review actions."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    memory_id: str = ""
+    operation: MemoryAuditOperation
+    user_id: str = "default"
+    created_at: str = Field(default_factory=lambda: utc_now_iso())
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class UserMemoryStore:
     """SQLite-backed canonical user memory store.
 
@@ -286,6 +346,59 @@ class UserMemoryStore:
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_memories_merge ON user_memories(merge_key)"
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_memory_usage (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    session_id TEXT,
+                    channel TEXT,
+                    project_id TEXT,
+                    role TEXT,
+                    surface TEXT,
+                    outcome TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    metadata TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_memory_usage_memory
+                ON user_memory_usage(memory_id, outcome, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_memory_usage_context
+                ON user_memory_usage(user_id, session_id, role, outcome)
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_memory_audit (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT,
+                    operation TEXT NOT NULL,
+                    user_id TEXT,
+                    created_at TEXT NOT NULL,
+                    metadata TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_memory_audit_memory
+                ON user_memory_audit(memory_id, operation, created_at)
+                """
+            )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_memory_audit_user
+                ON user_memory_audit(user_id, operation, created_at)
+                """
+            )
             await db.commit()
         self._initialized = True
 
@@ -305,6 +418,18 @@ class UserMemoryStore:
         final = upsert.to_item(existing)
         await self._write_item(final)
         await self._sync_external_upsert(final)
+        await self.record_audit(
+            memory_id=final.id,
+            operation="update" if existing is not None else "upsert",
+            user_id=final.user_id,
+            metadata={
+                "scope": final.scope,
+                "kind": final.kind,
+                "status": final.status,
+                "merge_key": final.merge_key(),
+                "source": "upsert",
+            },
+        )
         return final
 
     async def add_many(self, items: Iterable[MemoryUpsert | UserMemoryItem | dict[str, Any]]) -> list[UserMemoryItem]:
@@ -388,7 +513,7 @@ class UserMemoryStore:
             + " AND ".join(clauses)
             + " ORDER BY importance DESC, confidence DESC, updated_at DESC LIMIT ?"
         )
-        params.append(max(1, min(int(limit), 200)))
+        params.append(max(1, min(int(limit), 1000)))
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, tuple(params)) as cursor:
@@ -406,8 +531,61 @@ class UserMemoryStore:
             )
             items = self._merge_external_items(items, external_items)
             items.sort(key=lambda item: (item.importance, item.confidence, item.updated_at), reverse=True)
-            items = items[: max(1, min(int(limit), 200))]
+            items = items[: max(1, min(int(limit), 1000))]
         return items
+
+    async def update(
+        self,
+        memory_id: str,
+        updates: dict[str, Any],
+        *,
+        user_id: str = "default",
+        audit_source: str = "manual_update",
+    ) -> Optional[UserMemoryItem]:
+        """Patch a memory exactly, preserving reviewability and external sync.
+
+        ``upsert`` intentionally keeps the maximum confidence/importance when
+        consolidating extractor candidates. Human audit/edit flows need exact
+        control so users can lower confidence, importance, or status when they
+        correct the assistant.
+        """
+        await self._ensure_initialized()
+        existing = await self.get(memory_id)
+        if existing is None:
+            return None
+
+        data = existing.model_dump()
+        changed_fields: list[str] = []
+        for key, value in updates.items():
+            if key == "id" or value is None or key not in data:
+                continue
+            if data.get(key) != value:
+                data[key] = value
+                changed_fields.append(key)
+        if not changed_fields:
+            return existing
+
+        data["id"] = existing.id
+        data["updated_at"] = utc_now_iso()
+        item = UserMemoryItem.model_validate(data)
+        await self._write_item(item)
+        if item.status == "active":
+            await self._sync_external_upsert(item)
+        else:
+            await self._sync_external_delete(item, hard=False)
+        await self.record_audit(
+            memory_id=item.id,
+            operation="update",
+            user_id=user_id or item.user_id or "default",
+            metadata={
+                "source": audit_source,
+                "changed_fields": changed_fields,
+                "status": item.status,
+                "confidence": item.confidence,
+                "importance": item.importance,
+            },
+        )
+        return item
 
     async def delete(self, memory_id: str, *, hard: bool = False) -> bool:
         await self._ensure_initialized()
@@ -426,6 +604,12 @@ class UserMemoryStore:
             deleted = bool(cursor.rowcount)
         if deleted:
             await self._sync_external_delete(existing or memory_id, hard=hard)
+            await self.record_audit(
+                memory_id=memory_id,
+                operation="delete",
+                user_id=(existing.user_id if existing is not None else "default"),
+                metadata={"hard": hard, "previous_status": existing.status if existing is not None else "unknown"},
+            )
         return deleted
 
     async def expire_due_memories(self, *, now: Optional[str] = None) -> int:
@@ -475,18 +659,23 @@ class UserMemoryStore:
                 await self._sync_external_upsert(item)
             else:
                 await self._sync_external_delete(item, hard=False)
+            await self.record_audit(
+                memory_id=memory_id,
+                operation="status_change",
+                user_id=item.user_id,
+                metadata={"status": status},
+            )
         return item
 
-    async def render_profile(
+    async def list_profile_items(
         self,
         *,
         user_id: str = "default",
         channel: str = "",
         project_id: str = "",
         max_items: int = 12,
-        max_chars: int = 2400,
-    ) -> tuple[str, str]:
-        """Return compact always-on profile and current project memory."""
+    ) -> tuple[list[UserMemoryItem], list[UserMemoryItem]]:
+        """Return the concrete memory items that would be injected into a prompt."""
         global_items = await self.list_memories(
             user_id=user_id,
             scopes=["global"],
@@ -502,7 +691,7 @@ class UserMemoryStore:
                 channel=channel,
                 limit=max_items,
             )
-        project = await self.list_memories(
+        project_items = await self.list_memories(
             user_id=user_id,
             scopes=["project"],
             status="active",
@@ -514,7 +703,361 @@ class UserMemoryStore:
             key=lambda item: (item.importance, item.confidence, item.updated_at),
             reverse=True,
         )[:max_items]
+        return always, project_items[:max_items]
+
+    async def render_profile(
+        self,
+        *,
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        max_items: int = 12,
+        max_chars: int = 2400,
+    ) -> tuple[str, str]:
+        """Return compact always-on profile and current project memory."""
+        always, project = await self.list_profile_items(
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            max_items=max_items,
+        )
         return self._render_items(always, max_chars=max_chars), self._render_items(project, max_chars=max_chars)
+
+    async def render_profile_with_items(
+        self,
+        *,
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        max_items: int = 12,
+        max_chars: int = 2400,
+    ) -> tuple[str, str, list[UserMemoryItem], list[UserMemoryItem]]:
+        """Return rendered profile text plus the exact injected memory rows."""
+        always, project = await self.list_profile_items(
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            max_items=max_items,
+        )
+        return (
+            self._render_items(always, max_chars=max_chars),
+            self._render_items(project, max_chars=max_chars),
+            always,
+            project,
+        )
+
+    async def record_usage(
+        self,
+        items: Iterable[UserMemoryItem],
+        *,
+        session_id: str = "",
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        role: str = "main",
+        surface: str = "prompt",
+        outcome: MemoryUsageOutcome = "injected",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryUseEvent]:
+        """Record which memories were used and whether that use helped or hurt."""
+        await self._ensure_initialized()
+        if outcome not in {"injected", "helpful", "harmful", "neutral"}:
+            raise ValueError(f"Invalid memory usage outcome: {outcome}")
+        now = utc_now_iso()
+        events: list[MemoryUseEvent] = []
+        for item in items:
+            if not item.id:
+                continue
+            events.append(MemoryUseEvent(
+                memory_id=item.id,
+                user_id=user_id or item.user_id or "default",
+                session_id=session_id,
+                channel=channel,
+                project_id=project_id,
+                role=role,
+                surface=surface,
+                outcome=outcome,
+                created_at=now,
+                metadata=dict(metadata or {}),
+            ))
+        if not events:
+            return []
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                """
+                INSERT INTO user_memory_usage (
+                    id, memory_id, user_id, session_id, channel, project_id,
+                    role, surface, outcome, created_at, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        event.id,
+                        event.memory_id,
+                        event.user_id,
+                        event.session_id,
+                        event.channel,
+                        event.project_id,
+                        event.role,
+                        event.surface,
+                        event.outcome,
+                        event.created_at,
+                        json.dumps(event.metadata, ensure_ascii=False),
+                    )
+                    for event in events
+                ],
+            )
+            await db.commit()
+        return events
+
+    async def record_usage_by_ids(
+        self,
+        memory_ids: Iterable[str],
+        *,
+        session_id: str = "",
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        role: str = "main",
+        surface: str = "feedback",
+        outcome: MemoryUsageOutcome = "neutral",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryUseEvent]:
+        """Record usage/feedback for known memory ids without rendering them first."""
+        items: list[UserMemoryItem] = []
+        for memory_id in memory_ids:
+            item = await self.get(str(memory_id))
+            if item is not None:
+                items.append(item)
+        return await self.record_usage(
+            items,
+            session_id=session_id,
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            role=role,
+            surface=surface,
+            outcome=outcome,
+            metadata=metadata,
+        )
+
+    async def apply_feedback(
+        self,
+        memory_id: str,
+        *,
+        outcome: MemoryFeedbackOutcome,
+        reason: str = "",
+        session_id: str = "",
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        role: str = "main",
+    ) -> Optional[UserMemoryItem]:
+        """Apply explicit user feedback to one memory and evolve confidence/status."""
+        await self._ensure_initialized()
+        if outcome not in {"helpful", "harmful", "neutral"}:
+            raise ValueError(f"Invalid memory feedback outcome: {outcome}")
+        item = await self.get(memory_id)
+        if item is None:
+            return None
+
+        metadata = dict(item.metadata or {})
+        feedback = metadata.get("feedback")
+        if not isinstance(feedback, dict):
+            feedback = {}
+        feedback[f"{outcome}_count"] = int(feedback.get(f"{outcome}_count", 0) or 0) + 1
+        if reason:
+            recent = feedback.get("recent_reasons")
+            if not isinstance(recent, list):
+                recent = []
+            recent.append({"outcome": outcome, "reason": reason, "at": utc_now_iso()})
+            feedback["recent_reasons"] = recent[-5:]
+        metadata["feedback"] = feedback
+
+        if outcome == "helpful":
+            item.confidence = min(1.0, float(item.confidence) + 0.05)
+            item.importance = min(5, int(item.importance) + 1)
+            if item.status in {"superseded", "expired"} and item.confidence >= 0.6:
+                item.status = "active"
+        elif outcome == "harmful":
+            harmful_count = int(feedback.get("harmful_count", 0) or 0)
+            item.confidence = max(0.0, float(item.confidence) - 0.2)
+            if item.confidence < 0.35 or harmful_count >= 2:
+                item.status = "rejected"
+
+        item.metadata = metadata
+        item.updated_at = utc_now_iso()
+        await self._write_item(item)
+        if item.status == "active":
+            await self._sync_external_upsert(item)
+        else:
+            await self._sync_external_delete(item, hard=False)
+        await self.record_usage(
+            [item],
+            session_id=session_id,
+            user_id=user_id or item.user_id,
+            channel=channel,
+            project_id=project_id,
+            role=role,
+            surface="feedback",
+            outcome=outcome,
+            metadata={"reason": reason} if reason else {},
+        )
+        await self.record_audit(
+            memory_id=item.id,
+            operation="feedback",
+            user_id=user_id or item.user_id,
+            metadata={
+                "outcome": outcome,
+                "reason": reason,
+                "confidence": item.confidence,
+                "importance": item.importance,
+                "status": item.status,
+            },
+        )
+        return item
+
+    async def record_audit(
+        self,
+        *,
+        operation: MemoryAuditOperation,
+        memory_id: str = "",
+        user_id: str = "default",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> MemoryAuditEvent:
+        """Append one audit event for memory reviewability."""
+        await self._ensure_initialized()
+        event = MemoryAuditEvent(
+            memory_id=memory_id,
+            operation=operation,
+            user_id=user_id or "default",
+            metadata=dict(metadata or {}),
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO user_memory_audit (id, memory_id, operation, user_id, created_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.memory_id,
+                    event.operation,
+                    event.user_id,
+                    event.created_at,
+                    json.dumps(event.metadata, ensure_ascii=False),
+                ),
+            )
+            await db.commit()
+        return event
+
+    async def usage_counts(self, memory_ids: Iterable[str]) -> dict[str, dict[str, int]]:
+        """Return per-memory usage/feedback counts grouped by outcome."""
+        await self._ensure_initialized()
+        ids = [str(memory_id) for memory_id in memory_ids if str(memory_id)]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                f"""
+                SELECT memory_id, outcome, COUNT(*) AS count
+                FROM user_memory_usage
+                WHERE memory_id IN ({placeholders})
+                GROUP BY memory_id, outcome
+                """,
+                tuple(ids),
+            ) as cursor:
+                rows = [row async for row in cursor]
+        counts: dict[str, dict[str, int]] = {memory_id: {} for memory_id in ids}
+        for memory_id, outcome, count in rows:
+            counts.setdefault(str(memory_id), {})[str(outcome)] = int(count)
+        return counts
+
+    async def list_usage_events(
+        self,
+        *,
+        user_id: str = "default",
+        memory_id: str = "",
+        outcome: str = "",
+        limit: int = 100,
+    ) -> list[MemoryUseEvent]:
+        """List recent memory telemetry events."""
+        await self._ensure_initialized()
+        clauses = ["user_id = ?"]
+        params: list[Any] = [user_id or "default"]
+        if memory_id:
+            clauses.append("memory_id = ?")
+            params.append(memory_id)
+        if outcome:
+            clauses.append("outcome = ?")
+            params.append(outcome)
+        params.append(max(1, min(int(limit), 500)))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM user_memory_usage WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at DESC LIMIT ?",
+                tuple(params),
+            ) as cursor:
+                rows = [row async for row in cursor]
+        return [self._row_to_usage(row) for row in rows]
+
+    async def list_audit_events(
+        self,
+        *,
+        user_id: str = "default",
+        memory_id: str = "",
+        operation: str = "",
+        limit: int = 100,
+    ) -> list[MemoryAuditEvent]:
+        """List recent memory audit events."""
+        await self._ensure_initialized()
+        clauses = ["user_id = ?"]
+        params: list[Any] = [user_id or "default"]
+        if memory_id:
+            clauses.append("memory_id = ?")
+            params.append(memory_id)
+        if operation:
+            clauses.append("operation = ?")
+            params.append(operation)
+        params.append(max(1, min(int(limit), 500)))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM user_memory_audit WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY created_at DESC LIMIT ?",
+                tuple(params),
+            ) as cursor:
+                rows = [row async for row in cursor]
+        return [self._row_to_audit(row) for row in rows]
+
+    async def export_snapshot(
+        self,
+        *,
+        user_id: str = "default",
+        include_usage: bool = True,
+        include_audit: bool = True,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Export reviewable memory state for CLI audit/backup."""
+        memories = await self.list_memories(user_id=user_id, status="", limit=limit)
+        memory_ids = [item.id for item in memories]
+        snapshot: dict[str, Any] = {
+            "user_id": user_id or "default",
+            "exported_at": utc_now_iso(),
+            "memories": [item.model_dump() for item in memories],
+        }
+        if include_usage:
+            snapshot["usage_counts"] = await self.usage_counts(memory_ids)
+        if include_audit:
+            snapshot["audit_events"] = [
+                event.model_dump()
+                for event in await self.list_audit_events(user_id=user_id, limit=limit)
+            ]
+        return snapshot
 
     async def apply_candidates(
         self,
@@ -735,6 +1278,33 @@ class UserMemoryStore:
             metadata=metadata if isinstance(metadata, dict) else {},
         )
 
+    def _row_to_usage(self, row: sqlite3.Row | aiosqlite.Row | Any) -> MemoryUseEvent:
+        metadata = safe_json_loads(row["metadata"], {})
+        return MemoryUseEvent(
+            id=row["id"],
+            memory_id=row["memory_id"],
+            user_id=row["user_id"] or "default",
+            session_id=row["session_id"] or "",
+            channel=row["channel"] or "",
+            project_id=row["project_id"] or "",
+            role=row["role"] or "main",
+            surface=row["surface"] or "prompt",
+            outcome=row["outcome"],
+            created_at=row["created_at"],
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
+
+    def _row_to_audit(self, row: sqlite3.Row | aiosqlite.Row | Any) -> MemoryAuditEvent:
+        metadata = safe_json_loads(row["metadata"], {})
+        return MemoryAuditEvent(
+            id=row["id"],
+            memory_id=row["memory_id"] or "",
+            operation=row["operation"],
+            user_id=row["user_id"] or "default",
+            created_at=row["created_at"],
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
+
     async def _ensure_initialized(self) -> None:
         if not self._initialized:
             await self.init_db()
@@ -752,6 +1322,405 @@ class UserMemoryStore:
         if len(text) <= max_chars:
             return text
         return text[: max_chars - 32].rstrip() + "\n- ... truncated ..."
+
+
+class MemoryUseTelemetry:
+    """Facade for recording and querying how memories influence prompts/results."""
+
+    def __init__(self, store: UserMemoryStore) -> None:
+        self.store = store
+
+    async def record_injected(
+        self,
+        items: Iterable[UserMemoryItem],
+        *,
+        session_id: str = "",
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        role: str = "main",
+        surface: str = "prompt",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryUseEvent]:
+        """Record the exact memory rows injected into a prompt."""
+        return await self.store.record_usage(
+            items,
+            session_id=session_id,
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            role=role,
+            surface=surface,
+            outcome="injected",
+            metadata=metadata,
+        )
+
+    async def record_outcome(
+        self,
+        memory_ids: Iterable[str],
+        *,
+        outcome: MemoryUsageOutcome,
+        session_id: str = "",
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        role: str = "main",
+        surface: str = "feedback",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryUseEvent]:
+        """Record whether prior memory use was helpful, harmful, or neutral."""
+        return await self.store.record_usage_by_ids(
+            memory_ids,
+            session_id=session_id,
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            role=role,
+            surface=surface,
+            outcome=outcome,
+            metadata=metadata,
+        )
+
+    async def usage_counts(self, memory_ids: Iterable[str]) -> dict[str, dict[str, int]]:
+        return await self.store.usage_counts(memory_ids)
+
+    async def list_events(
+        self,
+        *,
+        user_id: str = "default",
+        memory_id: str = "",
+        outcome: str = "",
+        limit: int = 100,
+    ) -> list[MemoryUseEvent]:
+        return await self.store.list_usage_events(
+            user_id=user_id,
+            memory_id=memory_id,
+            outcome=outcome,
+            limit=limit,
+        )
+
+
+class MemoryFeedbackLoop:
+    """Explicit feedback loop that evolves confidence/status from user corrections."""
+
+    def __init__(self, store: UserMemoryStore) -> None:
+        self.store = store
+
+    async def apply_feedback(
+        self,
+        memory_id: str,
+        *,
+        outcome: MemoryFeedbackOutcome,
+        reason: str = "",
+        session_id: str = "",
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        role: str = "main",
+    ) -> Optional[UserMemoryItem]:
+        return await self.store.apply_feedback(
+            memory_id,
+            outcome=outcome,
+            reason=reason,
+            session_id=session_id,
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            role=role,
+        )
+
+    async def mark_helpful(self, memory_id: str, **kwargs: Any) -> Optional[UserMemoryItem]:
+        return await self.apply_feedback(memory_id, outcome="helpful", **kwargs)
+
+    async def mark_harmful(self, memory_id: str, **kwargs: Any) -> Optional[UserMemoryItem]:
+        return await self.apply_feedback(memory_id, outcome="harmful", **kwargs)
+
+
+class MemoryConsolidator:
+    """Periodic memory evolution: merge duplicates, surface conflicts, decay stale noise."""
+
+    def __init__(self, store: UserMemoryStore) -> None:
+        self.store = store
+
+    async def maybe_consolidate(
+        self,
+        *,
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        limit: int = 500,
+        min_interval_hours: float = 24.0,
+        stale_after_days: int = 90,
+    ) -> tuple[bool, MemoryConsolidationReport]:
+        """Run consolidation only when the user's memory graph is due for evolution."""
+        await self.store._ensure_initialized()
+        last_at = await self._last_consolidated_at(user_id=user_id or "default")
+        if last_at is not None:
+            next_due = last_at + timedelta(hours=max(0.1, float(min_interval_hours)))
+            if datetime.now(timezone.utc) < next_due:
+                return False, MemoryConsolidationReport(
+                    scanned=0,
+                    notes=[f"not_due_until:{next_due.isoformat()}"],
+                )
+        report = await self.consolidate(
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            limit=limit,
+            dry_run=False,
+            stale_after_days=stale_after_days,
+        )
+        return True, report
+
+    async def consolidate(
+        self,
+        *,
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        limit: int = 500,
+        dry_run: bool = False,
+        stale_after_days: int = 90,
+    ) -> MemoryConsolidationReport:
+        await self.store._ensure_initialized()
+        items = await self.store.list_memories(
+            user_id=user_id or "default",
+            status="active",
+            channel=channel,
+            project_id=project_id,
+            limit=max(1, min(int(limit), 1000)),
+        )
+        report = MemoryConsolidationReport(scanned=len(items), dry_run=dry_run)
+        if not items:
+            report.notes.append("no_active_memories")
+            return report
+
+        usage = await self.store.usage_counts(item.id for item in items)
+        await self._apply_feedback_scores(items, usage, report, dry_run=dry_run)
+        await self._consolidate_groups(items, report, dry_run=dry_run)
+        await self._decay_stale_items(
+            items,
+            usage,
+            report,
+            dry_run=dry_run,
+            stale_after_days=stale_after_days,
+        )
+        if not dry_run:
+            await self.store.record_audit(
+                operation="consolidate",
+                user_id=user_id or "default",
+                metadata=report.model_dump(mode="json"),
+            )
+        return report
+
+    async def detect_conflicts(
+        self,
+        *,
+        user_id: str = "default",
+        channel: str = "",
+        project_id: str = "",
+        limit: int = 500,
+    ) -> list[MemoryConflict]:
+        """Return unresolved conflicts without mutating memory state."""
+        report = await self.consolidate(
+            user_id=user_id,
+            channel=channel,
+            project_id=project_id,
+            limit=limit,
+            dry_run=True,
+        )
+        return report.conflicts
+
+    async def _last_consolidated_at(self, *, user_id: str) -> Optional[datetime]:
+        async with aiosqlite.connect(self.store.db_path) as db:
+            async with db.execute(
+                """
+                SELECT created_at FROM user_memory_audit
+                WHERE user_id = ? AND operation = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (user_id or "default", "consolidate"),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return parse_iso_datetime(row[0]) if row else None
+
+    async def _apply_feedback_scores(
+        self,
+        items: list[UserMemoryItem],
+        usage: dict[str, dict[str, int]],
+        report: MemoryConsolidationReport,
+        *,
+        dry_run: bool,
+    ) -> None:
+        for item in items:
+            counts = usage.get(item.id, {})
+            helpful = int(counts.get("helpful", 0) or 0)
+            harmful = int(counts.get("harmful", 0) or 0)
+            if harmful >= 2:
+                report.decayed.append(item.id)
+                if not dry_run:
+                    item.confidence = max(0.0, item.confidence - 0.2)
+                    item.status = "rejected"
+                    item.updated_at = utc_now_iso()
+                    item.metadata = self._append_consolidation_note(
+                        item.metadata,
+                        "rejected_after_repeated_harmful_feedback",
+                    )
+                    await self.store._write_item(item)
+                    await self.store._sync_external_delete(item, hard=False)
+                    await self.store.record_audit(
+                        operation="consolidate",
+                        memory_id=item.id,
+                        user_id=item.user_id,
+                        metadata={"action": "reject_harmful", "helpful": helpful, "harmful": harmful},
+                    )
+                continue
+            if helpful >= 2 and helpful > harmful and item.confidence < 0.98:
+                report.boosted.append(item.id)
+                if not dry_run:
+                    item.confidence = min(1.0, item.confidence + 0.05)
+                    item.importance = min(5, item.importance + 1)
+                    item.updated_at = utc_now_iso()
+                    item.metadata = self._append_consolidation_note(
+                        item.metadata,
+                        "boosted_after_helpful_feedback",
+                    )
+                    await self.store._write_item(item)
+                    await self.store._sync_external_upsert(item)
+                    await self.store.record_audit(
+                        operation="consolidate",
+                        memory_id=item.id,
+                        user_id=item.user_id,
+                        metadata={"action": "boost_helpful", "helpful": helpful, "harmful": harmful},
+                    )
+
+    async def _consolidate_groups(
+        self,
+        items: list[UserMemoryItem],
+        report: MemoryConsolidationReport,
+        *,
+        dry_run: bool,
+    ) -> None:
+        groups: dict[str, list[UserMemoryItem]] = defaultdict(list)
+        for item in items:
+            if item.id in report.decayed:
+                continue
+            groups[_memory_conflict_group_key(item)].append(item)
+
+        for group_key, group_items in groups.items():
+            if len(group_items) < 2:
+                continue
+
+            by_value: dict[str, list[UserMemoryItem]] = defaultdict(list)
+            for item in group_items:
+                by_value[normalize_memory_value(item.value)].append(item)
+
+            survivors: list[UserMemoryItem] = []
+            for value_items in by_value.values():
+                keep = max(value_items, key=_memory_rank)
+                survivors.append(keep)
+                for duplicate in value_items:
+                    if duplicate.id == keep.id:
+                        continue
+                    report.superseded.append(duplicate.id)
+                    if not dry_run:
+                        await self._supersede(
+                            duplicate,
+                            reason="duplicate_equivalent_memory",
+                            superseded_by=keep.id,
+                        )
+
+            if len(survivors) < 2:
+                continue
+            best = max(survivors, key=_memory_rank)
+            unresolved: list[UserMemoryItem] = [best]
+            for candidate in survivors:
+                if candidate.id == best.id:
+                    continue
+                confidence_gap = best.confidence - candidate.confidence
+                importance_gap = best.importance - candidate.importance
+                if confidence_gap >= 0.30 or importance_gap >= 2:
+                    report.superseded.append(candidate.id)
+                    if not dry_run:
+                        await self._supersede(
+                            candidate,
+                            reason="weaker_conflicting_memory",
+                            superseded_by=best.id,
+                        )
+                    continue
+                unresolved.append(candidate)
+
+            if len(unresolved) > 1:
+                report.conflicts.append(MemoryConflict(
+                    group_key=group_key,
+                    memory_ids=[item.id for item in unresolved],
+                    reason="same subject/predicate has conflicting active values; needs user review",
+                    severity="high" if any(item.importance >= 4 for item in unresolved) else "medium",
+                ))
+
+    async def _decay_stale_items(
+        self,
+        items: list[UserMemoryItem],
+        usage: dict[str, dict[str, int]],
+        report: MemoryConsolidationReport,
+        *,
+        dry_run: bool,
+        stale_after_days: int,
+    ) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(stale_after_days)))
+        for item in items:
+            if item.id in report.superseded or item.id in report.decayed:
+                continue
+            if item.importance > 2 or item.confidence > 0.45:
+                continue
+            counts = usage.get(item.id, {})
+            if int(counts.get("helpful", 0) or 0) > 0:
+                continue
+            updated_at = parse_iso_datetime(item.updated_at)
+            if updated_at is None or updated_at > cutoff:
+                continue
+            report.decayed.append(item.id)
+            if not dry_run:
+                item.confidence = max(0.0, item.confidence - 0.10)
+                if item.confidence <= 0.30:
+                    item.status = "expired"
+                item.updated_at = utc_now_iso()
+                item.metadata = self._append_consolidation_note(item.metadata, "decayed_stale_low_confidence")
+                await self.store._write_item(item)
+                if item.status == "active":
+                    await self.store._sync_external_upsert(item)
+                else:
+                    await self.store._sync_external_delete(item, hard=False)
+                await self.store.record_audit(
+                    operation="consolidate",
+                    memory_id=item.id,
+                    user_id=item.user_id,
+                    metadata={"action": "decay_stale", "status": item.status, "confidence": item.confidence},
+                )
+
+    async def _supersede(self, item: UserMemoryItem, *, reason: str, superseded_by: str) -> None:
+        metadata = dict(item.metadata or {})
+        metadata["superseded_by"] = superseded_by
+        item.metadata = self._append_consolidation_note(metadata, reason)
+        item.status = "superseded"
+        item.updated_at = utc_now_iso()
+        await self.store._write_item(item)
+        await self.store._sync_external_delete(item, hard=False)
+        await self.store.record_audit(
+            operation="consolidate",
+            memory_id=item.id,
+            user_id=item.user_id,
+            metadata={"action": "supersede", "reason": reason, "superseded_by": superseded_by},
+        )
+
+    def _append_consolidation_note(self, metadata: dict[str, Any], note: str) -> dict[str, Any]:
+        updated = dict(metadata or {})
+        notes = updated.get("consolidation_notes")
+        if not isinstance(notes, list):
+            notes = []
+        notes.append({"note": note, "at": utc_now_iso()})
+        updated["consolidation_notes"] = notes[-10:]
+        return updated
 
 
 class MemoryExtractor:
@@ -881,6 +1850,12 @@ def normalize_memory_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
+def normalize_memory_value(value: str) -> str:
+    """Normalize memory values for deterministic duplicate/conflict checks."""
+    text = normalize_memory_text(value)
+    return re.sub(r"[\s\-_,.;:，。；：、]+", " ", text).strip()
+
+
 def canonical_memory_key(
     *,
     user_id: str,
@@ -903,6 +1878,36 @@ def canonical_memory_key(
     if scope == "project":
         parts.append(normalize_memory_text(project_id))
     return "|".join(parts)
+
+
+def parse_iso_datetime(value: str | None) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _memory_conflict_group_key(item: UserMemoryItem) -> str:
+    parts = [
+        normalize_memory_text(item.user_id),
+        normalize_memory_text(item.scope),
+        normalize_memory_text(item.subject),
+        normalize_memory_text(item.predicate),
+    ]
+    if item.scope == "channel":
+        parts.append(normalize_memory_text(item.channel))
+    if item.scope == "project":
+        parts.append(normalize_memory_text(item.project_id))
+    return "|".join(parts)
+
+
+def _memory_rank(item: UserMemoryItem) -> tuple[int, float, str]:
+    return (int(item.importance), float(item.confidence), str(item.updated_at))
 
 
 def is_sensitive_memory_text(text: str) -> bool:

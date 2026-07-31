@@ -12,16 +12,22 @@ from pyclaw.core.session import Session
 from pyclaw.core.system_prompt.manager import SystemPromptManager
 from pyclaw.core.system_prompt.models import LayerContext
 from pyclaw.core.user_memory import (
+    MemoryConsolidator,
     MemoryExtractor,
+    MemoryFeedbackLoop,
     MemoryUpsert,
+    MemoryUseTelemetry,
     UserMemoryItem,
     UserMemoryStore,
     should_skip_memory_extraction,
 )
 from pyclaw.core.user_memory_backends import Mem0UserMemoryBackend
 from pyclaw.tools.user_memory import (
+    AuditUserMemoryTool,
+    ConsolidateUserMemoryTool,
     DeleteUserMemoryTool,
     ListUserMemoriesTool,
+    RecordUserMemoryFeedbackTool,
     SaveUserMemoryTool,
     UpdateUserMemoryTool,
 )
@@ -673,3 +679,289 @@ async def test_agent_schedules_user_memory_extraction_after_turn(tmp_path, monke
     assert len(memories) == 1
     assert memories[0].predicate == "prefers_response_style"
     assert "deep design" in memories[0].value
+
+
+@pytest.mark.asyncio
+async def test_memory_usage_telemetry_records_injected_profile_items(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    saved = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_language",
+        value="Chinese",
+        importance=5,
+    ))
+
+    profile, project, profile_items, project_items = await store.render_profile_with_items(
+        user_id="u1",
+        project_id="repo-a",
+    )
+    telemetry = MemoryUseTelemetry(store)
+    events = await telemetry.record_injected(
+        profile_items + project_items,
+        session_id="s1",
+        user_id="u1",
+        role="main",
+        surface="prompt",
+    )
+
+    assert saved.id in profile
+    assert project == ""
+    assert [event.memory_id for event in events] == [saved.id]
+    counts = await telemetry.usage_counts([saved.id])
+    assert counts[saved.id]["injected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_feedback_loop_rejects_after_repeated_harmful_feedback(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    saved = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_language",
+        value="English",
+        confidence=0.6,
+        importance=3,
+    ))
+
+    feedback_loop = MemoryFeedbackLoop(store)
+    first = await feedback_loop.mark_harmful(saved.id, reason="user corrected language", user_id="u1")
+    second = await feedback_loop.mark_harmful(saved.id, reason="same correction repeated", user_id="u1")
+
+    assert first is not None
+    assert second is not None
+    assert second.status == "rejected"
+    assert second.confidence < saved.confidence
+    counts = await store.usage_counts([saved.id])
+    assert counts[saved.id]["harmful"] == 2
+
+
+@pytest.mark.asyncio
+async def test_memory_consolidator_supersedes_weaker_conflict_and_reports_close_conflict(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    weak = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="note",
+        subject="user",
+        predicate="prefers_editor",
+        value="vim",
+        confidence=0.4,
+        importance=2,
+    ))
+    strong = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_editor",
+        value="vscode",
+        confidence=0.95,
+        importance=5,
+    ))
+    report = await MemoryConsolidator(store).consolidate(user_id="u1")
+
+    assert weak.id in report.superseded
+    assert (await store.get(weak.id)).status == "superseded"
+    assert (await store.get(strong.id)).status == "active"
+
+    await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="workflow",
+        subject="pyclaw",
+        predicate="test_policy",
+        value="run targeted tests only",
+        confidence=0.75,
+        importance=4,
+    ))
+    await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="constraint",
+        subject="pyclaw",
+        predicate="test_policy",
+        value="run full suite before final",
+        confidence=0.80,
+        importance=4,
+    ))
+    dry = await MemoryConsolidator(store).consolidate(user_id="u1", dry_run=True)
+    assert any("test_policy" in conflict.group_key for conflict in dry.conflicts)
+
+
+@pytest.mark.asyncio
+async def test_user_memory_audit_consolidate_and_feedback_tools(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    save = SaveUserMemoryTool(store)
+    audit = AuditUserMemoryTool(store)
+    feedback = RecordUserMemoryFeedbackTool(store)
+    consolidate = ConsolidateUserMemoryTool(store)
+
+    saved = await save.execute(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_detail_level",
+        value="concise",
+        confidence=0.7,
+        importance=3,
+    )
+    memory_id = saved.structured["memory"]["id"]
+    fb = await feedback.execute(id=memory_id, outcome="helpful", user_id="u1", reason="matched style")
+    audited = await audit.execute(user_id="u1")
+    preview = await consolidate.execute(user_id="u1", dry_run=True)
+
+    assert fb.success
+    assert audited.success
+    assert memory_id in audited.content
+    assert audited.structured["usage_counts"][memory_id]["helpful"] == 1
+    assert preview.success
+    assert preview.structured["report"]["dry_run"] is True
+
+
+@pytest.mark.asyncio
+async def test_user_memory_update_tool_can_lower_confidence_and_importance(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    saved = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_detail_level",
+        value="verbose",
+        confidence=0.9,
+        importance=5,
+    ))
+    update = UpdateUserMemoryTool(store)
+
+    result = await update.execute(
+        id=saved.id,
+        confidence=0.25,
+        importance=1,
+        status="rejected",
+    )
+
+    assert result.success
+    changed = await store.get(saved.id)
+    assert changed is not None
+    assert changed.confidence == 0.25
+    assert changed.importance == 1
+    assert changed.status == "rejected"
+    audit_events = await store.list_audit_events(user_id="u1", memory_id=saved.id, operation="update")
+    assert audit_events
+
+
+@pytest.mark.asyncio
+async def test_agent_dynamic_prompt_records_memory_injection_telemetry(tmp_path):
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    saved = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_language",
+        value="Chinese",
+        importance=5,
+    ))
+    agent = Agent(AsyncMock(), MagicMock(), MagicMock(), work_dir=str(tmp_path), memory=None, user_memory=store)
+    session = Session(session_id="s1", user_id="u1", channel="feishu", messages=[], metadata={})
+
+    prompt = await agent._get_dynamic_system_prompt(session)
+
+    assert "prefers_language" in prompt
+    counts = await store.usage_counts([saved.id])
+    assert counts[saved.id]["injected"] == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_auto_consolidates_user_memory_after_new_memory_is_saved(tmp_path, monkeypatch):
+    monkeypatch.setattr("pyclaw.core.agent.SemanticMemory.is_available", lambda: False)
+    store = UserMemoryStore(tmp_path / "user_memory.db")
+    await store.init_db()
+    weak = await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="note",
+        subject="user",
+        predicate="prefers_editor",
+        value="vim",
+        confidence=0.4,
+        importance=2,
+    ))
+    await store.upsert(MemoryUpsert(
+        user_id="u1",
+        scope="global",
+        kind="preference",
+        subject="user",
+        predicate="prefers_editor",
+        value="vscode",
+        confidence=0.95,
+        importance=5,
+    ))
+    model = AsyncMock()
+    model.chat.return_value = json.dumps({
+        "candidates": [
+            {
+                "action": "upsert",
+                "scope": "global",
+                "kind": "preference",
+                "subject": "user",
+                "predicate": "prefers_language",
+                "value": "Chinese",
+                "confidence": 0.9,
+                "importance": 5,
+            }
+        ]
+    })
+    agent = Agent(
+        model,
+        MagicMock(),
+        MagicMock(),
+        work_dir=str(tmp_path),
+        memory=None,
+        user_memory=store,
+        user_memory_consolidation_interval_hours=0.1,
+    )
+    session = Session(session_id="s1", user_id="u1", channel="feishu", messages=[], metadata={})
+    user_message = Message(
+        id="m1",
+        channel="feishu",
+        channel_user_id="open1",
+        user_id="u1",
+        session_id="s1",
+        type=MessageType.TEXT,
+        role=MessageRole.USER,
+        content="以后用中文回答我",
+    )
+    assistant_message = Message(
+        id="m2",
+        channel="feishu",
+        channel_user_id="open1",
+        user_id="u1",
+        session_id="s1",
+        type=MessageType.TEXT,
+        role=MessageRole.ASSISTANT,
+        content="好的，我会记住。",
+    )
+
+    await agent._extract_user_memory_after_turn(
+        session=session,
+        user_message=user_message,
+        assistant_message=assistant_message,
+    )
+
+    assert (await store.get(weak.id)).status == "superseded"
+    assert any(item.predicate == "prefers_language" for item in await store.list_memories(user_id="u1"))
+    audit_events = await store.list_audit_events(user_id="u1", operation="consolidate")
+    assert audit_events
