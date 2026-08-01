@@ -44,6 +44,9 @@ logs/
 # Keep local test suites out of the shared repository.
 tests/
 
+# Local browser automation snapshots/state.
+.playwright-cli/
+
 # Environment variables
 .env
 .env.local
