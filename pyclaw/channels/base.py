@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import asyncio
 from collections import OrderedDict
 import hashlib
 import re
@@ -67,7 +68,29 @@ class BaseChannel(ABC):
     async def _handle_message(self, message: Message) -> None:
         """处理收到的消息"""
         if self._message_handler:
-            await self._message_handler(message)
+            result = self._message_handler(message)
+            if result is not None and hasattr(result, "__await__"):
+                await result
+
+    def _dispatch_message(self, message: Message) -> Optional[asyncio.Task[Any]]:
+        """Schedule message handling without blocking the channel receive loop."""
+        if not self._message_handler:
+            return None
+        result = self._message_handler(message)
+        if result is None or not hasattr(result, "__await__"):
+            return None
+        task = asyncio.create_task(result)
+
+        def _log_failure(done_task: asyncio.Task[Any]) -> None:
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                print(f"❌ Channel message handler failed: {type(exc).__name__}: {exc}")
+
+        task.add_done_callback(_log_failure)
+        return task
 
     def _remember_source_message_id(
         self,

@@ -167,6 +167,8 @@ class ToolRegistry:
                 error_code="timeout",
                 retryable=True,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return ToolResult(
                 success=False,

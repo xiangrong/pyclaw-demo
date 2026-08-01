@@ -9,7 +9,7 @@ import shlex
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Any
+from typing import TYPE_CHECKING, Optional, Any
 
 from pyclaw.core.message import Message, MessageRole, MessageType
 from pyclaw.core.session import Session, SessionManager
@@ -40,6 +40,9 @@ from pyclaw.core.completion_contract import (
 )
 from pyclaw.tools.terminal_safety import is_read_only_terminal_command, primary_terminal_action
 from pyclaw.tools.skill_activation import _available_skills_dirs, _discover_markdown_skills, resolve_markdown_skill
+
+if TYPE_CHECKING:
+    from pyclaw.core.events import AgentEventRuntime
 
 
 class Agent:
@@ -173,6 +176,7 @@ class Agent:
             skill_evidence=SkillEvidenceService(self.skill_contexts),
             skill_workspace=self.skill_workspace,
         )
+        self.event_runtime: AgentEventRuntime | None = None
         self._ensure_default_terminal_artifact_paths()
         from pyclaw.core.subagent import SubAgentRuntime
 
@@ -187,6 +191,17 @@ class Agent:
             user_memory=self.user_memory,
             memory_project_id=self._memory_project_id(),
         )
+
+    def set_event_runtime(self, runtime: AgentEventRuntime | None) -> None:
+        """Register an external event runtime for safe-boundary queue flushing."""
+        self.event_runtime = runtime
+
+    async def _flush_pending_external_events(self, session: Session, *, boundary: str) -> int:
+        """Flush queued user events into history when the controller reaches a safe boundary."""
+        runtime = self.event_runtime
+        if runtime is None:
+            return 0
+        return await runtime.flush_pending_events(session, boundary=boundary)
 
     def _ensure_default_terminal_artifact_paths(self) -> None:
         """Expose bounded local artifact roots to terminal commands.
@@ -713,6 +728,8 @@ class Agent:
 
         # 添加用户消息到会话
         await self.sessions.save_message(session, message)
+        if self.event_runtime is not None:
+            self.event_runtime.record_event_message(message)
         self._touch_activity("user_message_saved", session)
 
         # 执行 Agent 循环
@@ -1476,6 +1493,14 @@ class Agent:
                     )
                     await self.sessions.save_message(session, tool_msg)
                     self._touch_activity(f"tool_observation_saved:{tr['name']}", session)
+
+                flushed_external_events = await self._flush_pending_external_events(
+                    session,
+                    boundary="tool_result",
+                )
+                if flushed_external_events:
+                    self._touch_activity(f"queued_events_flushed:{flushed_external_events}", session)
+                    continue
 
                 # 更新连续失败计数
                 if any_failure:

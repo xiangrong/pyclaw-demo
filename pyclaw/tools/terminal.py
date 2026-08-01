@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shlex
+import signal
 
 from pydantic import BaseModel, Field
 
@@ -159,6 +160,7 @@ class TerminalTool(BaseTool):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                start_new_session=True,
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -202,16 +204,8 @@ class TerminalTool(BaseTool):
             )
 
         except asyncio.TimeoutError:
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.terminate()
-                    await asyncio.wait_for(proc.wait(), timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except Exception:
-                        pass
+            if proc is not None:
+                await self._terminate_process(proc)
             return ToolResult(
                 success=False,
                 content=f"Command: {command}\nCommand timed out after {timeout} seconds",
@@ -221,6 +215,10 @@ class TerminalTool(BaseTool):
                 retryable=level == 1,
                 requires_model_repair=level != 1,
             )
+        except asyncio.CancelledError:
+            if proc is not None:
+                await self._terminate_process(proc)
+            raise
         except Exception as e:
             return ToolResult(
                 success=False,
@@ -230,6 +228,26 @@ class TerminalTool(BaseTool):
                 error_code="execution_error",
                 requires_model_repair=True,
             )
+
+    async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:
+        """Terminate a subprocess tree spawned by this tool, escalating to kill if needed."""
+        if proc.returncode is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=2)
+        except Exception:
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
 
     def _truncate_output(self, output: str, max_chars: int = 8000) -> str:
         """Bound terminal output while preserving completion evidence.

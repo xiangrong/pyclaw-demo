@@ -267,7 +267,9 @@ class WechatChannel(BaseChannel):
             metadata={"context_token": context_token, "source_message_id": msg_id}
         )
 
-        await self._handle_message(msg)
+        task = self._dispatch_message(msg)
+        if task is not None:
+            await asyncio.sleep(0)
 
     async def send_message(self, message: Message) -> None:
         """发送消息到微信 (基于 iLink 官方回复规范)"""

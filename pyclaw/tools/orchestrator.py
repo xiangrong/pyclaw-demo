@@ -92,6 +92,8 @@ class ToolCallOrchestrator:
                     error_code="timeout",
                     retryable=True,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # defensive boundary: registry should not crash the agent loop
                 result = ToolResult(
                     success=False,

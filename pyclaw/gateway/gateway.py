@@ -8,6 +8,7 @@ from typing import Any
 
 from pyclaw.channels.base import BaseChannel
 from pyclaw.core.agent import Agent
+from pyclaw.core.events import AgentEventRuntime
 from pyclaw.core.message import Message
 from pyclaw.core.public_sanitize import sanitize_user_facing_content
 from pyclaw.cron.scheduler import tick as cron_tick
@@ -19,6 +20,7 @@ class Gateway:
 
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
+        self.events = AgentEventRuntime(agent)
         self.channels: dict[str, BaseChannel] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._cron_ticker_thread: threading.Thread | None = None
@@ -60,6 +62,24 @@ class Gateway:
         for task in self._tasks:
             task.cancel()
 
+    async def _send_response(self, response: Message) -> None:
+        """Send a sanitized response and any pending files through its source channel."""
+        response.content = sanitize_user_facing_content(response.content)
+        await self.channels[response.channel].send_message(response)
+
+        pending_files = response.metadata.get("pending_files", [])
+        for file_info in pending_files:
+            file_path = file_info.get("file_path")
+            description = file_info.get("description")
+            if file_path and os.path.exists(file_path):
+                print(f"📤 [Gateway] Sending file: {file_path}")
+                await self.channels[response.channel].send_file(
+                    channel_user_id=response.channel_user_id,
+                    file_path=file_path,
+                    description=description,
+                    metadata=response.metadata,
+                )
+
     async def _on_message(self, message: Message) -> None:
         """处理收到的消息"""
         source_message_id = message.metadata.get("source_message_id") if message.metadata else None
@@ -76,26 +96,12 @@ class Gateway:
                     "thread_id": None,
                 }
 
-            # 交给 Agent 处理
-            response = await self.agent.process_message(message)
-            response.content = sanitize_user_facing_content(response.content)
-
-            # 1. 首先通过原通道发送回复文本
-            await self.channels[message.channel].send_message(response)
-            
-            # 2. 检查是否有待发送的文件
-            pending_files = response.metadata.get("pending_files", [])
-            for file_info in pending_files:
-                file_path = file_info.get("file_path")
-                description = file_info.get("description")
-                if file_path and os.path.exists(file_path):
-                    print(f"📤 [Gateway] Sending file: {file_path}")
-                    await self.channels[message.channel].send_file(
-                        channel_user_id=message.channel_user_id,
-                        file_path=file_path,
-                        description=description,
-                        metadata=response.metadata # 传递 metadata 以便微信获取 context_token
-                    )
+            # 交给事件运行时处理。运行时负责同一会话内的 queued / cancellation / parallel 调度。
+            response = await self.events.process_message(
+                message,
+                response_callback=self._send_response,
+            )
+            await self._send_response(response)
 
             resp_preview = response.content[:50]
             print(f"📤 Replied: {resp_preview}...")
