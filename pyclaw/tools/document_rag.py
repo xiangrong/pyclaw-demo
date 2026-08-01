@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_module
+import json
 import os
 import re
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -20,10 +23,20 @@ from pyclaw.tools.web_extract import unsafe_url_reason
 
 MAX_INGEST_CHARS = 2_000_000
 MAX_SEARCH_SNIPPET_CHARS = 900
+LARK_DOCUMENT_HOST_SUFFIXES = ("larkoffice.com", "feishu.cn", "feishu.net", "doubao.com")
+LARK_DOCUMENT_PATH_MARKERS = ("/docx/", "/docs/", "/wiki/")
+VOLCENGINE_DOC_HOST_SUFFIXES = ("volcengine.com",)
+VOLCENGINE_DOC_PATH_RE = re.compile(r"^/docs/\d+/\d+/?$", flags=re.IGNORECASE)
 
 
 class IngestDocumentArgs(BaseModel):
-    source: str = Field(..., description="Local file path inside the workspace/allowed paths, or a public http(s) URL to ingest.")
+    source: str = Field(
+        ...,
+        description=(
+            "Local file path inside the workspace/allowed paths, a safe public http(s) URL, "
+            "or an authenticated Feishu/Lark document URL to ingest."
+        ),
+    )
     title: str = Field(default="", description="Optional human-readable document title. If omitted, PyClaw infers one.")
     collection: str = Field(default=DEFAULT_COLLECTION, description="Knowledge collection/namespace. Use default unless the user asks for separation.")
     replace: bool = Field(default=True, description="Replace previously learned chunks from the same source in this collection.")
@@ -43,7 +56,8 @@ class IngestDocumentTool(BaseTool):
     description = (
         "Learn/index a company or technical document into PyClaw's document RAG knowledge base. "
         "Use when the user asks PyClaw to study/learn/remember a document for later Q&A. "
-        "Supports local text/Markdown/HTML/JSON/code files, .docx, best-effort .pdf if a PDF reader is installed, and safe public URLs."
+        "Supports local text/Markdown/HTML/JSON/code files, .docx, best-effort .pdf if a PDF reader is installed, "
+        "safe public URLs, and Feishu/Lark/doubao cloud document URLs via authenticated `lark-cli docs +fetch`."
     )
     args_schema = IngestDocumentArgs
 
@@ -129,6 +143,19 @@ class IngestDocumentTool(BaseTool):
             unsafe_reason = unsafe_url_reason(source)
             if unsafe_reason:
                 raise ValueError(f"Unsafe or unsupported URL '{source}': {unsafe_reason}")
+
+            if is_lark_document_url(source):
+                content, title = await _extract_lark_document(source)
+                if not content:
+                    raise ValueError(f"Could not extract readable content from Feishu/Lark document: {source}")
+                return {
+                    "source": source,
+                    "source_type": "lark_doc",
+                    "content": _truncate_for_ingest(content),
+                    "title": title,
+                    "content_type": "lark_doc",
+                }
+
             content, title = await _extract_public_url(source)
             if not content:
                 raise ValueError(f"Could not extract readable content from URL: {source}")
@@ -261,6 +288,12 @@ async def _extract_public_url(url: str) -> tuple[str, str]:
         downloaded = trafilatura.fetch_url(url)
         if not downloaded:
             return "", ""
+
+        if is_volcengine_doc_url(url):
+            content, title = _extract_volcengine_doccenter_html(downloaded, url)
+            if content.strip():
+                return content, title
+
         content = trafilatura.extract(
             downloaded,
             include_tables=True,
@@ -272,6 +305,262 @@ async def _extract_public_url(url: str) -> tuple[str, str]:
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _fetch)
+
+
+def is_volcengine_doc_url(url: str) -> bool:
+    """Return True for Volcengine document-center pages with SSR router payloads."""
+
+    parsed = urlparse(str(url).strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not any(host == suffix or host.endswith(f".{suffix}") for suffix in VOLCENGINE_DOC_HOST_SUFFIXES):
+        return False
+    return bool(VOLCENGINE_DOC_PATH_RE.match(parsed.path or ""))
+
+
+def _extract_volcengine_doccenter_html(html: str, url: str) -> tuple[str, str]:
+    """Extract clean markdown from Volcengine doc-center HTML router data."""
+
+    payload = _extract_volcengine_router_payload(html)
+    if payload is None:
+        return "", _title_from_html(html) or _title_from_url(url)
+
+    page = _find_volcengine_page_payload(payload)
+    if not page:
+        return "", _title_from_html(html) or _title_from_url(url)
+
+    cur_doc = page.get("curDoc")
+    if not isinstance(cur_doc, dict):
+        return "", _title_from_html(html) or _title_from_url(url)
+
+    title = str(cur_doc.get("Title") or "").strip()
+    content = _extract_volcengine_cur_doc_content(cur_doc)
+    content = _clean_volcengine_markdown(content)
+    if not content.strip():
+        return "", title or _title_from_html(html) or _title_from_url(url)
+    return content, title or _title_from_markdown_or_url(content, url)
+
+
+def _extract_volcengine_router_payload(html: str) -> dict[str, Any] | None:
+    marker = "window._ROUTER_DATA"
+    marker_index = str(html or "").find(marker)
+    if marker_index < 0:
+        return None
+    object_start = html.find("{", marker_index)
+    script_end = html.find("</script>", object_start)
+    if object_start < 0 or script_end < 0:
+        return None
+    raw_payload = html[object_start:script_end].strip().rstrip(";").strip()
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _find_volcengine_page_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    loader_data = payload.get("loaderData")
+    if not isinstance(loader_data, dict):
+        return None
+
+    exact = loader_data.get("docs/(libid)/(docid$)/page")
+    if isinstance(exact, dict) and isinstance(exact.get("curDoc"), dict):
+        return exact
+
+    for value in loader_data.values():
+        if isinstance(value, dict) and isinstance(value.get("curDoc"), dict):
+            return value
+    return None
+
+
+def _extract_volcengine_cur_doc_content(cur_doc: dict[str, Any]) -> str:
+    md_content = cur_doc.get("MDContent")
+    if isinstance(md_content, str) and md_content.strip():
+        return md_content
+
+    content = cur_doc.get("Content")
+    if not isinstance(content, str) or not content.strip():
+        return ""
+
+    quill_text = _extract_volcengine_quill_text(content)
+    if quill_text.strip():
+        return quill_text
+    return content
+
+
+def _extract_volcengine_quill_text(content: str) -> str:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return ""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ""
+
+    parts: list[str] = []
+    for block in data.values():
+        if not isinstance(block, dict):
+            continue
+        ops = block.get("ops")
+        if not isinstance(ops, list):
+            continue
+        for op in ops:
+            if isinstance(op, dict) and isinstance(op.get("insert"), str):
+                parts.append(op["insert"])
+    return "".join(parts).strip()
+
+
+def _clean_volcengine_markdown(content: str) -> str:
+    text = html_module.unescape(str(content or ""))
+    text = re.sub(r'<span\s+id="[^"]*"\s*>\s*</span>\s*', "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip()
+
+
+def is_lark_document_url(url: str) -> bool:
+    """Return True when a URL should be fetched with authenticated lark-cli docs APIs."""
+
+    parsed = urlparse(str(url).strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    path = parsed.path.lower()
+    if not any(host == suffix or host.endswith(f".{suffix}") for suffix in LARK_DOCUMENT_HOST_SUFFIXES):
+        return False
+    return any(marker in path for marker in LARK_DOCUMENT_PATH_MARKERS)
+
+
+async def _extract_lark_document(url: str, timeout: int = 60) -> tuple[str, str]:
+    """Fetch a private Feishu/Lark cloud document as markdown using authenticated lark-cli."""
+
+    if not shutil.which("lark-cli"):
+        raise ImportError(
+            "Feishu/Lark document URL ingest requires authenticated `lark-cli`. "
+            "Please install lark-cli, run `lark-cli auth login`, and ensure your account can read the document."
+        )
+
+    cmd = [
+        "lark-cli",
+        "docs",
+        "+fetch",
+        "--api-version",
+        "v2",
+        "--doc",
+        url,
+        "--doc-format",
+        "markdown",
+        "--format",
+        "json",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        await proc.communicate()
+        raise ValueError(f"Timed out fetching Feishu/Lark document after {timeout} seconds: {url}") from exc
+
+    out = stdout.decode("utf-8", errors="replace").strip()
+    err = stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        detail = err or out
+        raise ValueError(
+            "Failed to fetch Feishu/Lark document via `lark-cli docs +fetch`. "
+            f"exit_code={proc.returncode}; detail={_truncate_cli_detail(detail)}"
+        )
+    if not out:
+        raise ValueError(
+            "`lark-cli docs +fetch` returned empty document content. "
+            "Check lark-cli login state, document permissions, and the document URL."
+        )
+
+    content, title = _parse_lark_cli_document_output(out, url)
+    content = _strip_lark_cli_noise(content)
+    if not content.strip():
+        raise ValueError(
+            "Feishu/Lark document fetch succeeded but no readable content was found. "
+            "Check whether the document is empty or contains unsupported embedded resources only."
+        )
+    return content, title or _title_from_markdown_or_url(content, url)
+
+
+def _parse_lark_cli_document_output(output: str, url: str) -> tuple[str, str]:
+    """Extract document content/title from lark-cli JSON output, falling back to raw stdout."""
+
+    text = str(output or "").strip()
+    if not text:
+        return "", _title_from_url(url)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text, _title_from_markdown_or_url(text, url)
+
+    content = _find_first_string(
+        payload,
+        (
+            ("data", "document", "content"),
+            ("document", "content"),
+            ("data", "content"),
+            ("content",),
+            ("markdown",),
+            ("text",),
+        ),
+    )
+    title = _find_first_string(
+        payload,
+        (
+            ("data", "document", "title"),
+            ("data", "document", "name"),
+            ("document", "title"),
+            ("document", "name"),
+            ("data", "title"),
+            ("title",),
+        ),
+    )
+    if content:
+        return content, title or _title_from_markdown_or_url(content, url)
+    return text, title or _title_from_url(url)
+
+
+def _find_first_string(payload: Any, paths: tuple[tuple[str, ...], ...]) -> str:
+    for path in paths:
+        current = payload
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if isinstance(current, str) and current.strip():
+            return current.strip()
+    return ""
+
+
+def _strip_lark_cli_noise(content: str) -> str:
+    """Normalize fetched Lark document content without altering meaningful markdown escapes."""
+
+    return str(content or "").strip()
+
+
+def _title_from_markdown_or_url(content: str, url: str) -> str:
+    for line in str(content or "").splitlines()[:20]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title[:160]
+    return _title_from_url(url)
+
+
+def _truncate_cli_detail(detail: str, max_chars: int = 1000) -> str:
+    text = re.sub(r"\s+", " ", str(detail or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + f"... [truncated to {max_chars} characters]"
 
 
 async def _read_local_document(path: Path) -> str:
