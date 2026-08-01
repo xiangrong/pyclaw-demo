@@ -41,6 +41,9 @@ Thumbs.db
 *.log
 logs/
 
+# Keep local test suites out of the shared repository.
+tests/
+
 # Environment variables
 .env
 .env.local

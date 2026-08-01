@@ -173,7 +173,7 @@ def _mentions_model(normalized: str) -> bool:
 def _extract_targets(raw_task: str) -> tuple[str, ...]:
     """Extract explicit user-provided batch targets from the task text.
 
-    Pod IDs are the most common operational targets, but the controller should
+    Numeric target IDs are the most common operational targets, but the controller should
     not make per-item delivery a pod-only behavior.  Many batch requests are
     written as a short instruction followed by one item per line, for example
     service names, accounts, URLs, device serials, or order IDs.  Capture those
@@ -181,8 +181,8 @@ def _extract_targets(raw_task: str) -> tuple[str, ...]:
     results instead of accepting aggregate success/failure summaries.
     """
     targets: list[str] = []
-    pod_ids = NUMERIC_TARGET_PATTERN.findall(raw_task or "")
-    targets.extend(pod_ids)
+    target_ids = NUMERIC_TARGET_PATTERN.findall(raw_task or "")
+    targets.extend(target_ids)
 
     for raw_line in (raw_task or "").splitlines():
         for candidate in _target_candidates_from_line(raw_line):
@@ -248,9 +248,9 @@ def _mentions_image_update(normalized: str) -> bool:
     # ``submitted_then_verify`` contract.  A generic sentence such as
     # "批量更新这些实例镜像" may be backed by a batch script that emits normal
     # success/fail stats, and should not be forced through the opencli
-    # update-image renderer unless the user/log contains a concrete image ref
+    # update-image renderer unless the user/log contains a concrete image marker
     # or update-image command marker.
-    has_strong_image_ref = bool(
+    has_strong_image_marker = bool(
         "update-image" in normalized
         or "set image" in normalized
         or "--image" in normalized
@@ -260,7 +260,7 @@ def _mentions_image_update(normalized: str) -> bool:
         or re.search(r"\b[\w.-]+/[\w./-]+:[\w][\w.-]*\b", normalized)
     )
     has_action = any(marker in normalized for marker in ("升级", "更新", "替换", "update", "upgrade", "set image"))
-    return has_strong_image_ref and has_action
+    return has_strong_image_marker and has_action
 
 
 def _mentions_batch(normalized: str) -> bool:

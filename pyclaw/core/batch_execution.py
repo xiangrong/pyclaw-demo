@@ -326,7 +326,8 @@ class BatchExecutionService:
             "Do not final-answer, do not ask the user for another confirmation, and do not expose this guardrail. "
             "Materialize the user-provided list with a file-writing tool under ~/.pyclaw/ when available, or retry the same safe "
             "runtime-scratch write/start once with approved=True. Keep all scratch paths under ~/.pyclaw/, avoid kill/rm/install/git/destructive "
-            "commands, then start the durable batch once and poll PID/log/result evidence. Do not mention this notice to the user."
+            "commands, prefer `bash ~/.pyclaw/<script>.sh` over `chmod +x && ./script.sh` for scratch scripts, then start the "
+            "durable batch once and poll PID/log/result evidence. Do not mention this notice to the user."
         )
 
     def timeout_repair_notice(self) -> str:
@@ -630,7 +631,7 @@ class BatchExecutionService:
         keys = {str(key or "").strip() for key in parsed.keys()}
         if task_targets and task_targets.issubset(keys):
             return True
-        if any(self._looks_like_pod_id(key) for key in keys):
+        if any(self._looks_like_target_id(key) for key in keys):
             return True
         for value in parsed.values():
             if isinstance(value, dict):
@@ -847,9 +848,9 @@ class BatchExecutionService:
             return ""
 
         lines = [
-            "## ⚠️ 批量任务已完成，但结果未满足完成契约",
+            "## ⚠️ 批量任务未完成：结果未满足完成契约",
             "",
-            "已观察到任务完成信号；以下是当前可解析结果。该报告不表示全部成功。",
+            "已观察到脚本结束或结果文件信号，但核心结果尚未满足用户请求；以下仅为当前可解析结果。",
         ]
         if latest_task.strip():
             lines.append(f"- 用户任务：{latest_task.strip().splitlines()[0]}")
@@ -871,7 +872,7 @@ class BatchExecutionService:
         if evidence.stats_line:
             lines.append(f"- 汇总：{evidence.stats_line}")
         if evidence.completion_line and evidence.completion_line != evidence.stats_line:
-            lines.append(f"- 完成信号：{evidence.completion_line}")
+            lines.append(f"- 脚本结束信号：{evidence.completion_line}")
         if evidence.result_path:
             lines.append(f"- 结果文件：{evidence.result_path}")
         if evidence.log_path:
@@ -928,6 +929,8 @@ class BatchExecutionService:
         if decision.coverage_missing_items:
             return True
         if decision.retryable_failed_items:
+            return True
+        if decision.missing_facets and self._has_terminal_completion_evidence(evidence):
             return True
         if evidence.is_in_progress:
             return False
@@ -1067,6 +1070,29 @@ class BatchExecutionService:
             if detail_paths:
                 paths = ", ".join(dict.fromkeys(detail_paths))
                 parts.append(f"Relevant observed artifact(s) to inspect before rerun: {paths}.")
+        repair_facets = set(decision.missing_facets)
+        repair_facets.update(decision.retryable_failed_items.keys())
+        repair_facets.update(decision.coverage_missing_items.keys())
+        if FACET_POD_MODEL in repair_facets:
+            parts.append(
+                "Pod model repair workflow: do not treat inventory metadata or other non-Android values as "
+                "Android model evidence. For each failed/missing target, run "
+                "`opencli vephone pod-terminal <target> -f json`, extract the `WSS URL`, then run "
+                "`RUN_CMD='getprop ro.product.model' python3 ~/.opencli-tmp/wss_run.py`. Parse only the text between "
+                "`=== OUTPUT START ===` and `=== OUTPUT END ===`; skip `__BEGIN__`, `__DONE__`, command echoes, and shell prompts."
+            )
+        if FACET_POD_EGRESS in repair_facets:
+            parts.append(
+                "Pod egress repair workflow: for each failed/missing target, reuse its WSS URL from "
+                "`opencli vephone pod-terminal <target> -f json`, then run "
+                "`RUN_CMD='runcon u:r:su:s0 /system/bin/sh -c \"curl -s --max-time 20 ipinfo.io\"' python3 ~/.opencli-tmp/wss_run.py`. "
+                "Parse the OUTPUT START/END block as JSON and capture ip/org/city."
+            )
+        if FACET_POD_MODEL in repair_facets or FACET_POD_EGRESS in repair_facets:
+            parts.append(
+                "Final merged artifact/report must include one row per requested target with columns for target, "
+                "model, ip, org, city, and status."
+            )
         if contract.requires_file_batch:
             parts.append(
                 "For multi-item operational work, preserve the file-driven workflow: write the target list to a stable ~/.pyclaw input file, "
@@ -1139,9 +1165,13 @@ class BatchExecutionService:
         contract: OperationalTaskContract,
         msg: Message,
     ) -> tuple[str, ...]:
+        content = str(getattr(msg, "content", "") or "")
+        mapping, _paths = self._json_mappings_from_read_files(content)
         evidence = self.evidence_from_messages([msg])
         facets: list[str] = []
         for facet in contract.required_facets:
+            if facet == FACET_POD_MODEL and mapping and not self._mapping_has_model_values(mapping):
+                continue
             facet_evidence = self._facet_evidence_from_batch_evidence(
                 facet,
                 evidence,
@@ -1174,6 +1204,8 @@ class BatchExecutionService:
             facets.append(FACET_POD_EGRESS)
         if self._has_pod_adb_signal(content):
             facets.append(FACET_POD_ADB)
+        if "invalid_model_evidence" in normalized:
+            facets.append(FACET_POD_MODEL)
         if any(
             marker in normalized
             for marker in (
@@ -1235,7 +1267,7 @@ class BatchExecutionService:
             if not evidence.model_items and not evidence.model_distribution and "Pod机型批量查询完成报告" not in evidence.structured_report:
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
-            retryable = self._retryable_failed_items_from_item_results(evidence.model_items)
+            retryable = self._retryable_failed_model_items_from_item_results(evidence.model_items)
             if evidence.model_items:
                 total = len(evidence.model_items)
                 failed = len(retryable)
@@ -1349,7 +1381,10 @@ class BatchExecutionService:
             if not evidence.item_results and not evidence.result_distribution and not evidence.structured_report and not has_completion_summary:
                 return None
             total, success, failed = self._counts_from_evidence(evidence)
-            retryable = self._retryable_failed_items_from_item_results(evidence.item_results)
+            retryable = self._retryable_failed_items_from_item_results(
+                evidence.item_results,
+                include_plain_failed_markers=False,
+            )
             status = "complete"
             if self._contract_requires_item_detail(contract, facet=facet, total=total) and not self._has_full_item_detail(
                 evidence.item_results,
@@ -1520,7 +1555,7 @@ class BatchExecutionService:
             )
         ):
             return True
-        if self._looks_like_pod_id(target_text):
+        if self._looks_like_target_id(target_text):
             return bool(re.search(rf"(?<!\d){re.escape(target_text)}(?!\d)", row_text))
         return False
 
@@ -1649,18 +1684,55 @@ class BatchExecutionService:
                 return int(match.group(1))
         return 0
 
-    def _retryable_failed_items_from_item_results(self, item_results: Sequence[str]) -> tuple[str, ...]:
+    def _retryable_failed_items_from_item_results(
+        self,
+        item_results: Sequence[str],
+        *,
+        include_plain_failed_markers: bool = True,
+    ) -> tuple[str, ...]:
         failed: list[str] = []
         for item in item_results:
             text = str(item or "").strip()
             if not text:
                 continue
-            left, _, right = text.partition(":")
-            candidate = right or text
+            left, candidate = self._split_item_result_for_retry(text)
             primary = self._primary_result_value(candidate)
-            if self._is_retryable_failed_value(primary) or self._is_retryable_failed_value(candidate):
+            if self._is_retryable_failed_value(
+                primary,
+                include_plain_failed_markers=include_plain_failed_markers,
+            ) or self._is_retryable_failed_value(
+                candidate,
+                include_plain_failed_markers=include_plain_failed_markers,
+            ):
                 failed.append(left.strip() or text)
         return tuple(dict.fromkeys(failed))
+
+    def _retryable_failed_model_items_from_item_results(self, item_results: Sequence[str]) -> tuple[str, ...]:
+        failed: list[str] = []
+        for item in item_results:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            left, candidate = self._split_item_result_for_retry(text)
+            primary = self._primary_result_value(candidate)
+            if (
+                self._is_retryable_failed_value(primary)
+                or self._is_retryable_failed_value(candidate)
+                or self._is_invalid_pod_model_value(primary)
+            ):
+                failed.append(left.strip() or text)
+        return tuple(dict.fromkeys(failed))
+
+    def _split_item_result_for_retry(self, text: str) -> tuple[str, str]:
+        for match in re.finditer(r"[:：]\s*", text or ""):
+            left = text[:match.start()].strip()
+            right = text[match.end():].strip()
+            if not left or not right:
+                continue
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", left) and right.startswith("//"):
+                continue
+            return left, right
+        return "", text
 
     def _primary_result_value(self, value: str) -> str:
         text = str(value or "").strip()
@@ -1668,20 +1740,55 @@ class BatchExecutionService:
             return text
         return text.split("|", 1)[0].strip()
 
-    def _is_retryable_failed_value(self, value: str) -> bool:
+    def _is_retryable_failed_value(self, value: str, *, include_plain_failed_markers: bool = True) -> bool:
         normalized = str(value or "").strip().lower()
         if not normalized:
             return True
         if self._is_shell_sentinel_or_prompt(normalized):
             return True
-        return any(
+        markers = [
+            "failed_to_get_wss", "timeout", "timed out", "connection reset", "connection refused",
+            "temporarily unavailable", "temporary", "empty", "unknown", "not found", "未找到",
+            "未获取", "获取失败", "解析失败", "未知", "网络", "重试",
+        ]
+        if include_plain_failed_markers:
+            markers.extend(("failed", "fail", "parse_failed", "failed_wss_url", "查询失败"))
+        return any(marker in normalized for marker in markers)
+
+    def _is_invalid_pod_model_value(self, value: str) -> bool:
+        """Return True for inventory/package metadata values that are not Android models."""
+        text = str(value or "").strip()
+        normalized = text.lower()
+        if not normalized:
+            return True
+        if any(
             marker in normalized
             for marker in (
-                "failed_to_get_wss", "timeout", "timed out", "connection reset", "connection refused",
-                "temporarily unavailable", "temporary", "empty", "unknown", "not found", "未找到",
-                "未获取", "获取失败", "解析失败", "未知", "网络", "重试",
+                "invalid_model_evidence", "non_android_model_metadata", "non_android_model",
+                "inventory", "metadata", "package", "resource", "tier", "layout",
+                "image", "storage", "quota",
             )
-        )
+        ):
+            return True
+        return bool(re.fullmatch(r"g\d+(?:\.\d+)?c\d+g(?:\S{1,12})?", normalized))
+
+    def _looks_like_inventory_metadata_header(self, header: str) -> bool:
+        """Return True when a CSV header names inventory metadata instead of device model evidence."""
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(header or "").strip().lower()).strip("_")
+        if not normalized:
+            return False
+        if normalized == "spec":
+            return True
+        tokens = {token for token in normalized.split("_") if token}
+        metadata_tokens = {"inventory", "metadata", "package", "resource", "tier", "layout", "image", "storage", "quota"}
+        return bool(tokens & metadata_tokens)
+
+    def _safe_pod_model_report_value(self, value: str) -> str:
+        """Avoid surfacing inventory metadata values in user-visible model reports."""
+        text = str(value or "").strip()
+        if self._is_invalid_pod_model_value(text):
+            return "INVALID_MODEL_EVIDENCE"
+        return text
 
     def _render_image_update_submission(self, messages: Sequence[Message]) -> str:
         text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
@@ -1703,7 +1810,7 @@ class BatchExecutionService:
             ]
             if image:
                 lines.append(f"- 目标镜像：`{image}`")
-            lines.extend(["", "### 📋 Pod提交明细", "| Pod ID | 提交状态 | RequestId |", "|---|---|---|"])
+            lines.extend(["", "### 📋 Pod提交明细", "| 目标 | 提交状态 | RequestId |", "|---|---|---|"])
             for row in batch_rows:
                 request_id = row.get("request_id") or "-"
                 lines.append(
@@ -1726,7 +1833,7 @@ class BatchExecutionService:
         status_code = self._jsonish_field(text, "StatusCode")
         request_id = self._jsonish_field(text, "RequestId")
         status_message = self._jsonish_field(text, "StatusMessage")
-        pod_id = self._first_pod_id(text)
+        target_id = self._first_target_id(text)
         image = self._image_from_update_command(text)
         env = self._field_value_from_opencli_table(text, "环境")
         if status_code and status_code != "0":
@@ -1736,8 +1843,8 @@ class BatchExecutionService:
             heading = "## ✅ Pod镜像升级请求已提交成功"
             status = "提交成功（StatusCode 0）" if status_code == "0" else "提交成功"
         rows = [heading, "", "| 项目 | 内容 |", "|---|---|"]
-        if pod_id:
-            rows.append(f"| Pod ID | `{pod_id}` |")
+        if target_id:
+            rows.append(f"| 目标 | `{target_id}` |")
         if env:
             rows.append(f"| 环境 | {self._escape_markdown_table_cell(env)} |")
         if image:
@@ -1825,7 +1932,7 @@ class BatchExecutionService:
             table_match = table_pattern.match(line)
             if table_match:
                 pod = table_match.group("pod")
-                if not self._looks_like_pod_id(pod):
+                if not self._looks_like_target_id(pod):
                     continue
                 status = table_match.group("status").strip()
                 if status in {"状态", "Pod"}:
@@ -1853,7 +1960,7 @@ class BatchExecutionService:
             return "-"
         return text
 
-    def _first_pod_id(self, text: str) -> str:
+    def _first_target_id(self, text: str) -> str:
         match = re.search(r"\b\d{12,}\b", text or "")
         return match.group(0) if match else ""
 
@@ -1883,10 +1990,10 @@ class BatchExecutionService:
     ) -> dict[str, Any]:
         csv_rows, csv_path = self._csv_rows_from_text(content)
         if csv_rows:
-            pod_detail = self._pod_model_egress_rows_from_csv_rows(csv_rows)
-            if pod_detail:
+            pod_model_egress_rows = self._pod_model_egress_rows_from_csv_rows(csv_rows)
+            if pod_model_egress_rows:
                 return self._pod_model_egress_rows_evidence(
-                    pod_detail,
+                    pod_model_egress_rows,
                     result_path=csv_path or result_path_hint,
                     operator_distribution_hint=operator_distribution_hint,
                     region_distribution_hint=region_distribution_hint,
@@ -1901,10 +2008,10 @@ class BatchExecutionService:
                 region_distribution_hint=region_distribution_hint,
             )
 
-        pod_detail_terminal_rows = self._pod_model_egress_rows_from_terminal_blocks(content)
-        if pod_detail_terminal_rows and self._text_has_completion_evidence(content):
+        pod_model_egress_terminal_rows = self._pod_model_egress_rows_from_terminal_blocks(content)
+        if pod_model_egress_terminal_rows and self._text_has_completion_evidence(content):
             return self._pod_model_egress_rows_evidence(
-                pod_detail_terminal_rows,
+                pod_model_egress_terminal_rows,
                 result_path=result_path_hint,
                 operator_distribution_hint=operator_distribution_hint,
                 region_distribution_hint=region_distribution_hint,
@@ -1926,6 +2033,15 @@ class BatchExecutionService:
         mapping, paths = self._json_mappings_from_read_files(content)
         terminal_pairs = self._model_pairs_from_terminal_rows(content)
         if mapping and self._mapping_looks_like_egress(mapping):
+            if self._mapping_has_model_values(mapping):
+                pod_model_egress_rows = self._pod_model_egress_rows_from_mapping(mapping)
+                if pod_model_egress_rows:
+                    return self._pod_model_egress_rows_evidence(
+                        pod_model_egress_rows,
+                        result_path=paths[-1] if paths else result_path_hint,
+                        operator_distribution_hint=operator_distribution_hint,
+                        region_distribution_hint=region_distribution_hint,
+                    )
             rows = self._egress_rows_from_mapping(mapping)
             if rows:
                 return self._egress_rows_evidence(
@@ -1935,7 +2051,7 @@ class BatchExecutionService:
                     region_distribution_hint=region_distribution_hint,
                 )
 
-        simple_mapping = self._simple_value_mapping(mapping)
+        simple_mapping = self._model_value_mapping(mapping)
         if terminal_pairs:
             simple_mapping.update(terminal_pairs)
         if simple_mapping and (paths or self._text_has_completion_evidence(content)):
@@ -2010,17 +2126,30 @@ class BatchExecutionService:
     def _simple_value_mapping(self, mapping: dict[str, Any]) -> dict[str, str]:
         result: dict[str, str] = {}
         for key, value in mapping.items():
-            if not self._looks_like_pod_id(key):
+            if not self._looks_like_target_id(key):
                 continue
             if isinstance(value, (str, int, float)):
                 result[str(key)] = str(value).strip()
+        return result
+
+    def _model_value_mapping(self, mapping: dict[str, Any]) -> dict[str, str]:
+        result = self._simple_value_mapping(mapping)
+        for key, value in mapping.items():
+            if not self._looks_like_target_id(key) or not isinstance(value, dict):
+                continue
+            model = self._dict_get(value, ("model", "device_model", "ro.product.model", "机型", "型号", "设备型号"))
+            status = self._dict_get(value, ("status", "result", "success", "状态", "结果"))
+            if model:
+                result[str(key)] = model
+            elif status and self._is_retryable_failed_value(status):
+                result[str(key)] = status
         return result
 
     def _generic_value_mapping(self, mapping: dict[str, Any]) -> dict[str, str]:
         result: dict[str, str] = {}
         for key, value in mapping.items():
             item = str(key or "").strip()
-            if not item or self._looks_like_pod_id(item):
+            if not item or self._looks_like_target_id(item):
                 continue
             if isinstance(value, (str, int, float, bool)):
                 value_text = str(value).strip()
@@ -2104,7 +2233,7 @@ class BatchExecutionService:
         for row in rows:
             item = self._row_get(row, (item_header,))
             result = self._row_get(row, (result_header,))
-            if item and result and not self._looks_like_pod_id(item):
+            if item and result and not self._looks_like_target_id(item):
                 items.append({"item": item[:180], "result": result[:260]})
         return items
 
@@ -2112,21 +2241,24 @@ class BatchExecutionService:
         if not rows:
             return []
         headers = list(rows[0].keys())
-        pod_header = self._choose_header(headers, ("Pod ID", "pod_id", "pod", "id", "实例ID", "实例id"))
+        pod_header = self._choose_header(headers, ("目标", "target_id", "pod", "id", "实例ID", "实例id"))
         model_header = self._choose_header(headers, ("机型", "型号", "设备型号", "model", "device_model"))
         ip_header = self._choose_header(headers, ("出口IP", "出口ip", "公网IP", "公网ip", "ip", "public_ip", "egress_ip"))
         if not pod_header or not model_header or not ip_header:
             return []
+        metadata_headers = tuple(header for header in headers if self._looks_like_inventory_metadata_header(header))
 
         parsed: list[dict[str, str]] = []
         for row in rows:
             pod = self._row_get(row, (pod_header,))
             model = self._row_get(row, (model_header,))
             ip = self._row_get(row, (ip_header,))
-            if not self._looks_like_pod_id(pod) or not model:
+            if model_header in metadata_headers:
+                model = ""
+            if not self._looks_like_target_id(pod) or not model:
                 continue
             parsed.append({
-                "Pod ID": pod,
+                "目标": pod,
                 "机型": model,
                 "出口IP": ip,
                 "运营商": self._row_get(row, ("运营商", "operator", "isp", "org", "carrier")),
@@ -2138,7 +2270,7 @@ class BatchExecutionService:
         if not rows:
             return []
         headers = list(rows[0].keys())
-        pod_header = self._choose_header(headers, ("Pod ID", "pod_id", "pod", "id", "实例ID", "实例id"))
+        pod_header = self._choose_header(headers, ("目标", "target_id", "pod", "id", "实例ID", "实例id"))
         adb_header = self._choose_header(
             headers,
             (
@@ -2156,9 +2288,9 @@ class BatchExecutionService:
             adb = self._row_get(row, (adb_header,)) if adb_header else ""
             status = self._row_get(row, (status_header,)) if status_header else ""
             value = adb or status
-            if not self._looks_like_pod_id(pod) or not value:
+            if not self._looks_like_target_id(pod) or not value:
                 continue
-            parsed.append({"Pod ID": pod, "ADB地址": value})
+            parsed.append({"目标": pod, "ADB地址": value})
         return parsed
 
     def _adb_rows_from_terminal_rows(self, content: str) -> list[dict[str, str]]:
@@ -2188,10 +2320,10 @@ class BatchExecutionService:
         )
 
         def append_row(pod: str, adb: str) -> None:
-            pod_id = str(pod or "").strip()
+            target_id = str(pod or "").strip()
             value = str(adb or "").strip()
-            if self._looks_like_pod_id(pod_id) and value:
-                rows.append({"Pod ID": pod_id, "ADB地址": value})
+            if self._looks_like_target_id(target_id) and value:
+                rows.append({"目标": target_id, "ADB地址": value})
 
         for raw in (content or "").splitlines():
             line = raw.strip()
@@ -2227,12 +2359,12 @@ class BatchExecutionService:
                 append_row(current_pod, failed_match.group("failed"))
                 current_pod = ""
 
-        return self._dedupe_rows_by_key(rows, "Pod ID")
+        return self._dedupe_rows_by_key(rows, "目标")
 
     def _adb_rows_evidence(self, rows: Sequence[dict[str, str]], *, result_path: str) -> dict[str, Any]:
         normalized_rows: list[dict[str, str]] = []
         for row in rows:
-            pod = self._row_get(row, ("Pod ID", "pod", "pod_id", "id", "实例ID", "实例id"))
+            pod = self._row_get(row, ("目标", "pod", "target_id", "id", "实例ID", "实例id"))
             adb = self._row_get(
                 row,
                 (
@@ -2240,7 +2372,7 @@ class BatchExecutionService:
                     "adb_addr", "android_debug_bridge", "调试桥", "结果", "状态", "result", "status",
                 ),
             )
-            if not self._looks_like_pod_id(pod):
+            if not self._looks_like_target_id(pod):
                 continue
             normalized_rows.append({"pod": pod, "adb": adb})
         normalized_rows = self._dedupe_rows_by_key(normalized_rows, "pod")
@@ -2261,7 +2393,7 @@ class BatchExecutionService:
         if result_path:
             report_lines.append(f"- 结果文件：{result_path}")
         if normalized_rows:
-            report_lines.extend(["", "### 📋 Pod ADB地址明细", "| Pod ID | ADB 地址 |", "|---|---|"])
+            report_lines.extend(["", "### 📋 Pod ADB地址明细", "| 目标 | ADB 地址 |", "|---|---|"])
             for row in normalized_rows:
                 report_lines.append(
                     "| "
@@ -2273,7 +2405,7 @@ class BatchExecutionService:
             for adb, count in adb_counter.most_common(30):
                 report_lines.append(f"| {self._escape_markdown_table_cell(adb)} | {count} 台 |")
         if failures:
-            report_lines.extend(["", "### ⚠️ 未成功项", "| Pod ID | 结果 |", "|---|---|"])
+            report_lines.extend(["", "### ⚠️ 未成功项", "| 目标 | 结果 |", "|---|---|"])
             for row in failures[:30]:
                 report_lines.append(
                     f"| {self._escape_markdown_table_cell(row['pod'])} | {self._escape_markdown_table_cell(row['adb'])} |"
@@ -2312,7 +2444,7 @@ class BatchExecutionService:
             nonlocal current_pod, current_row
             if current_pod and (current_row.get("机型") or current_row.get("出口IP")):
                 rows.append({
-                    "Pod ID": current_pod,
+                    "目标": current_pod,
                     "机型": current_row.get("机型", "").strip(),
                     "出口IP": current_row.get("出口IP", "").strip(),
                     "运营商": current_row.get("运营商", "").strip(),
@@ -2330,8 +2462,8 @@ class BatchExecutionService:
             result_match = result_pattern.search(raw)
             if result_match and current_pod:
                 rows.append({
-                    "Pod ID": current_pod,
-                    "机型": result_match.group("model").strip(),
+                    "目标": current_pod,
+                    "机型": self._safe_pod_model_report_value(result_match.group("model")),
                     "出口IP": result_match.group("ip").strip(),
                     "运营商": "",
                     "地域": "",
@@ -2344,7 +2476,10 @@ class BatchExecutionService:
             for field, pattern in field_patterns.items():
                 match = pattern.search(raw)
                 if match:
-                    current_row[field] = match.group("value").strip()
+                    value = match.group("value").strip()
+                    if field == "机型" and self._is_invalid_pod_model_value(value):
+                        value = ""
+                    current_row[field] = value
                     break
         flush_current_row()
         return rows
@@ -2368,7 +2503,7 @@ class BatchExecutionService:
         )
         for match in pattern.finditer(content or ""):
             model = match.group("model").strip()
-            if model:
+            if model and not self._is_invalid_pod_model_value(model):
                 pairs[match.group("pod")] = model[:120]
         return pairs
 
@@ -2399,7 +2534,7 @@ class BatchExecutionService:
             operator = parts[1] if len(parts) > 1 else ""
             region = parts[2] if len(parts) > 2 else ""
             rows.append({
-                "Pod ID": match.group("pod"),
+                "目标": match.group("pod"),
                 "出口IP": ip,
                 "运营商": operator,
                 "地域": region,
@@ -2425,7 +2560,7 @@ class BatchExecutionService:
             if not parsed:
                 continue
             item, result = parsed
-            if self._looks_like_pod_id(item):
+            if self._looks_like_target_id(item):
                 # Pod/domain-specific rows keep their existing specialized
                 # reports.  This generic path is for non-pod batch tasks.
                 continue
@@ -2576,14 +2711,22 @@ class BatchExecutionService:
     def _model_mapping_evidence(self, mapping: dict[str, str], *, result_paths: Sequence[str]) -> dict[str, Any]:
         normalized_mapping: dict[str, str] = {}
         for pod, model in mapping.items():
-            pod_id = str(pod).strip()
+            target_id = str(pod).strip()
             model_name = str(model).strip()
-            if self._looks_like_pod_id(pod_id) and model_name:
-                normalized_mapping[pod_id] = model_name
+            if self._looks_like_target_id(target_id) and model_name:
+                normalized_mapping[target_id] = model_name
         total = len(normalized_mapping)
-        failed_items = {pod: value for pod, value in normalized_mapping.items() if self._is_failed_value(value)}
+        failed_items = {
+            pod: value
+            for pod, value in normalized_mapping.items()
+            if self._is_failed_value(value) or self._is_invalid_pod_model_value(value)
+        }
         success = total - len(failed_items)
-        distribution = Counter(value for value in normalized_mapping.values() if not self._is_failed_value(value))
+        distribution = Counter(
+            value
+            for value in normalized_mapping.values()
+            if not self._is_failed_value(value) and not self._is_invalid_pod_model_value(value)
+        )
         model_distribution = tuple(f"{model}: {count} 台" for model, count in distribution.most_common())
         stats_line = f"总数={total} 成功={success} 失败={len(failed_items)}"
         report_lines = [
@@ -2598,26 +2741,32 @@ class BatchExecutionService:
         if unique_paths:
             report_lines.append("- 结果文件：" + "，".join(unique_paths))
         if failed_items:
-            failed_preview = "，".join(f"{pod}: {value}" for pod, value in list(failed_items.items())[:10])
+            failed_preview = "，".join(
+                f"{pod}: {self._safe_pod_model_report_value(value)}"
+                for pod, value in list(failed_items.items())[:10]
+            )
             report_lines.append(f"- 失败项：{failed_preview}")
         if normalized_mapping:
-            report_lines.extend(["", "### 📋 Pod机型明细", "| Pod ID | 机型 |", "|---|---|"])
+            report_lines.extend(["", "### 📋 Pod机型明细", "| 目标 | 机型 |", "|---|---|"])
             for pod, model in normalized_mapping.items():
-                report_lines.append(f"| {pod} | {model} |")
+                report_lines.append(f"| {pod} | {self._safe_pod_model_report_value(model)} |")
         report_lines.extend(["", "### 📱 机型分布", "| 机型代码 | 数量 | 占比 |", "|---|---:|---:|"])
         for model, count in distribution.most_common():
             pct = (count / total * 100) if total else 0.0
             report_lines.append(f"| {model} | {count} 台 | {pct:.1f}% |")
         if failed_items:
-            report_lines.extend(["", "### ⚠️ 未成功项", "| Pod ID | 结果 |", "|---|---|"])
+            report_lines.extend(["", "### ⚠️ 未成功项", "| 目标 | 结果 |", "|---|---|"])
             for pod, value in failed_items.items():
-                report_lines.append(f"| {pod} | {value} |")
+                report_lines.append(f"| {pod} | {self._safe_pod_model_report_value(value)} |")
         return {
             "stats_line": stats_line,
             "completion_line": "查询完成",
             "result_path": unique_paths[-1] if unique_paths else "",
             "model_distribution": model_distribution,
-            "model_items": tuple(f"{pod}: {model}" for pod, model in normalized_mapping.items()),
+            "model_items": tuple(
+                f"{pod}: {self._safe_pod_model_report_value(model)}"
+                for pod, model in normalized_mapping.items()
+            ),
             "structured_report": "\n".join(report_lines),
         }
 
@@ -2631,21 +2780,27 @@ class BatchExecutionService:
     ) -> dict[str, Any]:
         normalized_rows: list[dict[str, str]] = []
         for row in rows:
-            pod = self._row_get(row, ("Pod ID", "pod", "pod_id", "id"))
+            pod = self._row_get(row, ("目标", "pod", "target_id", "id"))
             model = self._row_get(row, ("机型", "型号", "设备型号", "model", "device_model"))
             ip = self._row_get(row, ("出口IP", "ip", "public_ip", "egress_ip", "公网IP"))
             operator = self._row_get(row, ("运营商", "operator", "isp", "org", "carrier"))
             region = self._row_get(row, ("地域", "地区", "region", "location", "city"))
-            if not self._looks_like_pod_id(pod):
+            if not self._looks_like_target_id(pod):
                 continue
-            normalized_rows.append({"pod": pod, "model": model, "ip": ip, "operator": operator, "region": region})
+            normalized_rows.append({
+                "pod": pod,
+                "model": self._safe_pod_model_report_value(model),
+                "ip": ip,
+                "operator": operator,
+                "region": region,
+            })
         normalized_rows = self._dedupe_rows_by_key(normalized_rows, "pod")
 
         model_mapping = {row["pod"]: row["model"] for row in normalized_rows if row.get("model")}
         model_evidence = self._model_mapping_evidence(model_mapping, result_paths=[result_path] if result_path else [])
         egress_rows = [
             {
-                "Pod ID": row["pod"],
+                "目标": row["pod"],
                 "出口IP": row["ip"],
                 "运营商": row["operator"],
                 "地域": row["region"],
@@ -2660,9 +2815,16 @@ class BatchExecutionService:
         )
 
         total = len(normalized_rows)
-        model_failed = [row for row in normalized_rows if self._is_failed_value(row.get("model", ""))]
+        model_failed = [
+            row for row in normalized_rows
+            if self._is_failed_value(row.get("model", "")) or self._is_invalid_pod_model_value(row.get("model", ""))
+        ]
         egress_failed = [row for row in normalized_rows if self._is_failed_value(row.get("ip", ""))]
-        model_distribution = Counter(row["model"] for row in normalized_rows if row.get("model") and not self._is_failed_value(row.get("model", "")))
+        model_distribution = Counter(
+            row["model"]
+            for row in normalized_rows
+            if row.get("model") and not self._is_failed_value(row.get("model", "")) and not self._is_invalid_pod_model_value(row.get("model", ""))
+        )
         ip_distribution = Counter(row["ip"] for row in normalized_rows if row.get("ip") and not self._is_failed_value(row.get("ip", "")))
 
         combined_lines = [
@@ -2678,7 +2840,7 @@ class BatchExecutionService:
         if result_path:
             combined_lines.append(f"- 结果文件：{result_path}")
         if normalized_rows:
-            combined_lines.extend(["", "### 📋 Pod明细", "| Pod ID | 机型 | 出口IP | 运营商 | 地域 |", "|---|---|---|---|---|"])
+            combined_lines.extend(["", "### 📋 Pod明细", "| 目标 | 机型 | 出口IP | 运营商 | 地域 |", "|---|---|---|---|---|"])
             for row in normalized_rows:
                 combined_lines.append(
                     "| "
@@ -2720,7 +2882,7 @@ class BatchExecutionService:
             if "," not in line:
                 continue
             lowered = line.lower()
-            if ("pod" in lowered or "pod id" in lowered) and ("ip" in lowered or "出口" in line or "adb" in lowered):
+            if ("pod" in lowered or "target" in lowered or "目标" in line or "实例" in line) and ("ip" in lowered or "出口" in line or "adb" in lowered):
                 header_index = index
                 break
         if header_index < 0:
@@ -2787,11 +2949,11 @@ class BatchExecutionService:
     def _egress_rows_from_mapping(self, mapping: dict[str, Any]) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         for pod, value in mapping.items():
-            if not self._looks_like_pod_id(pod):
+            if not self._looks_like_target_id(pod):
                 continue
             if isinstance(value, dict):
                 rows.append({
-                    "Pod ID": str(pod),
+                    "目标": str(pod),
                     "出口IP": self._dict_get(value, ("出口IP", "ip", "public_ip", "egress_ip", "公网IP")),
                     "运营商": self._dict_get(value, ("运营商", "operator", "isp", "org", "carrier")),
                     "地域": self._dict_get(value, ("地域", "地区", "region", "location", "city")),
@@ -2800,11 +2962,25 @@ class BatchExecutionService:
             if isinstance(value, str) and "|" in value:
                 parts = [part.strip() for part in value.split("|")]
                 rows.append({
-                    "Pod ID": str(pod),
+                    "目标": str(pod),
                     "出口IP": parts[0] if len(parts) > 0 else "",
                     "运营商": parts[1] if len(parts) > 1 else "",
                     "地域": parts[2] if len(parts) > 2 else "",
                 })
+        return rows
+
+    def _pod_model_egress_rows_from_mapping(self, mapping: dict[str, Any]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for pod, value in mapping.items():
+            if not self._looks_like_target_id(pod) or not isinstance(value, dict):
+                continue
+            rows.append({
+                "目标": str(pod),
+                "机型": self._dict_get(value, ("model", "device_model", "ro.product.model", "机型", "型号", "设备型号")),
+                "出口IP": self._dict_get(value, ("ip", "public_ip", "egress_ip", "出口IP", "公网IP")),
+                "运营商": self._dict_get(value, ("org", "operator", "isp", "carrier", "运营商")),
+                "地域": self._dict_get(value, ("city", "region", "location", "地域", "地区")),
+            })
         return rows
 
     def _egress_rows_evidence(
@@ -2817,7 +2993,7 @@ class BatchExecutionService:
     ) -> dict[str, Any]:
         normalized_rows: list[dict[str, str]] = []
         for row in rows:
-            pod = self._row_get(row, ("Pod ID", "pod", "pod_id", "id"))
+            pod = self._row_get(row, ("目标", "pod", "target_id", "id"))
             ip = self._row_get(row, ("出口IP", "ip", "public_ip", "egress_ip", "公网IP"))
             operator = self._row_get(row, ("运营商", "operator", "isp", "org", "carrier"))
             region = self._row_get(row, ("地域", "地区", "region", "location", "city"))
@@ -2852,7 +3028,7 @@ class BatchExecutionService:
         if result_path:
             report_lines.append(f"- 结果文件：{result_path}")
         if normalized_rows:
-            report_lines.extend(["", "### 📋 Pod出口IP明细", "| Pod ID | 出口IP | 运营商 | 地域 |", "|---|---|---|---|"])
+            report_lines.extend(["", "### 📋 Pod出口IP明细", "| 目标 | 出口IP | 运营商 | 地域 |", "|---|---|---|---|"])
             for row in normalized_rows:
                 report_lines.append(
                     "| "
@@ -2983,6 +3159,19 @@ class BatchExecutionService:
                 return True
         return False
 
+    def _mapping_has_model_values(self, mapping: dict[str, Any]) -> bool:
+        for key, value in mapping.items():
+            if not self._looks_like_target_id(key):
+                continue
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return True
+            if isinstance(value, dict):
+                model = self._dict_get(value, ("model", "device_model", "ro.product.model", "机型", "型号", "设备型号"))
+                status = self._dict_get(value, ("status", "result", "success", "状态", "结果"))
+                if model or self._is_retryable_failed_value(status):
+                    return True
+        return False
+
     def _dict_get(self, value: dict[str, Any], keys: Sequence[str]) -> str:
         lowered = {str(key).lower(): val for key, val in value.items()}
         for key in keys:
@@ -3003,7 +3192,7 @@ class BatchExecutionService:
                 return str(value or "").strip()
         return ""
 
-    def _looks_like_pod_id(self, value: Any) -> bool:
+    def _looks_like_target_id(self, value: Any) -> bool:
         return bool(re.fullmatch(r"\d{12,}", str(value or "").strip()))
 
     def _is_failed_value(self, value: str) -> bool:
