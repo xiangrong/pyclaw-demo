@@ -31,7 +31,8 @@ from pyclaw.gateway.gateway import Gateway
 from pyclaw.infra.config import Config, load_config
 from pyclaw.models.openai import OpenAIProvider
 from pyclaw.tools.files import CopyFileTool, EditFileTool, ReadFileTool, WriteFileTool, SendFileTool
-from pyclaw.tools.code_search import FindRefsTool, GotoDefTool, GrepCodeTool, ListSymbolsTool, ReadLinesTool
+from pyclaw.tools.batch_python import BatchPythonTool
+from pyclaw.tools.code_search import FindRefsTool, GlobFilesTool, GotoDefTool, GrepCodeTool, ListSymbolsTool, ReadLinesTool
 from pyclaw.tools.registry import ToolRegistry
 from pyclaw.tools.terminal import TerminalTool
 from pyclaw.tools.web_search import WebSearchTool
@@ -258,8 +259,10 @@ def start(config: str = typer.Option(None, help="Path to config file")) -> None:
             work_dir=cfg.work_dir,
             allowed_paths=list(allowed_paths)
         )
+        tool_registry.register(BatchPythonTool())
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
+        tool_registry.register(GlobFilesTool())
         tool_registry.register(GrepCodeTool())
         tool_registry.register(ReadLinesTool())
         tool_registry.register(ListSymbolsTool())
@@ -460,8 +463,10 @@ def cron_exec(
             work_dir=cfg.work_dir,
             allowed_paths=list(allowed_paths)
         )
+        tool_registry.register(BatchPythonTool())
         tool_registry.register(TerminalTool())
         tool_registry.register(ReadFileTool())
+        tool_registry.register(GlobFilesTool())
         tool_registry.register(GrepCodeTool())
         tool_registry.register(ReadLinesTool())
         tool_registry.register(ListSymbolsTool())

@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Any
@@ -50,6 +51,7 @@ class Agent:
 
     SIDE_EFFECT_TOOL_NAMES = {
         "terminal",
+        "batch_python",
         "cronjob",
         "edit_file",
         "write_file",
@@ -731,6 +733,7 @@ class Agent:
         if self.event_runtime is not None:
             self.event_runtime.record_event_message(message)
         self._touch_activity("user_message_saved", session)
+        await self._clear_stale_batch_monitor_for_new_user_turn(session)
 
         # 执行 Agent 循环
         response_content, pending_files = await self._agent_loop(session)
@@ -753,6 +756,10 @@ class Agent:
             metadata={"pending_files": pending_files} if pending_files else {},
         )
         await self.sessions.save_message(session, response)
+        await self._abandon_stale_batch_monitor(
+            session,
+            reason="post_response_stale_cleanup",
+        )
 
         # 异步保存到语义记忆与结构化用户记忆（不阻塞主流程回复）
         if self.memory:
@@ -903,6 +910,10 @@ class Agent:
             )
             print(f"🔄 Agent loop iteration {i+1}/{max_iterations}")
 
+            active_skills = session.metadata.get("active_skills", [])
+            if self._should_steer_to_batch_python(session, active_skills=active_skills):
+                await self._request_batch_python_steering(session)
+
             if self._is_near_soft_deadline(started_at, soft_deadline_seconds):
                 if not soft_deadline_reached and not force_final_answer:
                     await self._request_soft_deadline_wrap_up(session)
@@ -1025,6 +1036,14 @@ class Agent:
                 if terminal_batch_limit and len(tool_calls) > terminal_batch_limit:
                     tool_calls = tool_calls[:terminal_batch_limit]
                     result["tool_calls"] = tool_calls
+                should_pivot, pivot_reason = self._should_pivot_batch_tool_calls_to_batch_python(
+                    session,
+                    tool_calls,
+                    active_skills=active_skills,
+                )
+                if should_pivot:
+                    await self._request_batch_python_pivot(session, pivot_reason)
+                    continue
                 if soft_deadline_reached and not self._are_delivery_tool_calls(tool_calls):
                     await self._request_final_answer_without_tools(
                         session,
@@ -1053,6 +1072,20 @@ class Agent:
                     result["tool_calls"] = tool_calls
                     await self._request_active_skill_continue(session, skipped_active_skills)
                     if not tool_calls:
+                        continue
+
+                tool_calls, skipped_memory_calls = self._filter_repeated_memory_tool_calls(tool_calls, session)
+                if skipped_memory_calls:
+                    result["tool_calls"] = tool_calls
+                    if not tool_calls:
+                        await self._request_final_answer_without_tools(
+                            session,
+                            (
+                                f"本轮 list_user_memories 已执行过，已跳过 {skipped_memory_calls} 个重复记忆读取调用。"
+                                "请基于已有记忆观察和当前上下文直接给出最终答复。"
+                            ),
+                        )
+                        force_final_answer = True
                         continue
 
                 tool_call_count += len(tool_calls)
@@ -1265,7 +1298,7 @@ class Agent:
                 if tool_call_signature in last_tool_calls:
                     print(f"  ⚠️  检测到重复调用，触发自我反思...")
                     reflection_msg = Message(
-                        id=f"reflection-{i}-{session.session_id}",
+                        id=self._new_internal_message_id("reflection", session, i),
                         channel=session.channel,
                         channel_user_id=session.user_id,
                         session_id=session.session_id,
@@ -1277,7 +1310,7 @@ class Agent:
                             "observations you've received so far. Why is this not working? "
                             "Adjust your strategy and try a different approach."
                         ),
-                        metadata={"internal_notice": True},
+                        metadata=self._controller_notice_metadata("controller_notice"),
                     )
                     await self.sessions.save_message(session, reflection_msg)
                     last_tool_calls = [] # 重置检测
@@ -1308,7 +1341,7 @@ class Agent:
 
                 # 1. 添加助手消息
                 assistant_msg = Message(
-                    id=f"assistant-toolcall-{i}-{session.session_id}",
+                    id=self._new_internal_message_id("assistant-toolcall", session, i),
                     channel=session.channel,
                     channel_user_id=session.user_id,
                     session_id=session.session_id,
@@ -2121,14 +2154,14 @@ class Agent:
     async def _request_active_skill_continue(self, session: Session, skipped_skills: list[str]) -> None:
         notice_content = self.skill_contexts.context_notice(session, skipped_skills)
         reminder = Message(
-            id=f"active-skill-continue-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("active-skill-continue", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=notice_content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -2138,6 +2171,44 @@ class Agent:
             function = tool_call.get("function", {})
             names.add(self._tool_repeat_counter_name(str(function.get("name", "")), function.get("arguments", "")))
         return names
+
+    def _memory_tool_observation_count_since_latest_user(self, session: Session) -> int:
+        """Count completed list_user_memories observations in the active user turn."""
+
+        count = 0
+        for msg in self._messages_since_latest_external_user(session):
+            if msg.role != MessageRole.TOOL:
+                continue
+            metadata = getattr(msg, "metadata", {}) or {}
+            content = str(getattr(msg, "content", "") or "")
+            if isinstance(metadata, dict) and metadata.get("tool_name") == "list_user_memories":
+                count += 1
+            elif content.lstrip().startswith("OBSERVATION from list_user_memories"):
+                count += 1
+        return count
+
+    def _filter_repeated_memory_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        session: Session,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Allow at most one list_user_memories call per user turn/model batch."""
+
+        remaining_budget = max(0, 1 - self._memory_tool_observation_count_since_latest_user(session))
+        filtered: list[dict[str, Any]] = []
+        skipped = 0
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+            name = str(function.get("name", "")) if isinstance(function, dict) else ""
+            if name != "list_user_memories":
+                filtered.append(tool_call)
+                continue
+            if remaining_budget > 0:
+                filtered.append(tool_call)
+                remaining_budget -= 1
+            else:
+                skipped += 1
+        return filtered, skipped
 
     def _should_nudge_patch_first_during_tool_loop(
         self,
@@ -2230,6 +2301,8 @@ class Agent:
         read_file is intentionally chunk-limited, so counting only tool name caused
         large-file coding tasks to stop before the agent had enough context.
         """
+        if tool_name == "list_user_memories":
+            return min(base_limit, self._get_session_int(session, "list_user_memories_repeat_limit", 1))
         if tool_name.startswith("activate_skill:"):
             return min(base_limit, self._get_session_int(session, "activate_skill_repeat_limit", 2))
         if tool_name == "terminal_navigation" and self.batch_execution.is_operational_task(self._latest_external_user_text(session)):
@@ -2314,7 +2387,7 @@ class Agent:
             next_action = "Stop reading and produce the final answer with changed files and validation results."
 
         reminder = Message(
-            id=f"coding-navigation-pivot-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("coding-navigation-pivot", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -2328,7 +2401,7 @@ class Agent:
                 "unless a new error or validation failure creates a specific new question. "
                 "Do not mention this notice to the user."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -3064,6 +3137,245 @@ class Agent:
                 break
         return [msg for msg in session.messages[latest_user_index + 1:] if msg.role == MessageRole.TOOL]
 
+    def _messages_since_latest_external_user(self, session: Session) -> list[Message]:
+        """Return all messages after the latest non-internal user request."""
+        latest_user_index = -1
+        for index in range(len(session.messages) - 1, -1, -1):
+            msg = session.messages[index]
+            if msg.role != MessageRole.USER:
+                continue
+            content = str(msg.content or "").strip()
+            if content and not self._is_internal_notice_message(msg):
+                latest_user_index = index
+                break
+        return session.messages[latest_user_index + 1:] if latest_user_index >= 0 else list(session.messages)
+
+    def _batch_python_tool_available(self, active_skills: Optional[list[str]] = None) -> bool:
+        """Return True when ``batch_python`` is visible to the model/tool registry."""
+        registry_tools = getattr(self.tools, "_tools", None)
+        if isinstance(registry_tools, dict) and "batch_python" in registry_tools:
+            return True
+        return self._tool_available("batch_python", active_skills=active_skills)
+
+    def _has_batch_python_attempt_since_latest_user(self, session: Session) -> bool:
+        """Return True if the current user turn already tried batch_python."""
+        for msg in self._messages_since_latest_external_user(session):
+            metadata = getattr(msg, "metadata", {}) or {}
+            if msg.role == MessageRole.TOOL and metadata.get("tool_name") == "batch_python":
+                return True
+            if msg.role != MessageRole.ASSISTANT:
+                continue
+            tool_calls = metadata.get("tool_calls") if isinstance(metadata, dict) else None
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function", {})
+                if isinstance(function, dict) and str(function.get("name", "")) == "batch_python":
+                    return True
+        return False
+
+    def _has_batch_python_evidence_since_latest_user(self, session: Session) -> bool:
+        """Return True when a batch_python observation exists in this user turn."""
+        return any(
+            msg.role == MessageRole.TOOL
+            and (getattr(msg, "metadata", {}) or {}).get("tool_name") == "batch_python"
+            for msg in self._messages_since_latest_external_user(session)
+        )
+
+    def _has_failed_batch_python_since_latest_user(self, session: Session) -> bool:
+        """Return True after a concrete batch_python failure so terminal fallback is allowed."""
+        for msg in self._messages_since_latest_external_user(session):
+            if msg.role != MessageRole.TOOL:
+                continue
+            metadata = getattr(msg, "metadata", {}) or {}
+            if metadata.get("tool_name") != "batch_python":
+                continue
+            if metadata.get("tool_result_success") is False:
+                return True
+            if str(metadata.get("tool_result_error_code") or ""):
+                return True
+        return False
+
+    def _should_steer_to_batch_python(
+        self,
+        session: Session,
+        *,
+        active_skills: Optional[list[str]] = None,
+    ) -> bool:
+        """Inject one proactive notice for multi-target operational batch tasks."""
+        latest_task = self._latest_external_user_text(session)
+        if not latest_task:
+            return False
+        if not self.batch_execution.prefers_batch_python(latest_task):
+            return False
+        if not self._batch_python_tool_available(active_skills=active_skills):
+            return False
+        if self._has_batch_python_attempt_since_latest_user(session):
+            return False
+        if self._has_batch_python_evidence_since_latest_user(session):
+            return False
+        if self.batch_execution.batch_python_steering_notice_count(session) > 0:
+            return False
+        return True
+
+    async def _request_batch_python_steering(self, session: Session) -> None:
+        """Ask the model to prefer the dedicated durable batch tool."""
+        content = self.batch_execution.batch_python_steering_notice(
+            self._latest_external_user_text(session)
+        )
+        reminder = Message(
+            id=self._new_internal_message_id("batch-python-steering", session),
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata=self._controller_notice_metadata("controller_notice"),
+        )
+        await self.sessions.save_message(session, reminder)
+
+    def _tool_call_args(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        """Safely parse the JSON arguments for a model tool call."""
+        function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+        raw_arguments = function.get("arguments", {}) if isinstance(function, dict) else {}
+        try:
+            parsed = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _write_file_call_looks_like_batch_script(
+        self,
+        tool_call: dict[str, Any],
+        latest_task: str,
+    ) -> bool:
+        """Detect ad-hoc batch scripts that should be routed through batch_python."""
+        function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+        if not isinstance(function, dict) or str(function.get("name", "")) != "write_file":
+            return False
+        args = self._tool_call_args(tool_call)
+        path = str(args.get("path") or "")
+        content = str(args.get("content") or "")
+        lower_path = path.lower()
+        lower_content = content.lower()
+        if not lower_path.endswith((".py", ".sh", ".bash")):
+            return False
+
+        marker_text = f"{lower_path}\n{lower_content}\n{(latest_task or '').lower()}"
+        operational_markers = (
+            "batch", "bulk", "query", "pod", "pods", "egress", "model", "adb",
+            "opencli", "kubectl", "wss", "subprocess", "targets", "results",
+            "summary.json", "results.jsonl", "results.csv", "出口ip", "机型",
+        )
+        has_operational_marker = any(marker in marker_text for marker in operational_markers)
+        loop_markers = (
+            "for target in", "for pod in", "for item in", "for line in", "while read",
+            "asyncio", "threadpoolexecutor", "processpoolexecutor", "subprocess",
+            "targets.txt", "opencli", "kubectl", "xargs", "results.jsonl", "results.csv",
+        )
+        has_loop_or_runtime = any(marker in lower_content for marker in loop_markers) or bool(
+            re.search(r"\bfor\s+\w+\s+in\s+(?:targets|pods|items|ids|lines)\b", lower_content)
+        )
+        script_name_looks_batch = bool(
+            re.search(r"(?:^|[/_.-])(?:batch|bulk|query|pods?|egress|model|adb|wss)(?:[/_.-]|$)", lower_path)
+        )
+        return bool(has_operational_marker and (has_loop_or_runtime or script_name_looks_batch))
+
+    def _terminal_call_looks_like_legacy_batch_pattern(
+        self,
+        tool_call: dict[str, Any],
+        latest_task: str,
+    ) -> tuple[bool, str]:
+        """Detect terminal-side batch loops/scripts that should pivot to batch_python."""
+        function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+        if not isinstance(function, dict) or str(function.get("name", "")) != "terminal":
+            return False, ""
+        raw_arguments = function.get("arguments", "")
+        if self._is_read_only_terminal_call(raw_arguments):
+            return False, ""
+        command = self._extract_terminal_command(raw_arguments)
+        if not command:
+            return False, ""
+        if self.batch_execution.looks_like_batch_terminal_command(command, task_text=latest_task):
+            return True, "terminal batch command"
+        normalized = command.lower()
+        legacy_patterns = (
+            r"\bnohup\b",
+            r"\b(?:python3?|bash|sh)\b[^\n;&|]*(?:batch|bulk|query|pods?|egress|model|adb|wss)[\w./-]*\.(?:py|sh)\b",
+            r"\bwhile\s+read\b",
+            r"\bxargs\b",
+            r"\bparallel\b",
+            r"\bfor\s+\w+\s+in\b[^\n]*(?:;\s*)?\bdo\b",
+        )
+        if any(re.search(pattern, normalized) for pattern in legacy_patterns):
+            return True, "terminal loop/script batch pattern"
+        return False, ""
+
+    def _should_pivot_batch_tool_calls_to_batch_python(
+        self,
+        session: Session,
+        tool_calls: list[dict[str, Any]],
+        *,
+        active_skills: Optional[list[str]] = None,
+    ) -> tuple[bool, str]:
+        """Block legacy batch execution patterns until batch_python has been tried."""
+        latest_task = self._latest_external_user_text(session)
+        if not latest_task:
+            return False, ""
+        if not self.batch_execution.prefers_batch_python(latest_task):
+            return False, ""
+        if not self._batch_python_tool_available(active_skills=active_skills):
+            return False, ""
+        if self._has_failed_batch_python_since_latest_user(session):
+            return False, ""
+        if self._has_batch_python_attempt_since_latest_user(session):
+            return False, ""
+        if any(
+            isinstance(tc, dict)
+            and isinstance(tc.get("function", {}), dict)
+            and str(tc.get("function", {}).get("name", "")) == "batch_python"
+            for tc in tool_calls
+        ):
+            return False, ""
+        if self.batch_execution.batch_python_pivot_notice_count(session) >= 2:
+            return False, ""
+
+        tool_names = []
+        for tc in tool_calls:
+            function = tc.get("function", {}) if isinstance(tc, dict) else {}
+            if isinstance(function, dict):
+                tool_names.append(str(function.get("name", "")))
+        if "write_file" in tool_names and "terminal" in tool_names:
+            return True, "write_file plus terminal batch workflow"
+
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            terminal_match, terminal_reason = self._terminal_call_looks_like_legacy_batch_pattern(tool_call, latest_task)
+            if terminal_match:
+                return True, terminal_reason
+            if self._write_file_call_looks_like_batch_script(tool_call, latest_task):
+                return True, "write_file ad-hoc batch script"
+        return False, ""
+
+    async def _request_batch_python_pivot(self, session: Session, reason: str) -> None:
+        """Inject a repair notice telling the model to use batch_python next."""
+        content = self.batch_execution.batch_python_pivot_notice(reason)
+        reminder = Message(
+            id=self._new_internal_message_id("batch-python-pivot", session),
+            channel=session.channel,
+            channel_user_id=session.user_id,
+            session_id=session.session_id,
+            type=MessageType.TEXT,
+            role=MessageRole.USER,
+            content=content,
+            metadata=self._controller_notice_metadata("controller_notice"),
+        )
+        await self.sessions.save_message(session, reminder)
+
     def _should_pivot_after_terminal_approval_failures(self, session: Session) -> bool:
         failures = 0
         for msg in self._recent_tool_messages_since_latest_user(session):
@@ -3083,14 +3395,14 @@ class Agent:
     async def _request_blocked_operational_materialization_repair(self, session: Session) -> None:
         content = self.batch_execution.runtime_materialization_repair_notice()
         reminder = Message(
-            id=f"terminal-batch-materialization-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-batch-materialization-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -3108,14 +3420,14 @@ class Agent:
     async def _request_terminal_batch_timeout_repair(self, session: Session) -> None:
         content = self.batch_execution.timeout_repair_notice()
         reminder = Message(
-            id=f"terminal-batch-timeout-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-batch-timeout-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -3129,22 +3441,27 @@ class Agent:
     async def _request_repeated_batch_side_effect_repair(self, session: Session, side_effect_keys: list[str]) -> None:
         content = self.batch_execution.repeated_side_effect_repair_notice(side_effect_keys)
         reminder = Message(
-            id=f"terminal-batch-repeat-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-batch-repeat-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
     def _should_request_operational_progress_poll(self, session: Session) -> bool:
         """Return True when a batch task has only partial progress and should keep polling."""
+        latest_task = self._latest_external_user_text(session)
+        if self.batch_execution._task_is_single_target_non_batch(latest_task):
+            return False
+        if self._stale_active_batch_monitor_for_latest_user(session):
+            return False
         return self.batch_execution.should_request_progress_poll(
             self.batch_execution.terminal_messages_since_latest_user(session),
-            latest_task=self._latest_external_user_text(session),
+            latest_task=latest_task,
             prior_notice_count=self.batch_execution.progress_poll_notice_count(session),
         )
 
@@ -3153,14 +3470,14 @@ class Agent:
         evidence = self.batch_execution.evidence_from_terminal_messages(terminal_messages)
         content = self.batch_execution.progress_poll_notice(evidence)
         reminder = Message(
-            id=f"terminal-batch-progress-poll-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-batch-progress-poll", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -3259,14 +3576,14 @@ class Agent:
         )
         content = self.batch_execution.operational_contract_repair_notice(decision)
         reminder = Message(
-            id=f"terminal-operational-contract-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-operational-contract-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -3283,19 +3600,21 @@ class Agent:
     async def _request_operational_no_evidence_repair(self, session: Session) -> None:
         content = self.batch_execution.no_evidence_repair_notice()
         reminder = Message(
-            id=f"terminal-batch-no-evidence-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-batch-no-evidence-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
     async def _register_operational_batch_monitor_if_needed(self, session: Session) -> None:
         latest_task = self._latest_external_user_text(session)
+        if self.batch_execution._task_is_single_target_non_batch(latest_task):
+            return
         if not self.batch_execution.is_operational_task(latest_task):
             return
         terminal_messages = self.batch_execution.terminal_messages_since_latest_user(session)
@@ -3331,14 +3650,14 @@ class Agent:
                 "If neither is possible, final-answer with the exact blocker and say no file was changed. Do not mention this notice."
             )
         reminder = Message(
-            id=f"terminal-approval-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("terminal-approval-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=content,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -3364,6 +3683,97 @@ class Agent:
         metadata = getattr(msg, "metadata", {}) or {}
         content = str(getattr(msg, "content", "") or "").strip()
         return bool(isinstance(metadata, dict) and metadata.get("internal_notice")) or content.startswith("NOTICE:")
+
+    def _controller_notice_metadata(self, reason: str, **extra: Any) -> dict[str, Any]:
+        """Metadata for controller-only turns hidden from UI/compression history."""
+
+        metadata: dict[str, Any] = {
+            "internal_notice": True,
+            "controller_noise": True,
+            "hidden_from_visible_history": True,
+            "hidden_reason": reason,
+        }
+        metadata.update(extra)
+        return metadata
+
+    def _new_internal_message_id(self, prefix: str, session: Session, *parts: object) -> str:
+        """Return a collision-resistant id for controller-injected messages."""
+        safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(prefix or "internal")).strip("-") or "internal"
+        safe_parts = [
+            re.sub(r"[^A-Za-z0-9_.-]+", "-", str(part)).strip("-")[:80]
+            for part in parts
+            if str(part or "").strip()
+        ]
+        middle = "-".join(part for part in safe_parts if part)
+        suffix = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        if middle:
+            return f"{safe_prefix}-{middle}-{session.session_id}-{suffix}"
+        return f"{safe_prefix}-{session.session_id}-{suffix}"
+
+    async def _clear_stale_batch_monitor_for_new_user_turn(self, session: Session) -> bool:
+        """Abandon old batch monitors when a new unrelated user task arrives."""
+        return await self._abandon_stale_batch_monitor(
+            session,
+            reason="new_user_turn",
+        )
+
+    def _stale_active_batch_monitor_for_latest_user(self, session: Session) -> bool:
+        """Return True when persisted batch state belongs to an older user turn."""
+        if not isinstance(session.metadata, dict):
+            return False
+        raw = session.metadata.get("active_batch_monitor")
+        if not isinstance(raw, dict):
+            return False
+        latest_task = str(raw.get("latest_task") or "").strip()
+        latest_user = self._latest_raw_external_user_text(session).strip()
+        return bool(
+            latest_user
+            and latest_task
+            and latest_user != latest_task
+            and not self._is_batch_monitor_continuation_request(latest_user)
+        )
+
+    async def _abandon_stale_batch_monitor(self, session: Session, *, reason: str) -> bool:
+        if not isinstance(session.metadata, dict):
+            return False
+        raw = session.metadata.get("active_batch_monitor")
+        if not isinstance(raw, dict):
+            return False
+        latest_task = str(raw.get("latest_task") or "").strip()
+        latest_user = self._latest_raw_external_user_text(session).strip()
+        if not latest_user or not latest_task or latest_user == latest_task:
+            return False
+        if self._is_batch_monitor_continuation_request(latest_user):
+            return False
+        abandoned = dict(raw)
+        abandoned["abandoned_at"] = datetime.now(timezone.utc).isoformat()
+        abandoned["abandoned_reason"] = reason
+        abandoned["superseded_by"] = latest_user[:500]
+        session.metadata["abandoned_batch_monitor"] = abandoned
+        session.metadata.pop("active_batch_monitor", None)
+        await self._persist_session_metadata(session)
+        return True
+
+    def _is_batch_monitor_continuation_request(self, text: str) -> bool:
+        """Return True for short follow-ups asking about an existing batch job."""
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        if not normalized or len(normalized) > 80:
+            return False
+        exact = {
+            "继续", "继续查", "继续查询", "继续跑", "继续执行", "接着查", "接着跑",
+            "看下结果", "看下批量结果", "批量结果", "结果出来了吗", "结果出来没",
+            "怎么样了", "现在怎么样", "进度", "查下进度", "看下进度", "status",
+            "progress", "result", "results", "continue", "go on", "resume",
+        }
+        if normalized in exact:
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "批量任务", "后台任务", "任务进度", "执行进度", "查询进度",
+                "batch status", "batch progress", "job status", "job progress",
+            )
+        )
 
     def _looks_like_internal_or_guardrail_assistant_text(self, content: str) -> bool:
         """Detect assistant text that is a guardrail fallback, not a pending user deliverable."""
@@ -4234,14 +4644,14 @@ class Agent:
             await self._request_file_deliverable_repair(session)
             return
         reminder = Message(
-            id=f"completion-contract-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("completion-contract-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=self._completion_contract_repair_notice(contract, acceptance, skill_evidence),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -4299,7 +4709,7 @@ class Agent:
         lines.append("Do not mention this notice.")
 
         notice = Message(
-            id=f"skill-workflow-orchestration-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("skill-workflow-orchestration", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -4308,6 +4718,9 @@ class Agent:
             content="\n".join(lines),
             metadata={
                 "internal_notice": True,
+                "controller_noise": True,
+                "hidden_from_visible_history": True,
+                "hidden_reason": "skill_workflow_orchestration",
                 "skill_workflow_orchestration": True,
                 "source_message_id": contract.source_message_id,
                 "task_fingerprint": contract.task_fingerprint,
@@ -4567,7 +4980,7 @@ class Agent:
         non-duplicate calls finish.
         """
         reminder = Message(
-            id=f"duplicate-side-effect-delivery-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("duplicate-side-effect-delivery-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -4580,7 +4993,7 @@ class Agent:
                 "was created, run it once, verify the output file exists, then call send_file_to_user. If blocked, "
                 "state the concrete blocker. Do not mention this notice."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -4597,7 +5010,7 @@ class Agent:
         command before allowing fallback synthesis.
         """
         reminder = Message(
-            id=f"deliverable-generation-plan-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("deliverable-generation-plan-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -4609,7 +5022,7 @@ class Agent:
                 "Do not call another package-version/import check. If writing code is easier, write the helper script under "
                 "the artifact directory, run it once, verify the file exists, then call send_file_to_user. Do not mention this notice."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5215,7 +5628,7 @@ class Agent:
 
     async def _request_file_deliverable_repair(self, session: Session) -> None:
         reminder = Message(
-            id=f"file-deliverable-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("file-deliverable-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -5230,7 +5643,7 @@ class Agent:
                 "the same artifact directory, not ~/ or Desktop. Only ask the user if required source content or "
                 "external credentials are missing. Do not mention this notice."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5257,7 +5670,7 @@ class Agent:
 
     async def _request_patch_first_repair(self, session: Session) -> None:
         reminder = Message(
-            id=f"patch-first-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("patch-first-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -5270,7 +5683,7 @@ class Agent:
                 "then edit files with edit_file or write_file. If you truly cannot edit, state the concrete blocker. "
                 "Do not mention this notice to the user."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5298,7 +5711,7 @@ class Agent:
 
     async def _request_verification_repair(self, session: Session) -> None:
         reminder = Message(
-            id=f"verification-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("verification-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -5310,7 +5723,7 @@ class Agent:
                 "project build, compile, lint). If validation cannot be run, explain the concrete reason in the final answer. "
                 "Do not mention this notice to the user."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5402,15 +5815,20 @@ class Agent:
         allow_incomplete_completed_report: bool = False,
     ) -> str:
         """Synthesize a safe final for operational tasks from observed evidence."""
+        latest_task = self._latest_external_user_text(session)
+        if self.batch_execution._task_is_single_target_non_batch(latest_task):
+            return ""
+        if self._stale_active_batch_monitor_for_latest_user(session):
+            return ""
         return self.batch_execution.final_from_observations(
-            latest_task=self._latest_external_user_text(session),
+            latest_task=latest_task,
             terminal_messages=self.batch_execution.evidence_messages_since_latest_user(session),
             allow_incomplete_completed_report=allow_incomplete_completed_report,
         )
 
     async def _request_build_repair(self, session: Session) -> None:
         reminder = Message(
-            id=f"build-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("build-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -5424,7 +5842,7 @@ class Agent:
                 "If no build target exists or the sandbox blocks it, say that concrete reason in the final answer. "
                 "Do not mention this notice to the user."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5841,7 +6259,7 @@ class Agent:
     async def _request_source_extraction_before_final(self, session: Session) -> None:
         """Ask the model to read source pages before answering a current task."""
         reminder = Message(
-            id=f"extract-before-final-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("extract-before-final", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -5855,7 +6273,7 @@ class Agent:
                 "rather than another web_search unless no URL is available. Then synthesize "
                 "the final answer. Do not mention this notice to the user."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5918,14 +6336,14 @@ class Agent:
     async def _request_answer_quality_repair(self, session: Session, notice: str) -> None:
         """Ask the model for one targeted repair turn before final delivery."""
         reminder = Message(
-            id=f"answer-quality-repair-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("answer-quality-repair", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
             type=MessageType.TEXT,
             role=MessageRole.USER,
             content=notice,
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, reminder)
 
@@ -5968,7 +6386,7 @@ class Agent:
         the observations already in context.
         """
         final_request = Message(
-            id=f"final-no-tools-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("final-no-tools", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -5981,7 +6399,7 @@ class Agent:
                 "Do not mention tool limits, execution time limits, budgets, guardrails, or internal errors. "
                 "If the available information is incomplete, say what is confirmed so far and mark uncertain details as pending confirmation."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, final_request)
 
@@ -6007,7 +6425,7 @@ class Agent:
         sending it. The next model turn therefore receives only delivery tools.
         """
         final_request = Message(
-            id=f"soft-deadline-wrap-up-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=self._new_internal_message_id("soft-deadline-wrap-up", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -6020,7 +6438,7 @@ class Agent:
                 "Otherwise, produce the final answer immediately from existing observations. "
                 "Do not mention tool limits, execution time limits, budgets, guardrails, or internal errors in the final user-facing answer."
             ),
-            metadata={"internal_notice": True},
+            metadata=self._controller_notice_metadata("controller_notice"),
         )
         await self.sessions.save_message(session, final_request)
 
@@ -7105,12 +7523,16 @@ class Agent:
             
             # 1. 提取需要摘要的消息 (除了系统消息和最近 10 条之外的所有消息)
             limit = 10
-            system_msgs = [msg for msg in session.messages if msg.role == MessageRole.SYSTEM]
-            recent_msgs = session.messages[-limit:]
+            visible_messages = (
+                session.visible_messages()
+                if hasattr(session, "visible_messages")
+                else list(session.messages)
+            )
+            recent_msgs = visible_messages[-limit:]
             recent_ids = {m.id for m in recent_msgs}
             
             msgs_to_summarize = [
-                m for m in session.messages 
+                m for m in visible_messages
                 if m.role != MessageRole.SYSTEM and m.id not in recent_ids
             ]
             

@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import logging
 import hashlib
+import re
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,7 @@ from pyclaw.core.session import Session
 
 ACTIVE_KEY = "active_batch_monitor"
 DONE_KEY = "completed_batch_monitor"
+ABANDONED_KEY = "abandoned_batch_monitor"
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +127,8 @@ class BatchMonitorService:
         record = BatchMonitorRecord.from_mapping(raw)
         if record.delivered:
             return False
+        if await self._abandon_if_stale(agent, session, record):
+            return False
         if self._agent_session_is_active(agent, session):
             return False
         if self._has_existing_delivery(session):
@@ -164,7 +169,7 @@ class BatchMonitorService:
             return False
 
         terminal_msg = Message(
-            id=f"batch-monitor-tool-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=_new_monitor_message_id("batch-monitor-tool", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -189,7 +194,7 @@ class BatchMonitorService:
             final = sanitizer(final)
 
         assistant_msg = Message(
-            id=f"batch-monitor-final-{int(datetime.now().timestamp())}-{session.session_id}",
+            id=_new_monitor_message_id("batch-monitor-final", session),
             channel=session.channel,
             channel_user_id=session.user_id,
             session_id=session.session_id,
@@ -247,10 +252,7 @@ class BatchMonitorService:
     def _has_existing_delivery(self, session: Session) -> bool:
         latest_user_index = -1
         for index, msg in enumerate(getattr(session, "messages", []) or []):
-            metadata = getattr(msg, "metadata", {}) or {}
-            if getattr(msg, "role", None) == MessageRole.USER and not (
-                isinstance(metadata, dict) and metadata.get("internal_notice")
-            ):
+            if getattr(msg, "role", None) == MessageRole.USER and not self._is_internal_notice_message(msg):
                 latest_user_index = index
         for msg in (getattr(session, "messages", []) or [])[latest_user_index + 1:]:
             metadata = getattr(msg, "metadata", {}) or {}
@@ -288,10 +290,7 @@ class BatchMonitorService:
         latest_user_index = -1
         messages = list(getattr(session, "messages", []) or [])
         for index, msg in enumerate(messages):
-            metadata = getattr(msg, "metadata", {}) or {}
-            if getattr(msg, "role", None) == MessageRole.USER and not (
-                isinstance(metadata, dict) and metadata.get("internal_notice")
-            ):
+            if getattr(msg, "role", None) == MessageRole.USER and not self._is_internal_notice_message(msg):
                 latest_user_index = index
         for msg in messages[latest_user_index + 1:]:
             metadata = getattr(msg, "metadata", {}) or {}
@@ -320,6 +319,59 @@ class BatchMonitorService:
     def _stable_hash(self, value: str) -> str:
         return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
 
+    async def _abandon_if_stale(self, agent: Any, session: Session, record: BatchMonitorRecord) -> bool:
+        """Drop a monitor that no longer belongs to the latest real user turn."""
+        latest_task = str(record.latest_task or "").strip()
+        latest_user = self._latest_external_user_text(session)
+        if not latest_task or not latest_user or latest_task == latest_user:
+            return False
+        if self._is_batch_monitor_continuation_request(latest_user):
+            return False
+        abandoned = asdict(record)
+        abandoned["abandoned_at"] = _utc_now()
+        abandoned["abandoned_reason"] = "latest_user_task_changed"
+        abandoned["superseded_by"] = latest_user[:500]
+        session.metadata.pop(ACTIVE_KEY, None)
+        session.metadata[ABANDONED_KEY] = abandoned
+        await self._persist_session_metadata(agent, session)
+        return True
+
+    def _latest_external_user_text(self, session: Session) -> str:
+        for msg in reversed(getattr(session, "messages", []) or []):
+            if getattr(msg, "role", None) != MessageRole.USER:
+                continue
+            if self._is_internal_notice_message(msg):
+                continue
+            content = str(getattr(msg, "content", "") or "").strip()
+            if content:
+                return content
+        return ""
+
+    def _is_internal_notice_message(self, msg: Message) -> bool:
+        metadata = getattr(msg, "metadata", {}) or {}
+        content = str(getattr(msg, "content", "") or "").lstrip()
+        return bool(isinstance(metadata, dict) and metadata.get("internal_notice")) or content.startswith("NOTICE:")
+
+    def _is_batch_monitor_continuation_request(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        if not normalized or len(normalized) > 80:
+            return False
+        exact = {
+            "继续", "继续查", "继续查询", "继续跑", "继续执行", "接着查", "接着跑",
+            "看下结果", "看下批量结果", "批量结果", "结果出来了吗", "结果出来没",
+            "怎么样了", "现在怎么样", "进度", "查下进度", "看下进度", "status",
+            "progress", "result", "results", "continue", "go on", "resume",
+        }
+        if normalized in exact:
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "批量任务", "后台任务", "任务进度", "执行进度", "查询进度",
+                "batch status", "batch progress", "job status", "job progress",
+            )
+        )
+
     async def _active_sessions(self, agent: Any) -> list[Session]:
         sessions_manager = getattr(agent, "sessions", None)
         list_by_key = getattr(sessions_manager, "list_sessions_with_metadata_key", None)
@@ -347,14 +399,19 @@ class BatchMonitorService:
         save_message = getattr(sessions_manager, "save_message", None)
         if callable(save_message):
             marker = Message(
-                id=f"batch-monitor-metadata-{int(datetime.now().timestamp())}-{session.session_id}",
+                id=_new_monitor_message_id("batch-monitor-metadata", session),
                 channel=session.channel,
                 channel_user_id=session.user_id,
                 session_id=session.session_id,
                 type=MessageType.TEXT,
                 role=MessageRole.SYSTEM,
                 content="batch monitor metadata updated",
-                metadata={"internal_notice": True},
+                metadata={
+                    "internal_notice": True,
+                    "controller_noise": True,
+                    "hidden_from_visible_history": True,
+                    "hidden_reason": "batch_monitor_metadata_update",
+                },
             )
             await save_message(session, marker)
 
@@ -401,6 +458,11 @@ class BatchMonitorService:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _new_monitor_message_id(prefix: str, session: Session) -> str:
+    safe_prefix = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(prefix or "batch-monitor")).strip("-") or "batch-monitor"
+    return f"{safe_prefix}-{session.session_id}-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
 
 
 async def tick_batch_monitors(agent: Any, adapters: dict[str, Any] | None = None) -> int:

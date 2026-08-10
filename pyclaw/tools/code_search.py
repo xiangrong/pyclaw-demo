@@ -91,6 +91,14 @@ class GrepCodeArgs(BaseModel):
     max_chars: int = Field(default=12000, ge=1000, le=50000, description="Maximum characters in the response")
 
 
+class GlobFilesArgs(BaseModel):
+    pattern: str = Field(description="Glob pattern for file names, e.g. '**/*.py' or 'src/**/*.ts'")
+    path: str = Field(default=".", description="Directory to search within, relative to work_dir by default")
+    include_hidden: bool = Field(default=False, description="Include hidden files and directories when true")
+    max_matches: int = Field(default=200, ge=1, le=1000, description="Maximum matching files to return")
+    max_chars: int = Field(default=12000, ge=1000, le=50000, description="Maximum characters in the response")
+
+
 class ReadLinesArgs(BaseModel):
     path: str = Field(description="File path to read")
     start_line: int = Field(ge=1, description="1-based first line to read")
@@ -269,6 +277,130 @@ class GrepCodeTool(CodeSearchMixin, BaseTool):
             return ToolResult(success=False, content=f"Invalid regex: {e}")
         except Exception as e:
             return ToolResult(success=False, content=f"Error searching code: {type(e).__name__}: {e}")
+
+
+class GlobFilesTool(CodeSearchMixin, BaseTool):
+    name = "glob_files"
+    description = (
+        "Find files by glob pattern with workspace sandbox validation, e.g. '**/*.py'. "
+        "Use this when you need to locate files by name before reading or editing them."
+    )
+    args_schema = GlobFilesArgs
+
+    async def execute(self, **kwargs: object) -> ToolResult:
+        pattern = str(kwargs.get("pattern", "")).strip()
+        search_path = str(kwargs.get("path", "."))
+        include_hidden = bool(kwargs.get("include_hidden", False))
+        max_matches = int(kwargs.get("max_matches", 200))
+        max_chars = int(kwargs.get("max_chars", 12000))
+
+        if not pattern:
+            return ToolResult(
+                success=False,
+                content="Error: pattern must not be empty",
+                error_code="invalid_arguments",
+                requires_model_repair=True,
+            )
+        if os.path.isabs(pattern):
+            return ToolResult(
+                success=False,
+                content="Error: pattern must be relative to the search path, not absolute",
+                error_code="invalid_arguments",
+                requires_model_repair=True,
+            )
+
+        try:
+            root = self._safe_root(search_path)
+            if not root.exists():
+                return ToolResult(
+                    success=False,
+                    content=f"Search path not found: {search_path}",
+                    error_code="file_not_found",
+                    requires_model_repair=True,
+                )
+            if not root.is_dir():
+                return ToolResult(
+                    success=False,
+                    content=f"Search path is not a directory: {search_path}",
+                    error_code="not_a_directory",
+                    requires_model_repair=True,
+                )
+
+            matches: list[Path] = []
+            total = 0
+            for candidate in root.glob(pattern):
+                try:
+                    safe_candidate = Path(self.validate_path(str(candidate)))
+                except PermissionError:
+                    continue
+                if not safe_candidate.is_file():
+                    continue
+                if not include_hidden and self._has_hidden_part(safe_candidate, root):
+                    continue
+                total += 1
+                if len(matches) < max_matches:
+                    matches.append(safe_candidate)
+
+            if not matches:
+                return ToolResult(
+                    success=True,
+                    content=f"No files matched glob pattern: {pattern}",
+                    structured={
+                        "operation": "glob_files",
+                        "pattern": pattern,
+                        "path": str(root),
+                        "requested_path": search_path,
+                        "total_matches": total,
+                        "matches": [],
+                        "truncated": False,
+                    },
+                )
+
+            unique_matches = sorted(dict.fromkeys(matches), key=lambda path: self._display_path(path))
+            rendered = [self._display_path(path) for path in unique_matches]
+            shown = len(rendered)
+            truncated = total > shown
+            header = f"Found {total} file(s) for glob {pattern!r}; showing {shown}."
+            if truncated:
+                header += " Narrow the pattern/path or increase max_matches to see more."
+            content = self._truncate(header + "\n" + "\n".join(rendered), max_chars)
+
+            return ToolResult(
+                success=True,
+                content=content,
+                structured={
+                    "operation": "glob_files",
+                    "pattern": pattern,
+                    "path": str(root),
+                    "requested_path": search_path,
+                    "total_matches": total,
+                    "matches": rendered,
+                    "truncated": truncated or content.endswith("... output truncated; narrow path/pattern or lower max_matches ..."),
+                },
+            )
+        except PermissionError as e:
+            return ToolResult(
+                success=False,
+                content=str(e),
+                error_code="sandbox_denied",
+                requires_model_repair=True,
+            )
+        except ValueError as e:
+            return ToolResult(
+                success=False,
+                content=f"Invalid glob pattern: {e}",
+                error_code="invalid_arguments",
+                requires_model_repair=True,
+            )
+        except Exception as e:
+            return ToolResult(success=False, content=f"Error globbing files: {type(e).__name__}: {e}")
+
+    def _has_hidden_part(self, path: Path, root: Path) -> bool:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            relative = path
+        return any(part.startswith(".") for part in relative.parts)
 
 
 class ReadLinesTool(CodeSearchMixin, BaseTool):

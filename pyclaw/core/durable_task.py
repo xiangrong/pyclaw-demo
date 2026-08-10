@@ -513,7 +513,8 @@ class DurableTaskEngine:
             ):
                 result_lines.append(line)
         scoped = "\n".join(result_lines)
-        explicit_path = self._last_path(scoped, ("csv", "json", "xlsx", "xls", "txt")) or self._last_path(content, ("csv", "json", "xlsx", "xls"))
+        result_extensions = ("csv", "jsonl", "ndjson", "json", "xlsx", "xls", "txt")
+        explicit_path = self._last_path(scoped, result_extensions) or self._last_path(content, result_extensions[:-1])
         if explicit_path:
             return explicit_path
         relative_path = self._last_relative_result_path(scoped)
@@ -525,7 +526,7 @@ class DurableTaskEngine:
         return os.path.join(log_dir, relative_path)
 
     def _last_relative_result_path(self, content: str) -> str:
-        pattern = re.compile(r"(?P<path>(?!/|~)[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:csv|json|xlsx|xls|txt))", re.IGNORECASE)
+        pattern = re.compile(r"(?P<path>(?!/|~)[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:csv|jsonl|ndjson|json|xlsx|xls|txt))", re.IGNORECASE)
         matches: list[str] = []
         for match in pattern.finditer(content or ""):
             candidate = match.group("path").rstrip('.,;:)]}')
@@ -600,8 +601,35 @@ class DurableTaskEngine:
             for pattern in patterns:
                 match = pattern.search(line)
                 if match:
+                    if patterns is self.RUNNING_PATTERNS and self._line_is_resource_status_descriptor(line):
+                        continue
                     return match.group(0).strip()
         return ""
+
+    def _line_is_resource_status_descriptor(self, line: str) -> bool:
+        """Return True for inspected-resource status fields, not task progress."""
+        text = (line or "").strip()
+        if not text:
+            return False
+        lowered = text.lower()
+        fieldish = bool(
+            re.search(r'^[{\[,\s]*["\']?(?:field|name|key|label|title|字段|名称|状态|status)["\']?\s*[:=]', lowered)
+            or re.search(r'^["\']?(?:status|state|phase|运行状态|状态|field)["\']?\s*[:：=]', lowered)
+            or re.search(r'["\'](?:field|name|key|label|title|status|state|phase)["\']\s*:', lowered)
+        )
+        if not fieldish:
+            return False
+        durable_markers = (
+            "job", "task", "batch", "script", "command", "pid=", "pid:",
+            "log=", "log:", "result=", "result:", "后台任务", "批量任务", "脚本",
+        )
+        if any(marker in lowered or marker in text for marker in durable_markers):
+            return False
+        status_markers = (
+            "running", "in progress", "运行中", "仍在执行", "正在执行",
+            "仍在运行", "后台执行中",
+        )
+        return any(marker in lowered or marker in text for marker in status_markers)
 
     def _line_is_non_terminal_timeout(self, line: str) -> bool:
         lowered = (line or "").lower()

@@ -106,6 +106,30 @@ class Config(BaseModel):
         return self.max_iterations
 
 
+def _normalize_local_path(path: str) -> str:
+    """Expand user/env vars and return an absolute local filesystem path."""
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
+
+def _normalize_loaded_paths(cfg: Config) -> Config:
+    """Normalize path-like config fields before startup changes cwd.
+
+    The example config uses values such as ``~/pyclaw``.  Python's ``os`` and
+    sqlite do not expand ``~`` automatically, so leaving those strings intact can
+    create a literal ``./~/pyclaw`` directory and later make sqlite fail to open
+    the intended database file.  Do the expansion once at config load time so all
+    startup components share the same absolute roots.
+    """
+    cfg.work_dir = _normalize_local_path(cfg.work_dir)
+    if cfg.config_dir:
+        cfg.config_dir = _normalize_local_path(cfg.config_dir)
+    cfg.allowed_paths = [_normalize_local_path(path) for path in cfg.allowed_paths]
+    cfg.sandbox.allowed_paths = [_normalize_local_path(path) for path in cfg.sandbox.allowed_paths]
+    if cfg.document_rag.db_path:
+        cfg.document_rag.db_path = _normalize_local_path(cfg.document_rag.db_path)
+    return cfg
+
+
 def load_config(config_path: Optional[str] = None) -> Config:
     """加载配置文件"""
     if config_path is None:
@@ -114,6 +138,7 @@ def load_config(config_path: Optional[str] = None) -> Config:
             str(Path.home() / ".config" / "pyclaw" / "config.yaml"),
         )
 
+    config_path = os.path.expanduser(os.path.expandvars(config_path))
     path = Path(config_path)
 
     if not path.exists():
@@ -174,4 +199,4 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 }
             }
 
-    return Config(**data)
+    return _normalize_loaded_paths(Config(**data))

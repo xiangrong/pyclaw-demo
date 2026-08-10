@@ -43,6 +43,7 @@ logs/
 
 # Keep local test suites out of the shared repository.
 tests/
+tmp_test_artifacts/
 
 # Local browser automation snapshots/state.
 .playwright-cli/

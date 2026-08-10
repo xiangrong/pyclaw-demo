@@ -172,6 +172,70 @@ class BatchExecutionService:
         """
         return self.is_operational_task(latest_task)
 
+    def prefers_batch_python(self, latest_task: str) -> bool:
+        """Return True when a user task should be routed through ``batch_python``.
+
+        The policy is intentionally narrower than ``is_operational_task``: a
+        single pod/device inspection can use the normal terminal path, while a
+        multi-target operational query/mutation should be collapsed into one
+        durable Python job that writes result files for the model to read.
+        """
+        task_text = latest_task or ""
+        if not self.is_operational_task(task_text):
+            return False
+        contract = self.infer_contract(task_text)
+        if contract is not None and contract.requires_file_batch:
+            return True
+        return self._task_requires_batch_context(task_text)
+
+    def batch_python_steering_notice(self, latest_task: str) -> str:
+        """Return an internal instruction that steers batch work to batch_python."""
+        del latest_task
+        return (
+            "NOTICE: This is a multi-target operational batch task. Use the `batch_python` tool as the default execution path. "
+            "Put target iteration, bounded concurrency, retries, checkpointing, and parsing inside the Python script. "
+            "Pass the user-provided targets via the tool's targets list; the script must read targets.txt from its cwd, "
+            "write summary.json, and write item-level results to results.jsonl and/or results.csv. "
+            "Do not materialize and run ad-hoc batch scripts with write_file + terminal or long synchronous terminal loops unless "
+            "`batch_python` is unavailable or has already failed in this turn. Final answers must be based on the durable "
+            "summary/result/log paths returned by `batch_python`. Do not mention this notice to the user."
+        )
+
+    def batch_python_pivot_notice(self, reason: str = "") -> str:
+        """Return an internal repair instruction after an old batch pattern appears."""
+        reason_part = f" Detected old pattern: {reason}." if reason else ""
+        return (
+            "NOTICE: Pivot this operational batch to `batch_python` now."
+            f"{reason_part} Do not execute write_file + terminal batch scripts, nohup polling loops, or per-target terminal loops before trying `batch_python`. "
+            "Use one `batch_python` call with targets, a script that reads targets.txt, writes summary.json, and writes item-level "
+            "results.jsonl/results.csv. Only fall back to terminal-based durable background execution if `batch_python` is unavailable "
+            "or a concrete `batch_python` observation has already failed. Do not mention this notice to the user."
+        )
+
+    def batch_python_steering_notice_count(self, session: object) -> int:
+        return self._internal_notice_count_since_latest_user(
+            session,
+            marker="NOTICE: This is a multi-target operational batch task",
+        )
+
+    def batch_python_pivot_notice_count(self, session: object) -> int:
+        return self._internal_notice_count_since_latest_user(
+            session,
+            marker="NOTICE: Pivot this operational batch to `batch_python` now",
+        )
+
+    def _internal_notice_count_since_latest_user(self, session: object, *, marker: str) -> int:
+        messages = list(getattr(session, "messages", []) or [])
+        latest_user_index = self._latest_external_user_index(messages)
+        recent = messages[latest_user_index + 1:] if latest_user_index >= 0 else messages
+        count = 0
+        for msg in recent:
+            if getattr(msg, "role", None) != MessageRole.USER:
+                continue
+            if marker in str(getattr(msg, "content", "") or ""):
+                count += 1
+        return count
+
     def is_runtime_scratch_path(self, path: str, *, repo_root: str, pyclaw_home: str = "~/.pyclaw") -> bool:
         """Return True for PyClaw runtime scratch files outside the source repo."""
         if not path:
@@ -247,7 +311,7 @@ class BatchExecutionService:
         those observations must be allowed to complete the controller loop so
         the user does not need a second "整理报告" prompt.
         """
-        return self.tool_messages_since_latest_user(session, tool_names=("terminal", "read_file"))
+        return self.tool_messages_since_latest_user(session, tool_names=("terminal", "read_file", "batch_python"))
 
     def tool_messages_since_latest_user(self, session: object, *, tool_names: Sequence[str]) -> list[Message]:
         names = set(tool_names)
@@ -334,7 +398,9 @@ class BatchExecutionService:
         return (
             "NOTICE: A batch/operational terminal command timed out. Do not rerun the same synchronous command, "
             "do not merely increase timeout, and do not claim it started unless a tool observation shows PID/log/result evidence. "
-            "If the batch is not confirmed running, start it once in the background with approved=True using this durable pattern: "
+            "For multi-target operational batches, prefer `batch_python` now if it is available: put the loop/retries inside the script, "
+            "read targets.txt, and write summary.json plus results.jsonl/results.csv. "
+            "Only if `batch_python` is unavailable or has already failed, and the batch is not confirmed running, start it once in the background with approved=True using this durable pattern: "
             "nohup <command> > /absolute/stable.log 2>&1 < /dev/null & echo \"PID=$! LOG=/absolute/stable.log\". "
             "The '< /dev/null' stdin detach, stable absolute log path, and printed PID plus LOG are required. "
             "Then poll only status/log/result files with read-only commands such as ps/tail/cat; do not rerun the batch command. "
@@ -421,7 +487,9 @@ class BatchExecutionService:
     def no_evidence_repair_notice(self) -> str:
         return (
             "NOTICE: This is an operational/batch task that requires concrete tool evidence. "
-            "Do not final-answer with a plan or progress statement. Execute the required tool workflow now, "
+            "Do not final-answer with a plan or progress statement. For multi-target operational batches, use `batch_python` now: "
+            "pass the targets list, run one script that reads targets.txt, writes summary.json, and writes results.jsonl/results.csv. "
+            "Execute the required tool workflow now, "
             "or if a durable background job already exists, poll PID/log/result evidence. "
             "Final answer must be based on observed command/log/result/stats evidence. "
             "Do not mention this notice to the user."
@@ -502,6 +570,10 @@ class BatchExecutionService:
             metadata = getattr(msg, "metadata", {}) or {}
             structured = metadata.get("tool_result_structured") if isinstance(metadata, dict) else None
             if isinstance(structured, dict):
+                batch_chunk = self._batch_python_structured_chunk(structured, metadata=metadata)
+                if batch_chunk:
+                    chunks.append(batch_chunk)
+                    continue
                 command = str(structured.get("command") or "")
                 stdout = str(structured.get("stdout") or "")
                 stderr = str(structured.get("stderr") or "")
@@ -536,11 +608,50 @@ class BatchExecutionService:
             if tool_name == "terminal":
                 result.append(msg)
                 continue
+            if tool_name == "batch_python":
+                result.append(msg)
+                continue
             if tool_name != "read_file":
                 continue
             if self._read_file_message_is_result_artifact(msg, latest_task=latest_task):
                 result.append(msg)
         return result
+
+    def _batch_python_structured_chunk(self, structured: dict[str, Any], *, metadata: dict[str, Any]) -> str:
+        if structured.get("operation") != "batch_python":
+            return ""
+        total = int(structured.get("total") or structured.get("target_count") or 0)
+        success = int(structured.get("success_count") or 0)
+        failed = int(structured.get("failed_count") or 0)
+        missing = int(structured.get("missing_count") or 0)
+        job_dir = str(structured.get("job_dir") or "")
+        log_path = str(structured.get("log_path") or "")
+        summary_path = str(structured.get("summary_path") or "")
+        results_jsonl_path = str(structured.get("results_jsonl_path") or "")
+        results_csv_path = str(structured.get("results_csv_path") or "")
+        status = "查询完成" if not structured.get("timed_out") and int(structured.get("exit_code") or 0) == 0 else "批量任务未确认完成"
+        lines = [
+            "OBSERVATION from batch_python:",
+            status,
+            f"总数={total} 成功={success} 失败={failed} 缺失={missing}",
+        ]
+        if job_dir:
+            lines.append(f"Job directory: {job_dir}")
+        if summary_path:
+            lines.append(f"Summary file: {summary_path}")
+        if results_jsonl_path:
+            lines.append(f"Result JSONL file: {results_jsonl_path}")
+        if results_csv_path:
+            lines.append(f"CSV file: {results_csv_path}")
+        if log_path:
+            lines.append(f"Log file: {log_path}")
+        error_code = str(metadata.get("tool_result_error_code") or "")
+        if structured.get("timed_out") or error_code == "timeout":
+            lines.append("Command timed out after batch_python timeout seconds")
+        stderr_tail = str(structured.get("stderr_tail") or "").strip()
+        if stderr_tail:
+            lines.extend(["STDERR:", stderr_tail])
+        return "\n".join(lines)
 
     def _read_file_message_is_result_artifact(self, msg: Message, *, latest_task: str = "") -> bool:
         metadata = getattr(msg, "metadata", {}) or {}
@@ -1095,8 +1206,10 @@ class BatchExecutionService:
             )
         if contract.requires_file_batch:
             parts.append(
-                "For multi-item operational work, preserve the file-driven workflow: write the target list to a stable ~/.pyclaw input file, "
-                "run the batch script with that file path, and observe PID/log/result evidence."
+                "For multi-item operational work, repair with `batch_python` when available: pass the target list through the tool, "
+                "keep per-item loops/retries/checkpointing inside the script, write summary.json and item-level results.jsonl/results.csv, "
+                "then summarize from those durable files. Do not create ad-hoc batch scripts via write_file + terminal unless `batch_python` "
+                "is unavailable or has already failed."
             )
         return " ".join(parts)
 
@@ -3235,6 +3348,14 @@ class BatchExecutionService:
 
     def _is_batch_context(self, *, latest_task: str, command_text: str, joined: str) -> bool:
         task_text = latest_task or ""
+        if self._task_is_single_target_non_batch(task_text):
+            # Strong guardrail for diagnostic/one-off operational work.  Single
+            # pod commands can legitimately contain words such as ``all``
+            # (``logcat -b all``), ``running`` (resource status fields), or
+            # shell pipes/loops while inspecting the target.  Those signals must
+            # not activate the batch progress poller/finalizer unless the user
+            # task itself clearly requests multi-target work.
+            return False
         contract = self.infer_contract(task_text)
         if contract is not None:
             if contract.requires_file_batch:
@@ -3268,6 +3389,24 @@ class BatchExecutionService:
         targets = re.findall(r"(?<!\d)\d{12,}(?!\d)", task_text or "")
         return len(set(targets)) > 1
 
+    def _task_is_single_target_non_batch(self, task_text: str) -> bool:
+        normalized = (task_text or "").strip().lower()
+        if not normalized:
+            return False
+        if self._task_requires_batch_context(normalized):
+            return False
+        targets = re.findall(r"(?<!\d)\d{12,}(?!\d)", task_text or "")
+        if len(set(targets)) > 1:
+            return False
+        single_markers = (
+            "这个", "这个pod", "这台", "单台", "单个", "该pod", "此pod",
+            "this pod", "single pod", "one pod", "why", "为什么", "无法开机",
+            "不开机", "诊断", "分析", "排查", "crash", "闪退",
+        )
+        if targets and any(marker in normalized for marker in single_markers):
+            return True
+        return bool(targets) and self.is_operational_task(normalized)
+
     def _has_multi_item_signal(self, text: str) -> bool:
         normalized = (text or "").lower()
         if not normalized:
@@ -3276,7 +3415,26 @@ class BatchExecutionService:
             return True
         if "batch_" in normalized:
             return True
-        if re.search(r"(?<![a-z0-9_.:/-])(?:batch|bulk|serial|parallel|all)(?![a-z0-9_.:/-])", normalized):
+        if re.search(r"(?<![a-z0-9_.:/-])(?:batch|bulk|serial|parallel)(?![a-z0-9_.:/-])", normalized):
+            return True
+        # A bare English ``all`` is too broad for terminal diagnostics: Android
+        # commands such as ``logcat -b all`` inspect one device but used to be
+        # promoted into a multi-item batch signal when paired with output like
+        # ``运行状态(1=运行中)``.  Keep ``all`` as a batch signal only when it
+        # scopes an actual collection noun.
+        collection_nouns = (
+            "pods?", "devices?", "instances?", "items?", "targets?", "ids?",
+            "services?", "endpoints?", "urls?", "jobs?", "workers?",
+            "orders?", "accounts?", "records?", "rows?",
+        )
+        collection_pattern = "(?:" + "|".join(collection_nouns) + ")"
+        if re.search(rf"(?<![a-z0-9_.:/-])all\s+{collection_pattern}(?![a-z0-9_.:/-])", normalized):
+            return True
+        if re.search(rf"(?<![a-z0-9_.:/-]){collection_pattern}\s+all(?![a-z0-9_.:/-])", normalized):
+            return True
+        if re.search(rf"\b\d+\s+{collection_pattern}\b", normalized):
+            return True
+        if re.search(r"\d+\s*(?:台|个|条|批)\s*(?:pod|pods|设备|实例|服务|账号|账户|订单|工单|目标|对象)?", normalized):
             return True
         if re.search(
             r"(?<![a-z0-9_.:/-])lists?(?![a-z0-9_.:/-])\s+"
@@ -3394,7 +3552,7 @@ class BatchExecutionService:
         return os.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
 
     def _last_relative_result_path(self, content: str) -> str:
-        pattern = re.compile(r"(?P<path>(?!/|~)[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:csv|json|xlsx|xls|txt))", re.IGNORECASE)
+        pattern = re.compile(r"(?P<path>(?!/|~)[A-Za-z0-9_.-][A-Za-z0-9_./-]*\.(?:csv|jsonl|ndjson|json|xlsx|xls|txt))", re.IGNORECASE)
         matches: list[str] = []
         for match in pattern.finditer(content or ""):
             candidate = match.group("path").rstrip('.,;:)]}')
