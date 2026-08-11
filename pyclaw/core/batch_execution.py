@@ -645,6 +645,9 @@ class BatchExecutionService:
             lines.append(f"CSV file: {results_csv_path}")
         if log_path:
             lines.append(f"Log file: {log_path}")
+        compact_summary = self._compact_batch_summary_for_evidence(structured.get("summary"))
+        if compact_summary:
+            lines.extend(["Summary JSON:", json.dumps(compact_summary, ensure_ascii=False)])
         error_code = str(metadata.get("tool_result_error_code") or "")
         if structured.get("timed_out") or error_code == "timeout":
             lines.append("Command timed out after batch_python timeout seconds")
@@ -652,6 +655,47 @@ class BatchExecutionService:
         if stderr_tail:
             lines.extend(["STDERR:", stderr_tail])
         return "\n".join(lines)
+
+    def _compact_batch_summary_for_evidence(self, summary: Any) -> dict[str, Any]:
+        if not isinstance(summary, dict):
+            return {}
+
+        keep_top_level = {
+            "target_image", "total", "target_count", "success", "success_count", "failed", "failed_count",
+            "missing", "missing_count", "verified", "verified_count", "not_verified", "not_verified_count",
+            "unverified", "unverified_count",
+        }
+        compact: dict[str, Any] = {
+            str(key): value
+            for key, value in summary.items()
+            if str(key) in keep_top_level and not isinstance(value, (dict, list))
+        }
+        results = summary.get("results")
+        if isinstance(results, list):
+            compact_rows: list[dict[str, Any]] = []
+            for item in results[:100]:
+                if isinstance(item, dict):
+                    compact_rows.append(self._compact_batch_result_row(item))
+            if compact_rows:
+                compact["results"] = compact_rows
+        return compact
+
+    def _compact_batch_result_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        keep = (
+            "pod_id", "pod", "target_id", "id", "env", "detected_env_name", "target_image",
+            "success", "result", "status", "state", "status_code", "statuscode", "http_status",
+            "request_id", "verified", "not_verified", "final_status", "image_id_before",
+            "image_id_after", "image_name_after", "attempts_taken",
+        )
+        compact: dict[str, Any] = {}
+        for key in keep:
+            if key not in row:
+                continue
+            value = row.get(key)
+            if isinstance(value, (dict, list)):
+                continue
+            compact[key] = value
+        return compact
 
     def _read_file_message_is_result_artifact(self, msg: Message, *, latest_task: str = "") -> bool:
         metadata = getattr(msg, "metadata", {}) or {}
@@ -1323,7 +1367,8 @@ class BatchExecutionService:
             marker in normalized
             for marker in (
                 "update-image", "更新云手机实例镜像", "requestid", "statuscode",
-                "升级镜像", "目标镜像", "批量更新", "更新成功",
+                "升级镜像", "目标镜像", "target_image", "批量更新", "更新成功",
+                "pod-image-upgrade", "image_id_after",
             )
         ):
             facets.append(FACET_IMAGE_UPDATE_SUBMISSION)
@@ -1468,6 +1513,31 @@ class BatchExecutionService:
                 retryable_failed_items=retryable,
             )
         if facet == FACET_IMAGE_UPDATE_SUBMISSION:
+            verify_rows = self._image_update_verify_rows_from_messages(messages)
+            if verify_rows:
+                total = len(verify_rows)
+                failed = sum(1 for row in verify_rows if not row.get("verified"))
+                success = max(0, total - failed)
+                item_results = tuple(
+                    f"{row['pod']}: {row.get('status', '')} | 镜像={row.get('image_id_after') or row.get('target_image') or '-'}"
+                    for row in verify_rows
+                    if row.get("pod")
+                )
+                return OperationalFacetEvidence(
+                    facet=facet,
+                    status="verified_complete",
+                    total=total,
+                    success=success,
+                    failed=failed,
+                    result_path=evidence.result_path,
+                    log_path=evidence.log_path,
+                    report=self._render_image_update_verify_report(
+                        verify_rows,
+                        result_path=evidence.result_path,
+                        log_path=evidence.log_path,
+                    ),
+                    item_results=item_results,
+                )
             rendered = self._render_image_update_submission(messages)
             if not rendered:
                 return None
@@ -1903,12 +1973,251 @@ class BatchExecutionService:
             return "INVALID_MODEL_EVIDENCE"
         return text
 
+    def _image_update_verify_rows_from_messages(self, messages: Sequence[Message]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for payload in self._image_update_payloads_from_messages(messages):
+            rows.extend(self._image_update_verify_rows_from_payload(payload))
+        return self._dedupe_rows_by_key(rows, "pod")
+
+    def _image_update_verify_rows_from_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        results = payload.get("results")
+        if isinstance(results, list):
+            rows: list[dict[str, Any]] = []
+            target_image = str(payload.get("target_image") or "").strip()
+            for item in results:
+                if isinstance(item, dict):
+                    row = self._image_update_verify_row_from_mapping(item, target_image_hint=target_image)
+                    if row:
+                        rows.append(row)
+            return rows
+        return [row] if (row := self._image_update_verify_row_from_mapping(payload)) else []
+
+    def _image_update_verify_row_from_mapping(
+        self,
+        item: dict[str, Any],
+        *,
+        target_image_hint: str = "",
+    ) -> dict[str, Any]:
+        pod = self._dict_get_any(item, ("pod_id", "pod", "target_id", "target", "id", "实例ID", "PodId"))
+        if not self._looks_like_target_id(pod):
+            return {}
+        has_verify_shape = any(
+            key in item
+            for key in (
+                "verified", "not_verified", "verification", "final_status", "image_id_after",
+                "image_name_after", "attempts_taken",
+            )
+        )
+        if not has_verify_shape:
+            return {}
+        target_image = self._dict_get_any(item, ("target_image", "目标镜像")) or target_image_hint
+        image_after = self._dict_get_any(item, ("image_id_after", "image_after", "镜像ID", "镜像"))
+        final_status = self._dict_get_any(item, ("final_status", "status", "状态", "运行状态"))
+        verified = self._bool_from_value(item.get("verified"))
+        if verified is None:
+            not_verified = self._bool_from_value(item.get("not_verified"))
+            if not_verified is not None:
+                verified = not not_verified
+        if verified is None and target_image and image_after:
+            verified = target_image == image_after or target_image in image_after or image_after in target_image
+        if verified is None:
+            result_text = self._dict_get_any(item, ("result", "status", "state", "message", "结果"))
+            lowered = result_text.lower()
+            if any(marker in lowered for marker in ("verified", "success", "ok", "已验证", "成功", "完成")):
+                verified = True
+            elif any(marker in lowered for marker in ("not verified", "failed", "fail", "error", "未验证", "失败", "错误")):
+                verified = False
+        if verified is None:
+            return {}
+        return {
+            "pod": pod,
+            "verified": bool(verified),
+            "status": "验证成功" if verified else "验证失败",
+            "final_status": self._normalize_pod_running_status(final_status),
+            "target_image": target_image,
+            "image_id_before": self._dict_get_any(item, ("image_id_before", "image_before")),
+            "image_id_after": image_after,
+            "image_name_after": self._dict_get_any(item, ("image_name_after", "image_name", "镜像名称")),
+            "attempts_taken": self._dict_get_any(item, ("attempts_taken", "attempts", "attempt")),
+        }
+
+    def _render_image_update_verify_report(
+        self,
+        rows: Sequence[dict[str, Any]],
+        *,
+        result_path: str = "",
+        log_path: str = "",
+    ) -> str:
+        normalized_rows = self._dedupe_rows_by_key(rows, "pod")
+        total = len(normalized_rows)
+        failed_rows = [row for row in normalized_rows if not row.get("verified")]
+        success = total - len(failed_rows)
+        target_image = next((str(row.get("target_image") or "").strip() for row in normalized_rows if row.get("target_image")), "")
+        heading_icon = "⚠️" if failed_rows else "✅"
+        lines = [
+            f"## {heading_icon} Pod镜像升级验证完成报告",
+            "",
+            "### 📊 总体验证情况",
+            f"- 总验证量：{total} 台",
+            f"- 验证成功：{success} 台",
+            f"- 验证失败：{len(failed_rows)} 台",
+        ]
+        if target_image:
+            lines.append(f"- 目标镜像：`{target_image}`")
+        if result_path:
+            lines.append(f"- 结果文件：{result_path}")
+        if log_path:
+            lines.append(f"- 日志：{log_path}")
+        if normalized_rows:
+            lines.extend([
+                "",
+                "### 📋 Pod验证明细",
+                "| 目标 | 验证状态 | 运行状态 | 当前镜像 | 尝试次数 |",
+                "|---|---|---|---|---:|",
+            ])
+            for row in normalized_rows:
+                lines.append(
+                    "| "
+                    f"{self._escape_markdown_table_cell(str(row.get('pod') or ''))} | "
+                    f"{self._escape_markdown_table_cell(str(row.get('status') or ''))} | "
+                    f"{self._escape_markdown_table_cell(str(row.get('final_status') or '-'))} | "
+                    f"{self._escape_markdown_table_cell(str(row.get('image_id_after') or row.get('image_name_after') or '-'))} | "
+                    f"{self._escape_markdown_table_cell(str(row.get('attempts_taken') or '-'))} |"
+                )
+        return "\n".join(lines)
+
+    def _image_update_payloads_from_messages(self, messages: Sequence[Message]) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for msg in messages:
+            metadata = getattr(msg, "metadata", {}) or {}
+            structured = metadata.get("tool_result_structured") if isinstance(metadata, dict) else None
+            if isinstance(structured, dict):
+                summary = structured.get("summary")
+                if isinstance(summary, dict):
+                    payloads.append(summary)
+            content = str(getattr(msg, "content", "") or "")
+            for _path, body in self._read_file_blocks(content):
+                parsed = self._loads_json_object(body)
+                if isinstance(parsed, dict):
+                    payloads.append(parsed)
+                payloads.extend(self._jsonl_objects_from_text(body))
+            payloads.extend(self._summary_json_objects_from_text(content))
+        return payloads
+
+    def _summary_json_objects_from_text(self, content: str) -> list[dict[str, Any]]:
+        objects: list[dict[str, Any]] = []
+        # ``_batch_python_structured_chunk`` emits compact JSON on one line so
+        # downstream parsers can recover item-level rows without re-reading the
+        # artifact.  Parse that line directly instead of using a non-greedy
+        # multi-line regex, which is fragile around nested result objects.
+        pattern = re.compile(r"Summary JSON:\s*\n(?P<body>[^\n]+)")
+        for match in pattern.finditer(content or ""):
+            parsed = self._loads_json_object(match.group("body"))
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+        return objects
+
+    def _jsonl_objects_from_text(self, text: str) -> list[dict[str, Any]]:
+        objects: list[dict[str, Any]] = []
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+        return objects
+
+    def _image_update_submission_rows_from_messages(self, messages: Sequence[Message]) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for payload in self._image_update_payloads_from_messages(messages):
+            rows.extend(self._image_update_submission_rows_from_payload(payload))
+        return self._dedupe_rows_by_key(rows, "pod")
+
+    def _image_update_submission_rows_from_payload(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        results = payload.get("results")
+        if isinstance(results, list):
+            rows: list[dict[str, str]] = []
+            for item in results:
+                if isinstance(item, dict):
+                    row = self._image_update_submission_row_from_mapping(item)
+                    if row:
+                        rows.append(row)
+            return rows
+        return [row] if (row := self._image_update_submission_row_from_mapping(payload)) else []
+
+    def _image_update_submission_row_from_mapping(self, item: dict[str, Any]) -> dict[str, str]:
+        pod = self._dict_get_any(item, ("pod_id", "pod", "target_id", "target", "id", "实例ID", "PodId"))
+        if not self._looks_like_target_id(pod):
+            return {}
+        has_submission_shape = any(
+            key in item
+            for key in ("success", "status_code", "statuscode", "result", "request_id", "target_image", "http_status")
+        )
+        if not has_submission_shape:
+            return {}
+        status_code = self._dict_get_any(item, ("status_code", "statuscode", "StatusCode"))
+        success_value = self._bool_from_value(item.get("success"))
+        result_text = self._dict_get_any(item, ("result", "status", "state", "message", "结果"))
+        failed = False
+        if status_code and status_code != "0":
+            failed = True
+        elif success_value is False:
+            failed = True
+        elif self._is_failed_value(result_text):
+            failed = True
+        status = "提交失败" if failed else "提交成功"
+        return {
+            "pod": pod,
+            "status": status,
+            "request_id": self._normalize_request_id(self._dict_get_any(item, ("request_id", "RequestId"))),
+            "target_image": self._dict_get_any(item, ("target_image", "目标镜像")),
+        }
+
+    def _dict_get_any(self, value: dict[str, Any], keys: Sequence[str]) -> str:
+        lowered = {str(key).lower(): val for key, val in value.items()}
+        for key in keys:
+            if key in value:
+                return str(value[key] or "").strip()
+            lowered_key = key.lower()
+            if lowered_key in lowered:
+                return str(lowered[lowered_key] or "").strip()
+        return ""
+
+    def _bool_from_value(self, value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "ok", "success", "succeeded", "passed", "verified", "成功", "已验证"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "failed", "fail", "error", "not_verified", "unverified", "失败", "未验证"}:
+                return False
+        return None
+
+    def _normalize_pod_running_status(self, value: str) -> str:
+        text = str(value or "").strip()
+        if text == "1":
+            return "运行中"
+        if text == "0":
+            return "非运行中"
+        return text
+
     def _render_image_update_submission(self, messages: Sequence[Message]) -> str:
         text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
         normalized = text.lower()
-        batch_rows = self._image_update_rows_from_text(text)
+        batch_rows = self._image_update_rows_from_messages(messages)
         if batch_rows:
-            image = self._image_from_update_command(text) or self._image_from_batch_update_log(text)
+            image = (
+                self._image_from_update_command(text)
+                or self._image_from_batch_update_log(text)
+                or next((row.get("target_image", "") for row in batch_rows if row.get("target_image")), "")
+            )
             total = len(batch_rows)
             failures = [row for row in batch_rows if self._is_failed_value(row.get("status", ""))]
             success = total - len(failures)
@@ -1986,7 +2295,11 @@ class BatchExecutionService:
 
     def _image_update_rows_from_messages(self, messages: Sequence[Message]) -> list[dict[str, str]]:
         text = "\n".join(str(getattr(msg, "content", "") or "") for msg in messages)
-        return self._image_update_rows_from_text(text)
+        rows = [
+            *self._image_update_rows_from_text(text),
+            *self._image_update_submission_rows_from_messages(messages),
+        ]
+        return self._dedupe_rows_by_key(rows, "pod")
 
     def _image_update_rows_from_text(self, text: str) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
@@ -2082,8 +2395,14 @@ class BatchExecutionService:
         return match.group(1).strip().strip('"\'') if match else ""
 
     def _image_from_batch_update_log(self, text: str) -> str:
-        match = re.search(r"(?:目标镜像|image)\s*[:：]\s*(?P<image>\S+)", text or "", flags=re.IGNORECASE)
-        return match.group("image").strip().strip('"\'') if match else ""
+        for pattern in (
+            r"(?:目标镜像|image)\s*[:：]\s*(?P<image>\S+)",
+            r'"target_image"\s*:\s*"(?P<image>[^"]+)"',
+        ):
+            match = re.search(pattern, text or "", flags=re.IGNORECASE)
+            if match:
+                return match.group("image").strip().strip('"\'')
+        return ""
 
     def _field_value_from_opencli_table(self, text: str, field: str) -> str:
         pattern = re.compile(
@@ -2101,6 +2420,14 @@ class BatchExecutionService:
         operator_distribution_hint: Sequence[str] = (),
         region_distribution_hint: Sequence[str] = (),
     ) -> dict[str, Any]:
+        if self._content_has_image_update_evidence_signal(content):
+            # Image-upgrade artifacts can contain generic columns such as
+            # ``status`` and numeric IDs, and occasionally embedded instance
+            # metadata with IP-like fields.  Do not let those fall through to
+            # the Pod egress/generic renderers; image submission/verification is
+            # parsed by the dedicated facet code from the same messages.
+            return {}
+
         csv_rows, csv_path = self._csv_rows_from_text(content)
         if csv_rows:
             pod_model_egress_rows = self._pod_model_egress_rows_from_csv_rows(csv_rows)
@@ -2190,6 +2517,18 @@ class BatchExecutionService:
             result_paths = [result_path_hint] if result_path_hint else []
             return self._generic_item_results_evidence(generic_items, result_paths=result_paths)
         return {}
+
+    def _content_has_image_update_evidence_signal(self, content: str) -> bool:
+        normalized = (content or "").lower()
+        if not normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                "update-image", "pod-image-upgrade", "target_image", "目标镜像",
+                "image_id_after", "image_id_before", "镜像升级", "升级镜像",
+            )
+        )
 
     def _json_mappings_from_read_files(self, content: str) -> tuple[dict[str, Any], list[str]]:
         merged: dict[str, Any] = {}

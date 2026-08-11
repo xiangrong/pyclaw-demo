@@ -505,13 +505,29 @@ class BatchPythonTool(BaseTool):
         )
         success = self._int_from_mapping(
             summary,
-            ("success_count", "succeeded", "successful", "success", "ok", "passed", "completed"),
+            (
+                "success_count", "succeeded", "successful", "success", "ok", "passed", "completed",
+                "verified_count", "verified",
+            ),
         )
         failed = self._int_from_mapping(
             summary,
-            ("failed_count", "failure_count", "failures", "failed", "errors", "error_count"),
+            (
+                "failed_count", "failure_count", "failures", "failed", "errors", "error_count",
+                "not_verified_count", "not_verified", "unverified_count", "unverified",
+            ),
         )
         missing = self._int_from_mapping(summary, ("missing_count", "missing", "skipped", "not_found"))
+
+        result_counts = self._counts_from_result_rows(summary.get("results"))
+        if total < 0 and result_counts["total"] >= 0:
+            total = result_counts["total"]
+        if success < 0 and result_counts["success_count"] >= 0:
+            success = result_counts["success_count"]
+        if failed < 0 and result_counts["failed_count"] >= 0:
+            failed = result_counts["failed_count"]
+        if missing < 0 and result_counts["missing_count"] >= 0:
+            missing = result_counts["missing_count"]
 
         if total < 0:
             total = target_count
@@ -533,6 +549,82 @@ class BatchPythonTool(BaseTool):
             "failed_count": max(0, int(failed)),
             "missing_count": max(0, int(missing)),
         }
+
+    def _counts_from_result_rows(self, value: Any) -> dict[str, int]:
+        if not isinstance(value, list):
+            return {"total": -1, "success_count": -1, "failed_count": -1, "missing_count": -1}
+
+        total = len(value)
+        success = 0
+        failed = 0
+        missing = 0
+        classified = 0
+        for item in value:
+            state = self._result_row_state(item)
+            if state == "success":
+                success += 1
+                classified += 1
+            elif state == "failed":
+                failed += 1
+                classified += 1
+            elif state == "missing":
+                missing += 1
+                classified += 1
+
+        return {
+            "total": total,
+            "success_count": success if classified else -1,
+            "failed_count": failed if classified else -1,
+            "missing_count": missing if classified else -1,
+        }
+
+    def _result_row_state(self, item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        lowered = {str(key).strip().lower(): value for key, value in item.items()}
+        for key in ("success", "ok", "passed", "completed", "verified"):
+            parsed_bool = self._coerce_bool(lowered.get(key))
+            if parsed_bool is True:
+                return "success"
+            if parsed_bool is False:
+                return "failed"
+        for key in ("missing", "not_found", "skipped"):
+            parsed_bool = self._coerce_bool(lowered.get(key))
+            if parsed_bool is True:
+                return "missing"
+        for key in ("not_verified", "unverified", "failed", "error"):
+            parsed_bool = self._coerce_bool(lowered.get(key))
+            if parsed_bool is True:
+                return "failed"
+        status = " ".join(
+            str(lowered.get(key) or "")
+            for key in ("status", "state", "result", "message", "status_code", "code")
+        ).strip().lower()
+        if not status:
+            return ""
+        if any(marker in status for marker in ("not found", "missing", "skipped", "未找到", "缺失")):
+            return "missing"
+        if any(marker in status for marker in ("failed", "fail", "error", "timeout", "失败", "异常", "错误", "未验证")):
+            return "failed"
+        if any(marker in status for marker in ("success", "ok", "passed", "done", "verified", "成功", "完成", "已验证")):
+            return "success"
+        status_code = str(lowered.get("status_code") or lowered.get("statuscode") or "").strip()
+        if status_code:
+            return "success" if status_code == "0" else "failed"
+        return ""
+
+    def _coerce_bool(self, value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "ok", "success", "succeeded", "passed", "verified", "成功", "已验证"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "failed", "fail", "error", "not_verified", "unverified", "失败", "未验证"}:
+                return False
+        return None
 
     def _int_from_mapping(self, mapping: dict[str, Any], keys: Iterable[str]) -> int:
         lowered = {str(key).strip().lower(): value for key, value in mapping.items()}
