@@ -531,6 +531,18 @@ class BatchPythonTool(BaseTool):
 
         if total < 0:
             total = target_count
+        overall_success = self._bool_from_mapping(
+            summary,
+            ("success", "ok", "passed", "completed", "verified"),
+        )
+        if overall_success is True and success < 0 and failed < 0 and missing < 0:
+            success = max(0, int(total))
+            failed = 0
+            missing = 0
+        elif overall_success is False and success < 0 and failed < 0 and missing < 0:
+            success = 0
+            failed = max(0, int(total))
+            missing = 0
         if success < 0 and total >= 0 and failed >= 0 and missing >= 0:
             success = max(0, total - failed - missing)
         elif success < 0:
@@ -634,6 +646,14 @@ class BatchPythonTool(BaseTool):
             if parsed >= 0:
                 return parsed
         return -1
+
+    def _bool_from_mapping(self, mapping: dict[str, Any], keys: Iterable[str]) -> bool | None:
+        lowered = {str(key).strip().lower(): value for key, value in mapping.items()}
+        for key in keys:
+            parsed = self._coerce_bool(lowered.get(key.lower()))
+            if parsed is not None:
+                return parsed
+        return None
 
     def _coerce_int(self, value: Any) -> int:
         if isinstance(value, bool):

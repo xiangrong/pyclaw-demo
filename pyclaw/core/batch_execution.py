@@ -137,22 +137,50 @@ class BatchExecutionService:
     DESKTOP_ONE_SHOT_MARKERS: tuple[str, ...] = (
         "screencapture", "imagesnap", "ffmpeg", "pmset displaysleepnow", "display notification",
     )
+    RESEARCH_CONTENT_MARKERS: tuple[str, ...] = (
+        "web_search", "web_read", "web_extract", "aihot", "日报", "简报", "新闻",
+        "资讯", "热点", "热榜", "热门", "github", "仓库", "stars", "star ",
+        "论文", "paper", "release notes", "官方文档", "搜索关键词",
+        "来源", "精选", "主链接", "阅读全文",
+    )
+    STRONG_OPERATIONAL_ANCHORS: tuple[str, ...] = (
+        "pod", "pods", "k8s", "kubernetes", "kubectl", "opencli", "镜像", "cr.volces",
+        "registry", "harbor", "docker", "helm", "adb", "wss", "云机", "云手机",
+    )
     STATS_PATTERNS = DurableTaskEngine.STATS_PATTERNS
     COMPLETION_PATTERNS = DurableTaskEngine.COMPLETION_PATTERNS
 
     def __init__(self, durable_engine: DurableTaskEngine | None = None) -> None:
         self.durable = durable_engine or DurableTaskEngine()
 
+    def effective_task_text(self, text: str) -> str:
+        """Return the user-authored task text used by batch classifiers.
+
+        Cron executions wrap the original job prompt with generic research,
+        delivery, and safety instructions.  Those wrapper instructions contain
+        broad tokens such as ``web_extract``, ``多页面``, ``3-5`` and ``API``
+        which must not influence operational/batch routing.  Keep the full
+        message for the LLM, but classify only the final cron task body.
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        return self._cron_wrapped_task_text(raw) or raw
+
     def infer_contract(self, latest_task: str) -> OperationalTaskContract | None:
         """Return the controller completion contract for an operational task."""
-        if not self.is_operational_task(latest_task):
+        task_text = self.effective_task_text(latest_task)
+        if not self.is_operational_task(task_text):
             return None
-        return infer_operational_task_contract(latest_task)
+        return infer_operational_task_contract(task_text)
 
     def is_operational_task(self, text: str) -> bool:
         """Return True for infrastructure/CLI work that is not source-code work."""
-        normalized = (text or "").lower()
+        task_text = self.effective_task_text(text)
+        normalized = task_text.lower()
         if not normalized:
+            return False
+        if self._looks_like_research_or_content_task(task_text):
             return False
         if any(marker in normalized for marker in self.STRONG_CODING_MARKERS):
             return False
@@ -170,7 +198,7 @@ class BatchExecutionService:
         the work, but the controller must not accept a plan/progress sentence as
         the final answer.
         """
-        return self.is_operational_task(latest_task)
+        return self.is_operational_task(self.effective_task_text(latest_task))
 
     def prefers_batch_python(self, latest_task: str) -> bool:
         """Return True when a user task should be routed through ``batch_python``.
@@ -180,7 +208,7 @@ class BatchExecutionService:
         multi-target operational query/mutation should be collapsed into one
         durable Python job that writes result files for the model to read.
         """
-        task_text = latest_task or ""
+        task_text = self.effective_task_text(latest_task)
         if not self.is_operational_task(task_text):
             return False
         contract = self.infer_contract(task_text)
@@ -258,9 +286,10 @@ class BatchExecutionService:
         side_effect_keys: Sequence[str] = (),
     ) -> bool:
         """Infer whether a shell command is a long-running batch operation."""
-        combined = f"{command or ''}\n{task_text or ''}\n{' '.join(side_effect_keys)}".lower()
+        effective_task = self.effective_task_text(task_text)
+        combined = f"{command or ''}\n{effective_task or ''}\n{' '.join(side_effect_keys)}".lower()
         command_scope = f"{command or ''}\n{' '.join(side_effect_keys)}".lower()
-        task_scope = (task_text or "").lower()
+        task_scope = (effective_task or "").lower()
         if not combined.strip():
             return False
         if any(marker in combined for marker in self.DESKTOP_ONE_SHOT_MARKERS):
@@ -276,7 +305,7 @@ class BatchExecutionService:
         )
         script_batch_signal = bool(re.search(r"(?:^|[/\s])(?:batch|bulk|query|update)[\w.-]*\.(?:py|sh)\b", command_scope))
         loop_batch_signal = self._has_shell_loop_signal(command_scope)
-        task_operational = self.is_operational_task(task_text)
+        task_operational = self.is_operational_task(effective_task)
         task_batch_signal = self._task_requires_batch_context(task_scope)
 
         if loop_batch_signal or script_batch_signal:
@@ -3685,8 +3714,66 @@ class BatchExecutionService:
         expected = total or (success + failed)
         return expected <= 0 or row_count >= expected
 
+    def _cron_wrapped_task_text(self, text: str) -> str:
+        if "【定时任务执行" not in text:
+            return ""
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", text.strip()) if block.strip()]
+        if len(blocks) < 2:
+            return ""
+
+        task_blocks: list[str] = []
+        for block in reversed(blocks):
+            if self._is_cron_wrapper_block(block):
+                if task_blocks:
+                    break
+                continue
+            task_blocks.append(block)
+
+        if not task_blocks:
+            return ""
+        return "\n\n".join(reversed(task_blocks)).strip()
+
+    def _is_cron_wrapper_block(self, block: str) -> bool:
+        normalized = str(block or "").strip()
+        if not normalized:
+            return True
+        wrapper_starts = (
+            "【定时任务执行",
+            "当前执行时间：",
+            "硬性限制：",
+            "实时/新闻/赛事研究策略：",
+            "通用研究策略：",
+            "飞书投递格式要求：",
+            "telegram投递格式要求：",
+            "Telegram投递格式要求：",
+            "【结果纠正尝试 ",
+        )
+        return normalized.startswith(wrapper_starts)
+
+    def _looks_like_research_or_content_task(self, task_text: str) -> bool:
+        """Return True for content/research jobs that mention API/search terms.
+
+        Words such as ``API`` and ``列表`` are useful operational signals for
+        service health checks, but they are common in news digests, GitHub
+        trending reports, and markdown brief generation.  Unless the task also
+        contains strong infrastructure anchors such as pod/kubectl/adb/image
+        rollout markers, do not route it through the operational batch layer.
+        """
+        normalized = str(task_text or "").lower()
+        if not normalized:
+            return False
+        if any(marker in normalized for marker in self.STRONG_OPERATIONAL_ANCHORS):
+            return False
+        if any(marker in normalized for marker in self.RESEARCH_CONTENT_MARKERS):
+            return True
+        if re.search(r"(?:\d+\s*[-~至到]\s*\d+|至少\s*\d+|不超过\s*\d+)\s*(?:条|个|篇|页|项目|内容|新闻|资讯|链接)", normalized):
+            return True
+        return False
+
     def _is_batch_context(self, *, latest_task: str, command_text: str, joined: str) -> bool:
-        task_text = latest_task or ""
+        task_text = self.effective_task_text(latest_task)
+        if self._looks_like_research_or_content_task(task_text) and not self.is_operational_task(task_text):
+            return False
         if self._task_is_single_target_non_batch(task_text):
             # Strong guardrail for diagnostic/one-off operational work.  Single
             # pod commands can legitimately contain words such as ``all``
@@ -3720,6 +3807,9 @@ class BatchExecutionService:
         return False
 
     def _task_requires_batch_context(self, task_text: str) -> bool:
+        task_text = self.effective_task_text(task_text)
+        if self._looks_like_research_or_content_task(task_text) and not self.is_operational_task(task_text):
+            return False
         normalized = (task_text or "").lower()
         if not normalized:
             return False
